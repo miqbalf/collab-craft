@@ -59,6 +59,9 @@ mod review_reverify;
 #[cfg(test)]
 mod review_reverify2;
 
+#[cfg(test)]
+mod review_lease_lapse;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -582,13 +585,25 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
                             rooms.entry(claims.rm.clone()).or_default().record_holder(scope_name.clone(), still.clone());
                             Err(Refusal::Locked { holder: still })
                         }
-                        Ok(_) => {
+                        Ok(current_holder) => {
                             // Either the bus now agrees this peer holds it, or the lease
                             // lapsed and nobody does. Either way the mirror was wrong; forget
                             // it so later submits to this scope do not pay this round trip
                             // again.
-                            let mut rooms = relay.rooms.lock().await;
-                            rooms.entry(claims.rm.clone()).or_default().forget_lock(scope_name);
+                            {
+                                let mut rooms = relay.rooms.lock().await;
+                                rooms.entry(claims.rm.clone()).or_default().forget_lock(scope_name);
+                            }
+                            if current_holder.is_none() {
+                                // The lease lapsed on its own and nobody holds the scope now.
+                                // The room still believes `holder` does, from the grant it was
+                                // told about with no matching release ever heard, so the lapse
+                                // is announced the same way a real unlock is.
+                                let _ = socket
+                                    .within(room_name.clone())
+                                    .emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": scope_name }))
+                                    .await;
+                            }
                             if claims.may_edit() { Ok(()) } else { Err(Refusal::ReadOnly) }
                         }
                         Err(e) => {
@@ -737,18 +752,24 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): S
     let Some(claims) = live_claims(&socket) else { return };
     let room_name = claims.room();
 
-    let released = {
+    let bus_released = {
         let mut bus = relay.bus.lock().await;
         bus.release(&claims.rm, &msg.scope, &claims.pid).await.unwrap_or(false)
     };
-    {
+    let mirror_released = {
         let mut rooms = relay.rooms.lock().await;
-        rooms.entry(claims.rm.clone()).or_default().unlock(&claims.pid, &msg.scope);
-    }
+        rooms.entry(claims.rm.clone()).or_default().unlock(&claims.pid, &msg.scope)
+    };
 
-    // Only a real release is announced. Telling the room about an unlock for a
-    // scope this peer never held would clear somebody else's busy marker.
-    if released {
+    // A real release on the bus is announced, as before. One where the lease had already
+    // lapsed on its own in Valkey, so there was nothing left for the bus to delete, but the
+    // room's mirror still recorded this peer as the scope's holder, is announced too: the
+    // mirror changing here is the room's only chance to hear the scope is free, since the
+    // lapse itself told nobody. Neither flag announces somebody else's unlock: a stale or
+    // wrong peer id matches neither the bus's compare-and-delete nor Room::unlock's own holder
+    // check, so both stay false and nothing broadcasts, which is what keeps a late unlock for a
+    // scope somebody else has since claimed a no-op.
+    if bus_released || mirror_released {
         let _ = socket.within(room_name.clone()).emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": msg.scope })).await;
     }
 }
@@ -881,14 +902,19 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
 
     // Releasing on disconnect is what makes a lock safe to take at all. One
     // that outlived its holder would wedge the region until the TTL lapsed.
+    //
+    // `dropped` already came from the room's own mirror, which only reports a scope here when
+    // it believed this peer held it, so every entry is a real release from the room's point of
+    // view and is announced unconditionally. The bus call is best effort cleanup alongside
+    // that: when the lease had already lapsed on its own before the disconnect, there is
+    // nothing left in Valkey to delete, and that must not suppress telling the room, which is
+    // exactly the silent-lapse gap this announcement exists to close.
     for scope in &dropped {
-        let released = {
+        {
             let mut bus = relay.bus.lock().await;
-            bus.release(&claims.rm, scope, &claims.pid).await.unwrap_or(false)
-        };
-        if released {
-            let _ = socket.to(room_name.clone()).emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": scope })).await;
+            let _ = bus.release(&claims.rm, scope, &claims.pid).await;
         }
+        let _ = socket.to(room_name.clone()).emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": scope })).await;
     }
 
     if !empty {
