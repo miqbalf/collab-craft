@@ -87,14 +87,23 @@ fn a_listing_drops_the_folder_itself_and_keys_rooms_on_the_path() {
 
 #[test]
 fn two_accounts_do_not_share_a_path_keyed_room() {
-    let fake_a = Fake::new(vec![Response::new(207, LISTING)]);
-    let fake_b = Fake::new(vec![Response::new(207, LISTING)]);
-    let a = WebDav::new(&layout(), "alice", "pw", &fake_a);
-    let b = WebDav::new(&layout(), "bob", "pw", &fake_b);
+    // A server with no user in its path, so one listing is honest for both
+    // accounts and the account is the only thing that varies between them.
+    let shared = Layout::new("https://nas.local/dav", None);
+    let listing = r#"<d:multistatus xmlns:d="DAV:">
+      <d:response><d:href>/dav/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+      <d:response><d:href>/dav/draft.docx</d:href><d:propstat><d:prop>
+        <d:resourcetype/><d:getcontentlength>10</d:getcontentlength><d:getetag>"e"</d:getetag>
+      </d:prop></d:propstat></d:response>
+    </d:multistatus>"#;
+    let fake_a = Fake::new(vec![Response::new(207, listing)]);
+    let fake_b = Fake::new(vec![Response::new(207, listing)]);
+    let a = WebDav::new(&shared, "alice", "pw", &fake_a);
+    let b = WebDav::new(&shared, "bob", "pw", &fake_b);
     let room_a = a.list("").expect("listed")[0].room.clone();
     let room_b = b.list("").expect("listed")[0].room.clone();
+    assert!(room_a.ends_with(":/draft.docx") && room_b.ends_with(":/draft.docx"), "{room_a} / {room_b}");
     assert_ne!(room_a, room_b, "the same path under two accounts must be two rooms");
-    assert!(room_a.contains("Report Q3.docx") && room_b.contains("Report Q3.docx"), "{room_a} / {room_b}");
 }
 
 #[test]
