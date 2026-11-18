@@ -134,12 +134,7 @@ mod e2e {
 
         let roster: Vec<String> =
             h.relay.rooms.lock().await.get(&room).map(|r| r.peers().iter().map(|p| p.peer.clone()).collect()).unwrap_or_default();
-        assert_eq!(
-            viewer.applies(),
-            seen_before_lapse,
-            "the lapsed viewer still received an edit; fx={:?}",
-            viewer.fx
-        );
+        assert_eq!(viewer.applies(), seen_before_lapse, "the lapsed viewer still received an edit; fx={:?}", viewer.fx);
         assert!(!roster.contains(&"viewer".to_owned()), "the lapsed viewer is still on the roster: {roster:?}");
         assert!(roster.contains(&"alice".to_owned()), "alice was dropped by the delivery recheck: {roster:?}");
     }
