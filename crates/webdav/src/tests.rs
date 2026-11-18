@@ -87,8 +87,10 @@ fn a_listing_drops_the_folder_itself_and_keys_rooms_on_the_path() {
 
 #[test]
 fn two_accounts_do_not_share_a_path_keyed_room() {
-    let a = WebDav::new(&layout(), "alice", "pw", &Fake::new(vec![Response::new(207, LISTING)]));
-    let b = WebDav::new(&layout(), "bob", "pw", &Fake::new(vec![Response::new(207, LISTING)]));
+    let fake_a = Fake::new(vec![Response::new(207, LISTING)]);
+    let fake_b = Fake::new(vec![Response::new(207, LISTING)]);
+    let a = WebDav::new(&layout(), "alice", "pw", &fake_a);
+    let b = WebDav::new(&layout(), "bob", "pw", &fake_b);
     let room_a = a.list("").expect("listed")[0].room.clone();
     let room_b = b.list("").expect("listed")[0].room.clone();
     assert_ne!(room_a, room_b, "the same path under two accounts must be two rooms");
