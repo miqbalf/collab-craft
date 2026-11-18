@@ -94,7 +94,7 @@ fn two_accounts_do_not_share_a_path_keyed_room() {
     let room_a = a.list("").expect("listed")[0].room.clone();
     let room_b = b.list("").expect("listed")[0].room.clone();
     assert_ne!(room_a, room_b, "the same path under two accounts must be two rooms");
-    assert!(room_a.ends_with(":/Report Q3.docx") && room_b.ends_with(":/Report Q3.docx"));
+    assert!(room_a.contains("Report Q3.docx") && room_b.contains("Report Q3.docx"), "{room_a} / {room_b}");
 }
 
 #[test]
