@@ -84,6 +84,21 @@ impl Git {
         &self.http
     }
 
+    /// A short stable tag for this repository, for scoping a room by repo.
+    ///
+    /// 16 hex from an FNV-1a over the API host, owner and repo. No
+    /// cryptographic claim: it only has to differ between two repositories.
+    fn repo_scope(&self) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for part in [self.api.as_str(), self.owner.as_str(), self.repo.as_str()] {
+            for byte in part.bytes().chain(std::iter::once(0)) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        format!("{h:016x}")
+    }
+
     fn get(&self, url: &str) -> Result<reqwest::blocking::Response> {
         if self.token.is_empty() {
             return Err(Error::Unauthenticated);
@@ -246,11 +261,17 @@ struct Content {
     download_url: Option<String>,
 }
 
-fn entry_from(item: &Content, writable: bool) -> Entry {
+fn entry_from(item: &Content, writable: bool, repo_scope: &str) -> Entry {
     let folder = item.kind == "dir";
     Entry {
         id: item.path.clone(),
-        room: item.sha.clone(),
+        // Repository and path, not the blob sha. The sha is the content hash,
+        // so keying the room on it put two different users with the same bytes
+        // in one room, and moved the room on every save. The path is stable
+        // across edits, and the repo scope keeps one repo's `/draft` apart from
+        // another's. The sha still serves as the etag below, which is what the
+        // contents API wants for a conditional write.
+        room: format!("{repo_scope}:{}", item.path),
         name: item.name.clone(),
         path: item.path.clone(),
         kind: if folder { EntryKind::Folder } else { EntryKind::File },
@@ -285,11 +306,12 @@ impl Files for Git {
         let response = status(response)?;
         let body: serde_json::Value = response.json().map_err(|e| Error::malformed("contents", e.to_string()))?;
         let writable = self.may_push();
+        let scope = self.repo_scope();
         if let Ok(items) = serde_json::from_value::<Vec<Content>>(body.clone()) {
-            return Ok(items.iter().map(|item| entry_from(item, writable)).collect());
+            return Ok(items.iter().map(|item| entry_from(item, writable, &scope)).collect());
         }
         let item: Content = serde_json::from_value(body).map_err(|e| Error::malformed("contents", e.to_string()))?;
-        Ok(vec![entry_from(&item, writable)])
+        Ok(vec![entry_from(&item, writable, &scope)])
     }
 
     fn shared_with_me(&self) -> Result<Vec<Entry>> {
@@ -322,7 +344,7 @@ impl Files for Git {
     fn stat(&self, id: &str) -> Result<Entry> {
         let url = self.contents_get_url(id)?;
         let item: Content = self.get(&url)?.json().map_err(|e| Error::malformed("file", e.to_string()))?;
-        Ok(entry_from(&item, self.may_push()))
+        Ok(entry_from(&item, self.may_push(), &self.repo_scope()))
     }
 }
 
@@ -354,7 +376,7 @@ impl Git {
             let item: Content = serde_json::from_value(content.clone()).map_err(|e| Error::malformed("commit", e.to_string()))?;
             // The push just succeeded, so this repository is writable to this
             // token whatever a cached probe might have said.
-            return Ok(entry_from(&item, true));
+            return Ok(entry_from(&item, true, &self.repo_scope()));
         }
         Files::stat(self, path)
     }

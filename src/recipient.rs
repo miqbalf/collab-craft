@@ -135,7 +135,11 @@ pub async fn open(State(app): State<Arc<App>>, headers: HeaderMap, Path(raw): Pa
         // Derived from the handle, so two windows are one guest and revoking
         // the link can find the sessions it created.
         user: Guest::user_id(&key.handle),
-        display: link.recipient.clone(),
+        // Not the recipient's address. The display name goes into the relay
+        // token and from there into every room member's roster, and the other
+        // people in the room were never given this person's email. The handle
+        // suffix keeps two guests tellable apart.
+        display: guest_display(&key.handle),
         email: Some(link.recipient.clone()),
         // No groups, ever. Group membership is how entitlement is granted
         // here, and a recipient is entitled to one document.
@@ -196,6 +200,16 @@ async fn grant(app: &App, link: &Link) -> Result<(craft_cloud::Entry, Permission
             Err(Refusal::Withdrawn)
         }
     }
+}
+
+/// What the rest of the room calls a keyed-link guest.
+///
+/// The handle is already public-safe (it appears in logs and key names), and
+/// its first characters make two guests in one room distinguishable without
+/// revealing either one's address.
+fn guest_display(handle: &str) -> String {
+    let tag: String = handle.chars().take(4).collect();
+    format!("Guest {tag}")
 }
 
 /// The grant for a recipient already holding a session.

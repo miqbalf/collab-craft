@@ -107,6 +107,14 @@ mod e2e {
         fx.iter().any(|e| matches!(e, Effect::Confirmed { local: l, .. } if *l == local))
     }
 
+    #[test]
+    fn a_valkey_url_logs_without_its_password() {
+        assert_eq!(crate::redact_url("redis://user:pw@valkey:6379/6"), "redis://…@valkey:6379/6");
+        assert_eq!(crate::redact_url("redis://valkey:6379/6"), "redis://valkey:6379/6", "no userinfo, nothing to hide");
+        assert_eq!(crate::redact_url("redis://u:p@host/db?x=@y"), "redis://…@host/db?x=@y", "only the authority's @ is cut");
+        assert_eq!(crate::redact_url("not a url"), "not a url");
+    }
+
     /// The finding: a viewer that only listens kept receiving edits after its
     /// token lapsed. Nothing between connect and disconnect ever read its
     /// expiry again. The viewer's token here lapses two seconds in. Alice

@@ -538,16 +538,25 @@ pub async fn share(State(app): State<Arc<App>>, session: Session, headers: Heade
         }
 
         let sharer = placed.sharer.clone().unwrap_or_else(|| session.display.clone());
-        let email_invitations: Vec<(String, String, i64)> = invitations
-            .iter()
-            .filter_map(|(target, url, expires)| match target {
-                ShareTarget::Email(address) => Some((address.clone(), url.clone(), *expires)),
-                _ => None,
-            })
-            .collect();
+        // Mail goes out only when the caller asked for it. `notify: false` is a
+        // promise that nothing leaves this request, and the invitation mail
+        // carries the document's title and the sharer's name, which is exactly
+        // what the caller asked to withhold. The link still comes back in the
+        // response, so the sharer passes it on themselves.
+        let email_invitations: Vec<(String, String, i64)> = if req.notify {
+            invitations
+                .iter()
+                .filter_map(|(target, url, expires)| match target {
+                    ShareTarget::Email(address) => Some((address.clone(), url.clone(), *expires)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut delivery = deliver(&p, &email_invitations, &sharer, &entry.name).await.into_iter();
         for (target, url, expires) in invitations {
-            let outcome = if matches!(target, ShareTarget::Email(_)) { delivery.next().unwrap_or("mail_failed") } else { "copy" };
+            let outcome = if req.notify && matches!(target, ShareTarget::Email(_)) { delivery.next().unwrap_or("mail_failed") } else { "copy" };
             // Older share dialogs ignore `keyed` and copy `shared[].url`. Put
             // the CollabCraft invite there so they still hand out a link that
             // opens the app. The provider share id stays for revocation.
@@ -647,12 +656,19 @@ fn place(p: &(dyn Provider + Send + Sync), req: &ShareRequest, mint: bool) -> Pl
         sharer: craft_cloud::Accounts::me(p).ok().map(|i| i.display),
     };
 
+    // A password on the share is a gate the sharer asked for. A keyed link
+    // admits whoever holds it with no password asked of anybody, so minting
+    // one here would hand out a way around the gate. With a password set the
+    // provider's own share is the only thing issued, and the recipient goes
+    // through the provider's password prompt like anyone else.
+    let password_gated = req.password.as_deref().is_some_and(|p| !p.trim().is_empty());
     for target in &req.targets {
         // Whether this address needs a keyed link is asked of the provider,
         // never taken from the request. A client naming an address proves
         // nothing about whether an account answers to it, and the answer
         // decides between two quite different kinds of share.
         let keyed = match target {
+            _ if password_gated => None,
             ShareTarget::Email(address) if mint && !has_account(p, address) => Some(target.clone()),
             ShareTarget::Link if mint => Some(target.clone()),
             _ => None,
@@ -880,7 +896,11 @@ pub async fn web(State(app): State<Arc<App>>, session: Option<Session>, req: axu
         }
     }
 
-    match tower::ServiceExt::oneshot(app.web.clone(), req).await {
+    let Some(web) = app.web.clone() else {
+        return (StatusCode::NOT_FOUND, Json(ApiError { code: "no_web_root", detail: "this deployment serves no browser builds".to_owned() }))
+            .into_response();
+    };
+    match tower::ServiceExt::oneshot(web, req).await {
         Ok(r) => {
             let mut response = r.into_response();
             if let Some(value) = cache_for(&path) {

@@ -212,10 +212,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // then refuses every submit is harder to diagnose than one that will not
     // start.
     bus.check_writable().await?;
-    tracing::info!(%valkey_url, "bus ready");
+    // Redacted, because a deployment may embed a password in the URL and a log
+    // is read by people who were never given it.
+    tracing::info!(valkey_url = %redact_url(&valkey_url), "bus ready");
 
     let secret_bytes = secret.clone().into_bytes();
     let relay = Arc::new(Relay { secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
+    // For the health route, which outlives the move into the socket layer.
+    let health_relay = relay.clone();
 
     // Cap the transport too. Room::submit refuses an oversized `params` after decoding, and a
     // cap there still means the bytes were read and parsed first. This refuses them at the
@@ -236,16 +240,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let web_root = std::env::var("COLLABCRAFT_WEB_ROOT").unwrap_or_default();
     // Read once. A directory listing per request would be a disk hit on every
     // asset, and the set only changes on deploy.
-    let hosted: Vec<String> = std::fs::read_dir(&web_root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    if !web_root.is_empty() {
+    let hosted: Vec<String> = if web_root.is_empty() {
+        Vec::new()
+    } else {
+        std::fs::read_dir(&web_root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if web_root.is_empty() {
+        // No root, no file service. ServeDir over an empty root resolves
+        // against the working directory, and a direct launch from a stack
+        // directory would then serve whatever sits there, `.env` included.
+        tracing::warn!("COLLABCRAFT_WEB_ROOT is not set: no browser builds are served");
+    } else {
         tracing::info!(count = hosted.len(), "browser builds hosted");
     }
     let esign = esign::EsignRuntime::from_env(&secret_bytes).await?;
@@ -253,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Precompressed on disk, sent with the Content-Encoding header.
         // Brotli at a high level costs minutes per wasm bundle, which is
         // unaffordable per request and free once at deploy.
-        web: tower_http::services::ServeDir::new(&web_root).precompressed_br().precompressed_gzip(),
+        web: (!web_root.is_empty()).then(|| tower_http::services::ServeDir::new(&web_root).precompressed_br().precompressed_gzip()),
         hosted,
         secret: secret_bytes,
         relay_url: std::env::var("COLLABCRAFT_PUBLIC_RELAY").unwrap_or_else(|_| format!("http://{bind}")),
@@ -349,7 +362,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Applying it earlier leaves the fallback still wanting state, and the
     // router then will not serve at all.
     let app = axum::Router::new()
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        // Health includes the bus. A static "ok" kept answering after Valkey
+        // went away, and a deploy gate reading it then called a relay healthy
+        // that could not order a single edit.
+        .route(
+            "/healthz",
+            axum::routing::get(move || {
+                let relay = health_relay.clone();
+                async move {
+                    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let mut bus = relay.bus.lock().await;
+                        bus.ping().await
+                    })
+                    .await;
+                    match pong {
+                        Ok(Ok(())) => (axum::http::StatusCode::OK, "ok"),
+                        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the bus is unreachable"),
+                    }
+                }
+            }),
+        )
         .merge(web)
         .nest("/api/v1", api)
         .nest("/auth", auth_routes)
@@ -932,6 +964,21 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// A URL with any userinfo replaced, fit for a log line.
+///
+/// `redis://user:password@valkey:6379/6` logs as `redis://…@valkey:6379/6`.
+/// String surgery rather than a parser, because the input came straight from
+/// the deployment's own environment and only ever needs its secret removed.
+fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.to_owned() };
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{}…@{}", &url[..scheme_end + 3], &rest[at + 1..]),
+        None => url.to_owned(),
+    }
 }
 
 /// The socket's claims, but only while its token still stands.

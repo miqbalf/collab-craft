@@ -75,11 +75,24 @@ fn a_listing_drops_the_folder_itself_and_keys_rooms_on_the_path() {
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].name, "Report Q3.docx");
     assert_eq!(got[0].id, "/Report Q3.docx");
-    assert_eq!(got[0].room, "/Report Q3.docx");
+    // No file id on plain WebDAV, so the room is the path scoped by the
+    // account, keeping two accounts' identically-named private files apart.
+    assert!(got[0].room.ends_with(":/Report Q3.docx"), "room carries the path: {}", got[0].room);
+    assert_ne!(got[0].room, "/Report Q3.docx", "the bare path would collide across accounts");
     assert_eq!(got[0].etag.as_deref(), Some("abc"));
     assert_eq!(got[0].size, Some(2048));
     assert_eq!(got[1].kind, craft_cloud::EntryKind::Folder);
     assert_eq!(fake.urls(), vec!["https://files.example.org/dav/alice/".to_owned()], "the root is asked for with its slash");
+}
+
+#[test]
+fn two_accounts_do_not_share_a_path_keyed_room() {
+    let a = WebDav::new(&layout(), "alice", "pw", &Fake::new(vec![Response::new(207, LISTING)]));
+    let b = WebDav::new(&layout(), "bob", "pw", &Fake::new(vec![Response::new(207, LISTING)]));
+    let room_a = a.list("").expect("listed")[0].room.clone();
+    let room_b = b.list("").expect("listed")[0].room.clone();
+    assert_ne!(room_a, room_b, "the same path under two accounts must be two rooms");
+    assert!(room_a.ends_with(":/Report Q3.docx") && room_b.ends_with(":/Report Q3.docx"));
 }
 
 #[test]

@@ -148,7 +148,21 @@ fn lift(e: Error) -> CloudError {
     }
 }
 
-fn entry_from(e: craft_nextcloud::Entry) -> CloudEntry {
+/// A short stable tag for one account, for scoping path-keyed rooms.
+///
+/// 16 hex from an FNV-1a over the server and user. No cryptographic claim is
+/// made of it: it only has to differ between two accounts, and a local hash
+/// avoids a dependency for that.
+fn account_scope(account: &Account) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in account.base().bytes().chain(std::iter::once(0)).chain(account.user().bytes()) {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn entry_from(e: craft_nextcloud::Entry, scope: &str) -> CloudEntry {
     // Read the grant from the server's own `oc:permissions` where it reports
     // one. A plain WebDAV server (RFC 4918 has no writability property) sends
     // none, `writable()` answers `None`, and the default stands. A server that
@@ -158,9 +172,13 @@ fn entry_from(e: craft_nextcloud::Entry) -> CloudEntry {
     CloudEntry {
         id: e.path.clone(),
         // A server reporting a file id (ownCloud Infinite Scale, SabreDAV with
-        // the ownCloud plugin) keeps the room across a rename. Plain WebDAV has
-        // nothing stable but the path, so a rename mid-session splits the room.
-        room: if e.file_id.is_empty() { e.path.clone() } else { e.file_id.clone() },
+        // the ownCloud plugin) keeps the room across a rename, and that id is
+        // the server's own, so two accounts opening one shared file land in one
+        // room. Plain WebDAV has no such id: the path is all there is, and two
+        // separate accounts each naming a private `/draft` would otherwise share
+        // a room. The account scope keeps those apart. Plain WebDAV has no
+        // sharing anyway, so scoping the fallback costs no real co-editing.
+        room: if e.file_id.is_empty() { format!("{scope}:{}", e.path) } else { e.file_id.clone() },
         name: e.name,
         path: e.path,
         kind: if e.is_dir { EntryKind::Folder } else { EntryKind::File },
@@ -177,11 +195,12 @@ impl<H: Http> craft_cloud::Files for WebDav<H> {
     fn list(&self, path: &str) -> CloudResult<Vec<CloudEntry>> {
         let at = if path.is_empty() { "/" } else { path };
         let mut out = Vec::new();
+        let scope = account_scope(&self.account);
         for e in self.files().list(&self.http, at).map_err(lift)? {
             if e.path.trim_end_matches('/') == at.trim_end_matches('/') {
                 continue;
             }
-            out.push(entry_from(e));
+            out.push(entry_from(e, &scope));
         }
         Ok(out)
     }
@@ -220,7 +239,8 @@ impl<H: Http> craft_cloud::Files for WebDav<H> {
     }
 
     fn stat(&self, id: &str) -> CloudResult<CloudEntry> {
-        self.files().stat(&self.http, id).map(entry_from).map_err(lift)
+        let scope = account_scope(&self.account);
+        self.files().stat(&self.http, id).map(|e| entry_from(e, &scope)).map_err(lift)
     }
 }
 

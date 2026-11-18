@@ -56,6 +56,12 @@ pub enum TokenError {
 pub struct Claims {
     /// The room. Opaque here: whatever the provider calls this document, as
     /// long as it survives a rename.
+    ///
+    /// The Nextcloud plugin's early releases signed this field as `fid` and as
+    /// a number. Both spellings are accepted on the way in, so a deployment
+    /// still carrying that plugin keeps working against this relay. Signing
+    /// always writes `rm`.
+    #[serde(alias = "fid", deserialize_with = "room_claim")]
     pub rm: String,
     /// Who this is, as the identity provider names them.
     pub uid: String,
@@ -68,6 +74,20 @@ pub struct Claims {
     pub exp: i64,
     /// Peer id for this one connection.
     pub pid: String,
+}
+
+/// A room claim, as the string it is or as the legacy plugin's numeric file id.
+fn room_claim<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Text(String),
+        Number(i64),
+    }
+    Ok(match Raw::deserialize(de)? {
+        Raw::Text(s) => s,
+        Raw::Number(n) => n.to_string(),
+    })
 }
 
 impl Claims {
@@ -154,4 +174,35 @@ pub fn verify(token: &str, secret: &[u8], now: i64) -> Result<Claims, TokenError
     }
 
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &[u8] = b"a-shared-secret-at-least-32-chars-long";
+
+    /// A token the current API mints round-trips.
+    #[test]
+    fn a_signed_token_verifies() {
+        let token = sign_at(SECRET, "file-123", "alice", "Alice", true, "peer-1", 1_000).unwrap();
+        let claims = verify(&token, SECRET, 1_100).unwrap();
+        assert_eq!(claims.rm, "file-123");
+        assert!(claims.may_edit());
+    }
+
+    /// The legacy Nextcloud plugin signed the room as a numeric `fid`. The
+    /// relay still accepts it, so a deployment carrying that plugin keeps
+    /// working. Hand-built because `sign_at` only ever writes `rm`.
+    #[test]
+    fn a_legacy_fid_token_is_accepted_as_a_room() {
+        let payload = serde_json::json!({ "fid": 4096, "uid": "bob", "dsp": "Bob", "perm": PERMISSION_READ, "exp": 2_000i64, "pid": "p" });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(SECRET).unwrap();
+        mac.update(payload_b64.as_bytes());
+        let token = format!("{payload_b64}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()));
+
+        let claims = verify(&token, SECRET, 1_000).expect("the numeric fid is read as the room");
+        assert_eq!(claims.rm, "4096", "the numeric file id becomes the room string");
+    }
 }

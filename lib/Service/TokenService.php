@@ -66,7 +66,10 @@ class TokenService {
 		// Short keys because this travels in every join. See the README for the
 		// field table.
 		$payload = [
-			'fid' => $fileId,
+			// `rm`, a string, which is what the relay's Claims require. The
+			// field was signed as a numeric `fid` in early releases, and the
+			// relay still accepts that spelling for tokens already in flight.
+			'rm' => (string)$fileId,
 			'uid' => $uid,
 			'dsp' => $displayName,
 			// Nextcloud's own bits, unchanged. The relay refuses a submit when

@@ -226,7 +226,11 @@ pub struct App {
     /// new one costs a connection pool.
     pub http: reqwest::Client,
     /// Serves the browser builds, behind the per-app permission check.
-    pub web: tower_http::services::ServeDir,
+    ///
+    /// Absent when `COLLABCRAFT_WEB_ROOT` is unset. Serving with no root would
+    /// resolve against the working directory, and a direct launch from a stack
+    /// directory would then hand out whatever sits there, `.env` included.
+    pub web: Option<tower_http::services::ServeDir>,
     /// Directory names under the web root, which are the apps this deployment
     /// actually hosts. Read once at startup rather than from disk per request.
     pub hosted: Vec<String>,

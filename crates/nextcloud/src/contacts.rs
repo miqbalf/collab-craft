@@ -151,10 +151,21 @@ impl<'a> Contacts<'a> {
         Ok(out)
     }
 
-    /// Turn a server path into an absolute URL, leaving an already-absolute one alone.
+    /// Turn a server path into an absolute URL against the account's own base.
+    ///
+    /// The href comes from the CardDAV server's own response. An absolute one
+    /// is honoured only when it points back at the account's base: the request
+    /// built from it carries this account's app password in an Authorization
+    /// header, and a server answering with an href on another host would
+    /// otherwise have the credential sent there. A cross-host href is refused,
+    /// and a rooted path is resolved against the base as before.
     fn resolve(&self, href: &str) -> Result<String> {
         if href.starts_with("http://") || href.starts_with("https://") {
-            return Ok(href.to_owned());
+            let base = self.account.base();
+            if href == base || href.strip_prefix(base).is_some_and(|rest| rest.starts_with('/')) {
+                return Ok(href.to_owned());
+            }
+            return Err(Error::invalid("address book href", format!("{href:?} is not under this account's server {base:?}")));
         }
         if !href.starts_with('/') {
             return Err(Error::invalid("address book href", format!("{href:?} is neither absolute nor rooted")));

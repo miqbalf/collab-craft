@@ -102,8 +102,13 @@ impl Store {
         }
     }
 
+    /// The storage key for one session.
+    ///
+    /// Keyed on a tag of the id, not the id itself. The id is the bearer
+    /// cookie, so a keyspace, a backup or a replica keyed on it would hand a
+    /// reader a working session. The tag is one-way, so it hands them nothing.
     fn session_key(&self, id: &str) -> String {
-        format!("{}:session:{id}", self.prefix)
+        format!("{}:session:{}", self.prefix, crate::sealed::tag(&self.secret, "session-id", id))
     }
 
     fn link_key(&self, user: &str) -> String {
@@ -113,13 +118,22 @@ impl Store {
     pub async fn put_session(&self, id: &str, session: &crate::session::Session) -> bool {
         let Some(mut c) = self.conn().await else { return false };
         let Ok(body) = serde_json::to_string(session) else { return false };
-        if c.set_ex::<_, _, ()>(self.session_key(id), body, SESSION_TTL_SECS).await.is_err() {
+        // Sealed at rest. A session carries the signed-in user's email and
+        // group membership, which a keyspace reader has no business seeing in
+        // the clear any more than a provider credential.
+        let sealed = crate::sealed::seal(&self.secret, "session", &body);
+        if sealed.is_empty() {
+            return false;
+        }
+        let key = self.session_key(id);
+        if c.set_ex::<_, _, ()>(&key, sealed, SESSION_TTL_SECS).await.is_err() {
             return false;
         }
         // Indexed by user so signing out can end every session this person
-        // has, not only the one whose cookie happens to be in hand.
+        // has, not only the one whose cookie happens to be in hand. The index
+        // holds the storage keys, never the raw ids, so it leaks no cookie.
         let index = self.user_sessions_key(&session.user);
-        let _ = c.sadd::<_, _, ()>(&index, id).await;
+        let _ = c.sadd::<_, _, ()>(&index, &key).await;
         let _ = c.expire::<_, ()>(&index, SESSION_TTL_SECS as i64).await;
         true
     }
@@ -132,9 +146,9 @@ impl Store {
     pub async fn drop_sessions_for(&self, user: &str) {
         let Some(mut c) = self.conn().await else { return };
         let index = self.user_sessions_key(user);
-        let ids: Vec<String> = c.smembers(&index).await.unwrap_or_default();
-        for id in ids {
-            let _ = c.del::<_, ()>(self.session_key(&id)).await;
+        let keys: Vec<String> = c.smembers(&index).await.unwrap_or_default();
+        for key in keys {
+            let _ = c.del::<_, ()>(&key).await;
         }
         let _ = c.del::<_, ()>(&index).await;
     }
@@ -142,7 +156,8 @@ impl Store {
     pub async fn session(&self, id: &str) -> Option<crate::session::Session> {
         let mut c = self.conn().await?;
         let body: String = c.get(self.session_key(id)).await.ok()?;
-        serde_json::from_str(&body).ok()
+        let opened = crate::sealed::open(&self.secret, "session", &body)?;
+        serde_json::from_str(&opened).ok()
     }
 
     pub async fn put_provider_link(&self, user: &str, link: &ProviderLink) -> bool {

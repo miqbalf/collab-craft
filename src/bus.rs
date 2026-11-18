@@ -86,6 +86,12 @@ impl Bus {
         Ok(Bus { conn })
     }
 
+    /// Whether the bus still answers. The health route's whole question.
+    pub async fn ping(&mut self) -> Result<(), BusError> {
+        redis::cmd("PING").query_async::<()>(&mut self.conn).await?;
+        Ok(())
+    }
+
     /// Fail now if this connection cannot write.
     ///
     /// Called at startup so a misrouted relay dies immediately with a clear

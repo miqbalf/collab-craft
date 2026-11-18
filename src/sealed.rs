@@ -43,6 +43,28 @@ fn subkey(secret: &[u8], domain: &str) -> [u8; 32] {
     key
 }
 
+/// A stable, non-reversible tag for a value, for use as a storage key.
+///
+/// An HMAC under the service secret, hex. Keying a session on `tag(id)` rather
+/// than on `id` keeps the raw id, which is the bearer cookie, out of the
+/// keyspace: a reader of a backup, a replica or the AOF then holds no value
+/// they can present as a cookie. With no secret (tests only) it falls back to
+/// an unkeyed hash, which is still stable.
+pub fn tag(secret: &[u8], domain: &str, value: &str) -> String {
+    let key = if secret.is_empty() { b"collabcraft-tag-fallback".as_slice() } else { secret };
+    let mut mac = <Hmac<Sha256> as HmacKeyInit>::new_from_slice(key).expect("hmac takes any key length");
+    mac.update(domain.as_bytes());
+    mac.update(b":");
+    mac.update(value.as_bytes());
+    let out = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(out.len() * 2);
+    for byte in out {
+        hex.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        hex.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    hex
+}
+
 /// Seal a plaintext value for storage under `domain`.
 ///
 /// Returns the plaintext unchanged when no secret is configured, which is the
