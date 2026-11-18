@@ -62,6 +62,9 @@ mod review_reverify2;
 #[cfg(test)]
 mod review_lease_lapse;
 
+#[cfg(test)]
+mod review_outbound_expiry;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -537,7 +540,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         let _ = socket.emit("ephemeral", &serde_json::json!({ "doc": room_name.clone(), "origin": peer, "kind": kind, "payload": payload }));
     }
 
-    let _ = socket.to(room_name.clone()).emit("presence", &serde_json::json!({ "doc": room_name, "roster": roster })).await;
+    emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
 
     tracing::info!(uid = %claims.uid, peer = %peer_id, room = %room_key, may_edit = claims.may_edit(), "peer joined");
 }
@@ -599,10 +602,11 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
                                 // The room still believes `holder` does, from the grant it was
                                 // told about with no matching release ever heard, so the lapse
                                 // is announced the same way a real unlock is.
-                                let _ = socket
-                                    .within(room_name.clone())
-                                    .emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": scope_name }))
-                                    .await;
+                                emit_live(
+                                    socket.within(room_name.clone()),
+                                    "lock_released",
+                                    &serde_json::json!({ "doc": room_name, "scope": scope_name }),
+                                );
                             }
                             if claims.may_edit() { Ok(()) } else { Err(Refusal::ReadOnly) }
                         }
@@ -673,7 +677,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             }
             // To the whole room, sender included. The sender recognises its own
             // op by the echoed local counter and confirms rather than reapplies.
-            let _ = socket.within(room_name).emit("op", &OpMsg::new(&claims, &op)).await;
+            emit_live(socket.within(room_name), "op", &OpMsg::new(&claims, &op));
         }
         Err(refusal) => {
             let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail() });
@@ -729,10 +733,11 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
                 rooms.entry(claims.rm.clone()).or_default().record_lock(&claims.pid, msg.scope.clone());
             }
             let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope }));
-            let _ = socket
-                .to(room_name.clone())
-                .emit("presence_lock", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "holder": claims.pid }))
-                .await;
+            emit_live(
+                socket.to(room_name.clone()),
+                "presence_lock",
+                &serde_json::json!({ "doc": room_name, "scope": msg.scope, "holder": claims.pid }),
+            );
         }
         Ok(LockOutcome::Held { holder }) => {
             {
@@ -770,7 +775,7 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): S
     // check, so both stay false and nothing broadcasts, which is what keeps a late unlock for a
     // scope somebody else has since claimed a no-op.
     if bus_released || mirror_released {
-        let _ = socket.within(room_name.clone()).emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": msg.scope })).await;
+        emit_live(socket.within(room_name.clone()), "lock_released", &serde_json::json!({ "doc": room_name, "scope": msg.scope }));
     }
 }
 
@@ -823,7 +828,7 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
         return;
     }
 
-    let _ = socket.to(room_name.clone()).emit("frame", &serde_json::json!({ "doc": room_name, "origin": claims.pid, "payload": msg.payload })).await;
+    emit_live(socket.to(room_name.clone()), "frame", &serde_json::json!({ "doc": room_name, "origin": claims.pid, "payload": msg.payload }));
 }
 
 /// Record and pass on one latest-wins value about this peer.
@@ -845,10 +850,11 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
         return;
     }
 
-    let _ = socket
-        .to(room_name.clone())
-        .emit("ephemeral", &serde_json::json!({ "doc": room_name, "origin": claims.pid, "kind": msg.kind, "payload": msg.payload }))
-        .await;
+    emit_live(
+        socket.to(room_name.clone()),
+        "ephemeral",
+        &serde_json::json!({ "doc": room_name, "origin": claims.pid, "kind": msg.kind, "payload": msg.payload }),
+    );
 }
 
 /// Record that the document was saved, so the file's own content is no longer
@@ -914,11 +920,11 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
             let mut bus = relay.bus.lock().await;
             let _ = bus.release(&claims.rm, scope, &claims.pid).await;
         }
-        let _ = socket.to(room_name.clone()).emit("lock_released", &serde_json::json!({ "doc": room_name, "scope": scope })).await;
+        emit_live(socket.to(room_name.clone()), "lock_released", &serde_json::json!({ "doc": room_name, "scope": scope }));
     }
 
     if !empty {
-        let _ = socket.to(room_name.clone()).emit("presence", &serde_json::json!({ "doc": room_name, "roster": roster })).await;
+        emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
     }
 
     tracing::info!(peer = %claims.pid, room = %claims.rm, locks_dropped = dropped.len(), "peer left");
@@ -933,7 +939,8 @@ fn now_unix() -> i64 {
 /// Authorisation is decided once, at connect, and cached on the socket. That
 /// alone would let a withdrawn or downgraded share keep editing for as long as
 /// the socket stays open, which has no bound. Re-reading expiry on every
-/// message that changes the document bounds it to the token's own lifetime:
+/// message that changes the document and on every delivery that
+/// [`emit_live`] fans out bounds it to the token's own lifetime:
 /// once the token lapses the peer is dropped and has to fetch another, and
 /// minting one re-stats the provider and re-decides the grant. A client that
 /// refreshes its token before then sees no interruption. Disconnecting is safe
@@ -948,4 +955,23 @@ fn live_claims(socket: &SocketRef) -> Option<Claims> {
         return None;
     }
     Some(claims)
+}
+
+/// Deliver one event to every targeted room member whose token still stands.
+///
+/// The adapter's own broadcast hands the payload to each member with no look
+/// at who is receiving. The inbound recheck in [`live_claims`] never fires for
+/// a member that only listens. Such a member used to keep receiving every
+/// edit for as long as its socket stayed open. Fanning out here puts the same
+/// recheck on the delivery path. A lapsed member never sees the event and is
+/// disconnected the first time one would have reached it. The disconnect runs
+/// `on_disconnect`, releasing the member's locks and correcting the roster
+/// the same way an inbound-side drop does.
+fn emit_live<T: ?Sized + serde::Serialize>(targets: socketioxide::operators::BroadcastOperators, event: &str, data: &T) {
+    for member in targets.sockets() {
+        if live_claims(&member).is_none() {
+            continue;
+        }
+        let _ = member.emit(event, data);
+    }
 }
