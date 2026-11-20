@@ -445,6 +445,7 @@ mod keyed_links {
             hosted: vec!["gridcraft".to_owned(), "wordcraft".to_owned()],
             keyed,
             esign: None,
+            public_apps: false,
         }
     }
 
@@ -976,6 +977,7 @@ mod web {
             hosted: hosted.iter().map(|a| (*a).to_owned()).collect(),
             keyed: Policy::decide(None, "https://craft.example.com", None, None),
             esign: None,
+            public_apps: false,
         }
     }
 
@@ -1463,6 +1465,29 @@ mod web {
 
     // ---- the gate, through the handler --------------------------------------
 
+    /// With `COLLABCRAFT_PUBLIC_APPS` on, a static build is served to a visitor with no
+    /// session, under the bare path and under `/apps/`. Off, the same request still goes to
+    /// sign-in. The gate is untouched for every other deployment.
+    #[tokio::test]
+    async fn public_apps_serve_without_session() {
+        let get = |path: &str| axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).expect("a request");
+
+        let mut open = service(Permissions::decide("gridcraft", &[]), env_provider("https://cloud.example.com"), &["gridcraft"]);
+        open.public_apps = true;
+        let open = Arc::new(open);
+        for path in ["/gridcraft/index.html", "/apps/gridcraft/index.html"] {
+            let r = crate::api::web(State(open.clone()), None, get(path)).await;
+            assert_ne!(r.status(), StatusCode::TEMPORARY_REDIRECT, "{path} must not ask a public visitor to sign in");
+            assert_ne!(r.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        let closed = Arc::new(service(Permissions::decide("gridcraft", &[]), env_provider("https://cloud.example.com"), &["gridcraft"]));
+        for path in ["/gridcraft/index.html", "/apps/gridcraft/index.html"] {
+            let r = crate::api::web(State(closed.clone()), None, get(path)).await;
+            assert_eq!(r.status(), StatusCode::TEMPORARY_REDIRECT, "{path} stays behind the session when apps are not public");
+        }
+    }
+
     #[tokio::test]
     async fn the_setup_page_refuses_somebody_outside_the_group() {
         let app = Arc::new(service(Permissions::decide("gridcraft", &[]), admin_settings(), &["gridcraft"]));
@@ -1592,4 +1617,65 @@ fn token_from_php_verifies() {
     assert_eq!(claims.pid, "bob~0a1b2c3d");
     assert!(claims.may_edit());
     assert!(matches!(token::verify(fixture, PHP_SECRET, claims.exp), Err(TokenError::Expired { .. })));
+}
+
+// ---- protocol version, text cap, saved marker -----------------------------
+
+mod relay_proto {
+    use serde_json::json;
+
+    use crate::room::{Room, Submission};
+    use crate::{Handshake, PROTO, check_proto};
+
+    fn handshake(v: serde_json::Value) -> Handshake {
+        serde_json::from_value(v).expect("a handshake")
+    }
+
+    #[test]
+    fn wrong_proto_is_refused() {
+        assert_eq!(PROTO, "craft-live/1");
+        assert!(check_proto(&handshake(json!({"token": "t", "proto": "craft-live/1"}))).is_ok());
+        for bad in [json!({"token": "t"}), json!({"token": "t", "proto": null}), json!({"token": "t", "proto": "craft-live/2"}), json!({"token": "t", "proto": ""})] {
+            assert_eq!(check_proto(&handshake(bad.clone())), Err("version mismatch"), "{bad}");
+        }
+    }
+
+    fn fill(cap: usize, total: usize) -> Room {
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        let chunk = "x".repeat(1024 * 1024);
+        for i in 0..total {
+            let sub = Submission {
+                peer_id: "alice".to_owned(),
+                may_edit: true,
+                command: "crdt.text".to_owned(),
+                params: json!({"scope": "doc", "ops": [{"blob": chunk}]}),
+                scope: None,
+                local: None,
+            };
+            r.submit(i as u64 + 1, sub).expect("accepted into the history");
+        }
+        r
+    }
+
+    #[test]
+    fn text_log_cap_follows_config() {
+        const MIB: usize = 1024 * 1024;
+        let small = fill(16 * MIB, 17);
+        assert!(!small.texts().get("doc").expect("scope").complete(), "17 MiB does not fit a 16 MiB cap");
+        let big = fill(32 * MIB, 17);
+        let log = big.texts().get("doc").expect("scope");
+        assert!(log.complete(), "17 MiB fits a 32 MiB cap");
+        assert_eq!(log.ops().len(), 17);
+    }
+
+    #[test]
+    fn saved_ephemeral_is_replayed_to_joiner() {
+        let mut r = Room::default();
+        r.remember_ephemeral("alice", "saved", json!({"seq": 7, "etag": "abc"})).expect("ok");
+        // The saver leaves; a later joiner still learns which file version is the baseline.
+        r.leave("alice");
+        let state = r.ephemeral();
+        assert!(state.iter().any(|(_, kind, v)| kind == "saved" && v == &json!({"seq": 7, "etag": "abc"})), "{state:?}");
+    }
 }

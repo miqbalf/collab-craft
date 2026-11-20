@@ -25,6 +25,10 @@ RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends git ca-certificates pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# Optional cap on parallel rustc jobs, for a shared build host.
+ARG CARGO_BUILD_JOBS=
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 COPY . .
 
 # No Cargo.lock is committed, so --locked fails on a first build. The fallback

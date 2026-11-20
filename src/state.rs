@@ -238,6 +238,10 @@ pub struct App {
     pub keyed: crate::keyed::Policy,
     /// Durable e-sign envelopes. Absent when `COLLABCRAFT_ESIGN_DATABASE_URL` is unset.
     pub esign: Option<crate::esign::EsignRuntime>,
+    /// `COLLABCRAFT_PUBLIC_APPS=1`: the static builds are served without a session. For a
+    /// deployment where the host application authenticates every join through its own
+    /// tickets, so the apps are only shells.
+    pub public_apps: bool,
 }
 
 impl App {
