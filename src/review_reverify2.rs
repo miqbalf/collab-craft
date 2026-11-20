@@ -276,7 +276,7 @@ mod e2e {
         cell_edits(&mut a, &[1, 2]).await;
         // The save goes through a checkpoint, the only save the relay accepts. Carol is the
         // saver: a separate replica of the document, as the service worker is.
-        let t = token::sign_at(SECRET, &room, "carol", "carol", true, "carol", now()).unwrap();
+        let t = token::sign_at(SECRET, &room, "craft_office", "carol", true, "carol", now()).unwrap();
         let mut saver = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
         assert!(saver.save().await, "the checkpoint was not accepted: {:?}", saver.work);
         saver.until(Duration::from_millis(200), |_, _| false).await;
@@ -419,7 +419,7 @@ mod e2e {
     async fn e2e_a_relay_under_a_base_path_is_reached_and_acks_a_save() {
         let Some(h) = start_under("/craft").await else { return };
         let room = unique_room("base-path");
-        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let t = token::sign_at(SECRET, &room, "craft_office", "alice", true, "alice", now()).unwrap();
         let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
         a.insert(5, "!");
         assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
@@ -433,7 +433,7 @@ mod e2e {
     async fn e2e_a_two_mib_snapshot_checkpoints_at_the_default_cap() {
         let Some(h) = start_with("", crate::DEFAULT_TEXT_BYTES).await else { return };
         let room = unique_room("big-snap");
-        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let t = token::sign_at(SECRET, &room, "craft_office", "alice", true, "alice", now()).unwrap();
         let file = "ab".repeat(800 * 1024);
         let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), &file).await;
         a.insert(0, "!");
@@ -448,7 +448,7 @@ mod e2e {
     async fn e2e_a_snapshot_over_the_cap_is_refused_not_retried() {
         let Some(h) = start_with("", 1 << 20).await else { return };
         let room = unique_room("over-cap");
-        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let t = token::sign_at(SECRET, &room, "craft_office", "alice", true, "alice", now()).unwrap();
         let file = "ab".repeat(600 * 1024);
         let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), &file).await;
         let refused = a.live.checkpoint();
@@ -465,7 +465,7 @@ mod e2e {
         let Some(h) = start_with("", crate::DEFAULT_TEXT_BYTES).await else { return };
         let room = unique_room("full-scope");
         let doc = format!("doc:{room}");
-        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let t = token::sign_at(SECRET, &room, "craft_office", "alice", true, "alice", now()).unwrap();
         let file = "ab".repeat(5 * 1024 * 1024);
         let mut a = LivePeer::open(&h.url, &t, &doc, &file).await;
         a.insert(0, &"1".repeat(1024 * 1024));
@@ -489,5 +489,58 @@ mod e2e {
         b.live.seed(&crate::test_text::para(&file)).expect("restores");
         assert_eq!(b.text().len(), a.text().len());
         assert!(b.text() == a.text(), "the fallback joiner did not converge");
+    }
+
+    /// Round 5, 6: a join whose replay is close to the whole op history queues every op on the
+    /// socket at once. engineioxide's default buffer holds 128 packets and an emit past it
+    /// fails, which used to leave the joiner with a gap; the buffer now holds the longest
+    /// replay and the joiner converges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_near_max_replay_reaches_a_late_joiner_whole() {
+        let Some(h) = start().await else { return };
+        let room = unique_room("long-replay");
+        let doc = format!("doc:{room}");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let mut a = LivePeer::open(&h.url, &t, &doc, "hello").await;
+        let edits = crate::room::HISTORY - 48;
+        for i in 0..edits {
+            a.insert(0, if i % 2 == 0 { "a" } else { "b" });
+            if i % 200 == 0 {
+                a.until(Duration::from_millis(20), |_, _| false).await;
+            }
+        }
+        let seq = || async { h.relay.rooms.lock().await.get(&room).map(crate::room::Room::seq).unwrap_or(0) };
+        let end = tokio::time::Instant::now() + Duration::from_secs(30);
+        while seq().await < edits as u64 && tokio::time::Instant::now() < end {
+            a.until(Duration::from_millis(100), |_, _| false).await;
+        }
+        assert_eq!(seq().await, edits as u64, "every edit was ordered");
+
+        let t = token::sign_at(SECRET, &room, "bob", "bob", true, "bob", now()).unwrap();
+        let mut b = LivePeer::join_late(&h.url, &t, &doc, "hello").await;
+        let want = a.text();
+        assert_eq!(want.len(), edits + 5);
+        let target = want.clone();
+        b.until(Duration::from_secs(20), move |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == target)).await;
+        assert!(b.text() == want, "the late joiner has {} of {} chars", b.text().len(), want.len());
+    }
+
+    /// Round 5, 3: a checkpoint from an editor that is not the service saver is refused for
+    /// good, so it neither moves the room's baseline nor loops on retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_an_editors_checkpoint_is_refused_for_good() {
+        let Some(h) = start().await else { return };
+        let room = unique_room("not-saver");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
+        a.insert(5, "!");
+        assert!(!a.save().await);
+        assert!(a.work.iter().any(|w| matches!(w, craft_collab::Work::CheckpointRefused { .. })), "{:?}", a.work);
+        let room_state = h.relay.rooms.lock().await;
+        let r = room_state.get(&room).expect("the room");
+        assert_eq!(r.saved_seq(), 0);
+        assert!(r.texts().values().all(|l| !l.starts_with_snapshot() && l.ops().len() == 1), "no snapshot was retained");
     }
 }

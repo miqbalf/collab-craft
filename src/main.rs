@@ -106,8 +106,15 @@ fn transport_cap(text_cap: usize) -> usize {
 /// to 1 MiB while a WebSocket one was not. All three now say the same thing.
 fn sized(builder: socketioxide::SocketIoBuilder, text_cap: usize) -> socketioxide::SocketIoBuilder {
     let cap = transport_cap(text_cap);
-    builder.max_payload(cap as u64).ws_max_message_size(cap).ws_max_frame_size(cap)
+    builder.max_payload(cap as u64).ws_max_message_size(cap).ws_max_frame_size(cap).max_buffer_size(SOCKET_BUFFER)
 }
+
+/// Packets a socket may have queued and not yet written. engineioxide's default is 128, and
+/// an emit past it fails rather than waits. A join queues its whole replay at once (up to
+/// [`room::HISTORY`] ops) plus the joined message, the text pieces, the ephemeral state and
+/// whatever goes live meanwhile, so the buffer holds all of that. It is a bound on a count,
+/// not memory set aside: the bytes queued are bounded by what the room retains.
+const SOCKET_BUFFER: usize = room::HISTORY + 512;
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -223,6 +230,13 @@ fn normalise_base(raw: &str) -> Result<String, String> {
 /// Whether this peer may emit the `saved` marker: the service peer, with edit right.
 fn saved_allowed(claims: &Claims, service_uid: &str) -> bool {
     claims.may_edit() && claims.uid == service_uid
+}
+
+/// Whether a submit is a checkpoint snapshot (`"snap": true` on a CRDT op). Only the service
+/// peer may send one, by the same rule as [`saved_allowed`]: a snapshot becomes where every
+/// joiner starts, and an editor's would let any peer reset the room or crowd out the saver's.
+fn is_snapshot(command: &str, params: &serde_json::Value) -> bool {
+    is_crdt_command(command) && params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false)
 }
 
 /// Upper bound for `COLLABCRAFT_TEXT_BYTES`: the native client's frame limit, less the
@@ -760,8 +774,12 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // The ordered ops since the saved version. The joiner applies these on top
     // of the file it loads, exactly as it would a live edit, so the edits made
     // since the last save are not lost. Empty on the fallback path below.
+    // Every one queued on the socket before any is written, so the socket's buffer is sized
+    // to hold the longest replay (see [`SOCKET_BUFFER`]). Should one still not fit, the
+    // join is cut below rather than left with a gap.
+    let mut caught_up = true;
     for op in &replay {
-        let _ = socket.emit("op", &OpMsg::new(&claims, op));
+        caught_up &= socket.emit("op", &OpMsg::new(&claims, op)).is_ok();
     }
 
     // The fallback catch-up for text, used only when the ordered replay above
@@ -771,13 +789,26 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // In pieces no larger than a client can read in one WebSocket frame: a scope can retain
     // up to three caps (edits plus two snapshots). Only the first piece can start with the
     // snapshot, and a client treats the rest as ordinary updates.
+    // `more` on every piece but the last, so a client knows when the catch-up is over and a
+    // link lost midway re-arms it on the rejoin.
     for (scope, ops, complete, snap) in texts {
-        for (i, piece) in text_pieces(&ops, TEXT_OPS_PIECE_BYTES).into_iter().enumerate() {
-            let _ = socket.emit(
+        let pieces = text_pieces(&ops, TEXT_OPS_PIECE_BYTES);
+        let last = pieces.len().saturating_sub(1);
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let sent = socket.emit(
                 "text_ops",
-                &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": piece, "complete": complete, "snap": snap && i == 0 }),
+                &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": piece, "complete": complete, "snap": snap && i == 0, "more": i < last }),
             );
+            caught_up &= sent.is_ok();
         }
+    }
+    if !caught_up {
+        // A catch-up with a hole in it would leave the joiner believing it is current. Cut
+        // the link instead: the client reconnects and the join sends it all again.
+        drop(ordered);
+        tracing::warn!(room = %room_key, "a join's catch-up did not fit the socket's buffer; disconnecting it");
+        let _ = socket.disconnect();
+        return;
     }
     socket.join(room_name.clone());
     drop(ordered);
@@ -813,6 +844,11 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     // crdt.* commands merge; a scope on them is a client bug and is stripped
     // before the lock check so a held region cannot refuse the edit.
     let scope = if is_crdt_command(&msg.command) { None } else { msg.scope };
+    if is_snapshot(&msg.command, &msg.params) && !saved_allowed(&claims, &relay.service_uid) {
+        let refusal = if claims.may_edit() { Refusal::NotTheSaver } else { Refusal::ReadOnly };
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
+        return;
+    }
     let preflight = match &scope {
         Some(scope_name) => {
             let mirrored = {
@@ -878,6 +914,22 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         return;
     }
 
+    // Taken before the sequence, and held only while the op is numbered and recorded.
+    //
+    // Numbering inside the gate keeps the room recording ops in sequence order. Numbered
+    // outside it, seq 10 could be recorded after seq 11 and after a join that read the room at
+    // 11: the joiner's replay ends at 11, it drops the broadcast of 10 as already seen, and
+    // the op is lost to it. With both inside, the op a join reads last is the highest number
+    // handed out so far, and every later one is recorded after the join is done.
+    //
+    // A join holds the gate from reading its replay until its socket is in the broadcast
+    // room, so an op recorded before the join read is in its replay (a later broadcast copy
+    // is dropped by sequence), and one recorded after had to wait for the join to finish, so
+    // its broadcast, whenever it goes out, reaches the joined socket. The lock refresh and the
+    // broadcast below run without the gate.
+    let gate = relay.gate(&claims.rm);
+    let ordered = gate.lock().await;
+
     // The sequence comes from Valkey, so two relay instances cannot hand out
     // the same number.
     let floor = {
@@ -896,13 +948,6 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         }
     };
 
-    // Held only while the op is recorded. That is enough: a join holds the gate from reading
-    // its replay until its socket is in the broadcast room, so an op recorded before the join
-    // read is in its replay (a later broadcast copy is dropped by sequence), and one recorded
-    // after had to wait for the join to finish, so its broadcast, whenever it goes out,
-    // reaches the joined socket. The Valkey round trip below runs without it.
-    let gate = relay.gate(&claims.rm);
-    let ordered = gate.lock().await;
     let outcome = {
         let mut rooms = relay.rooms.lock().await;
         let room = relay.room(&mut rooms, &claims.rm);

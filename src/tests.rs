@@ -1672,6 +1672,7 @@ mod relay_proto {
     use serde_json::json;
 
     use crate::room::{Room, Submission};
+    use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
     use crate::{Handshake, PROTO, check_proto};
 
     fn handshake(v: serde_json::Value) -> Handshake {
@@ -1833,6 +1834,33 @@ mod relay_proto {
         const { assert!(crate::MAX_TEXT_BYTES + 64 * 1024 <= 16 * 1024 * 1024, "one op at the cap fits a client frame") };
     }
 
+    /// Round 5, 3: only the service peer may checkpoint. A snapshot is where every joiner
+    /// starts, so an editor's would let any peer reset the room or crowd out the saver's.
+    #[test]
+    fn only_the_service_peer_may_send_a_snapshot() {
+        use crate::{is_snapshot, saved_allowed};
+        assert!(is_snapshot("crdt.text", &json!({"scope": "doc", "snap": true, "ops": []})));
+        assert!(!is_snapshot("crdt.text", &json!({"scope": "doc", "ops": []})));
+        assert!(!is_snapshot("crdt.text", &json!({"scope": "doc", "snap": "yes", "ops": []})), "the room reads the flag the same way");
+        assert!(!is_snapshot("cell.set", &json!({"snap": true})));
+        let editor = claims_for("alice", PERMISSION_READ | PERMISSION_UPDATE);
+        let service = claims_for("craft_office", PERMISSION_READ | PERMISSION_UPDATE);
+        assert!(!saved_allowed(&editor, "craft_office") && saved_allowed(&service, "craft_office"));
+    }
+
+    /// Round 5, 3a: a snapshot the room refuses does not cost the scope the unsaved one a
+    /// save may still be reporting.
+    #[test]
+    fn a_refused_snapshot_keeps_the_unsaved_one() {
+        let cap = 64 * 1024;
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        submit(&mut r, 1, "crdt.text", json!({"scope": "doc", "ops": ["e"]})).expect("an edit");
+        submit(&mut r, 2, "crdt.text", snapshot_of(cap / 2)).expect("a snapshot");
+        submit(&mut r, 3, "crdt.text", snapshot_of(cap + 1)).expect("ordered, not retained");
+        assert_eq!(r.checkpoint(1), Ok(()), "the snapshot at 2 is still there");
+    }
+
     /// The client hubs name the version this relay checks for.
     #[test]
     fn the_client_speaks_this_relays_protocol() {
@@ -1847,6 +1875,7 @@ mod relay_proto {
             assert!(craft_collab::refusal_is_permanent(&permanent.detail()), "{}", permanent.detail());
         }
         assert!(craft_collab::refusal_is_permanent(&Refusal::TooLargeToRetain { bytes: 17 << 20 }.detail()));
+        assert!(craft_collab::refusal_is_permanent(&Refusal::NotTheSaver.detail()));
         for passing in [Refusal::Locked { holder: "bob".to_owned() }, Refusal::NotACheckpoint { seq: 4 }] {
             assert!(!craft_collab::refusal_is_permanent(&passing.detail()), "{}", passing.detail());
         }

@@ -166,6 +166,11 @@ pub enum ServerMsg {
         complete: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         snap: bool,
+        /// More pieces of this catch-up follow. The relay splits a scope that would not fit
+        /// one WebSocket frame; the catch-up is over only with the piece that has this false.
+        /// Absent from an older relay, which sends one piece.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
     },
     /// An opaque frame, passed through unread and unordered.
     ///

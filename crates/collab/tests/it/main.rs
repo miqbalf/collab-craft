@@ -594,6 +594,7 @@ fn live_sends_yrs_updates_as_crdt_text() {
         ops: params["ops"].clone(),
         complete: true,
         snap: false,
+        more: false,
     });
     let work = bob.pump();
     assert!(matches!(work.as_slice(), [Work::SeedWanted { .. }]), "{work:?}");
@@ -767,7 +768,7 @@ fn wire(up: &[u8]) -> Value {
 }
 
 fn text_ops(ops: Value, snap: bool) -> ServerMsg {
-    ServerMsg::TextOps { doc: "d".to_owned(), scope: DOC_SCOPE.to_owned(), ops, complete: true, snap }
+    ServerMsg::TextOps { doc: "d".to_owned(), scope: DOC_SCOPE.to_owned(), ops, complete: true, snap, more: false }
 }
 
 fn whole(d: &LiveDoc) -> BTreeSet<u64> {
@@ -1338,5 +1339,120 @@ fn an_edit_over_the_advertised_cap_is_refused_for_good() {
     assert!(matches!(&refused, Err(craft_collab::Error::Refused(reason)) if craft_collab::refusal_is_permanent(reason)), "{refused:?}");
     assert!(hub.0.borrow().sent.is_empty(), "nothing was sent");
     assert!(!live.ready_to_type(), "the replica holds an edit the room never saw");
+    assert!(live.edit(|d| d.insert_text(1, 0, "y", &Map::new())).is_err());
+}
+
+// ---- fix round 5 -------------------------------------------------------------------------
+
+fn text_piece(ops: Value, snap: bool, more: bool) -> ServerMsg {
+    ServerMsg::TextOps { doc: "d".to_owned(), scope: DOC_SCOPE.to_owned(), ops, complete: true, snap, more }
+}
+
+fn with_cap(mut join: ServerMsg, cap: u64) -> ServerMsg {
+    if let ServerMsg::Joined { text_cap, .. } = &mut join {
+        *text_cap = Some(cap);
+    }
+    join
+}
+
+/// Round 5, 1: a catch-up in pieces is over only with its last piece. A link lost midway
+/// leaves it unfinished, so the rejoin re-arms it: no checkpoint goes out until the whole
+/// catch-up has arrived again, and the replica ends with every piece.
+#[test]
+fn a_catch_up_in_pieces_ends_only_with_the_last() {
+    let mut worker = replica(&sample(), 9);
+    let saved_file = file_of(&worker);
+    let u1 = worker.insert_text(2, 0, "¡", &Map::new()).unwrap();
+    let snap = worker.state();
+    let u2 = worker.insert_text(4, 0, ">", &Map::new()).unwrap();
+    let _ = u1;
+
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&saved_file).unwrap();
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), text_piece(json!([wire(&snap)]), true, true)]);
+    live.pump();
+    assert!(live.checkpoint().is_err(), "the catch-up is not over");
+    // The link drops before the last piece; the relay sends it all again on the rejoin.
+    hub.0.borrow_mut().inbox.push(fallback_join("c", 3, 5));
+    live.pump();
+    assert!(live.checkpoint().is_err(), "the rejoin re-armed the unfinished catch-up");
+    hub.0.borrow_mut().inbox.extend([text_piece(json!([wire(&snap)]), true, true), text_piece(json!([wire(&u2)]), false, false)]);
+    live.pump();
+    assert_same(&worker, live.doc().unwrap(), &whole(&worker));
+    assert!(live.checkpoint().is_ok(), "the last piece ended the catch-up");
+}
+
+/// Round 5, 2: an incomplete scope is reported once per catch-up, not once per piece.
+#[test]
+fn an_incomplete_catch_up_is_reported_once() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    let incomplete =
+        |more| ServerMsg::TextOps { doc: "d".to_owned(), scope: DOC_SCOPE.to_owned(), ops: json!([]), complete: false, snap: false, more };
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), incomplete(true), incomplete(true), incomplete(false)]);
+    let work = live.pump();
+    assert_eq!(work.iter().filter(|w| matches!(w, Work::TextIncomplete { .. })).count(), 1, "{work:?}");
+}
+
+/// Round 5, 4: the guard measures the serialized params, as the relay does, so an edit whose
+/// ops fit the cap but whose submit does not is refused here rather than by the relay.
+#[test]
+fn the_edit_guard_measures_the_params_as_the_relay_does() {
+    let measure = |cap: Option<u64>| {
+        let hub = FakeHub::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&sample()).unwrap();
+        let join = joined_at("alice", 1, 0, Some(0));
+        hub.0.borrow_mut().inbox.push(match cap {
+            Some(cap) => with_cap(join, cap),
+            None => join,
+        });
+        live.pump();
+        let sent = live.edit(|d| d.insert_text(1, 0, &"x".repeat(300), &Map::new()));
+        (sent, hub)
+    };
+    let (sent, hub) = measure(None);
+    sent.unwrap();
+    let (_, params) = last_submit(&hub);
+    let params_bytes = serde_json::to_vec(&params).unwrap().len() as u64;
+    let ops_bytes: u64 = params["ops"].as_array().unwrap().iter().map(|op| serde_json::to_vec(op).unwrap().len() as u64).sum();
+    assert!(ops_bytes < params_bytes - 1);
+    let (refused, hub) = measure(Some(params_bytes - 1));
+    assert!(matches!(&refused, Err(craft_collab::Error::Refused(_))), "{refused:?}");
+    assert!(hub.0.borrow().sent.iter().all(|m| !matches!(m, ClientMsg::Submit { .. })), "nothing was submitted");
+    let (fits, _) = measure(Some(params_bytes));
+    assert!(fits.is_ok(), "a submit at exactly the cap goes out");
+}
+
+/// Round 5, 4: a refused edit is not ignored. It already landed here and the room will never
+/// have it, so the replica is broken and the app is told. A refusal of a checkpoint snapshot,
+/// even a late one, is the checkpoint's and breaks nothing.
+#[test]
+fn a_refused_edit_breaks_the_replica_and_says_so() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.checkpoint().unwrap();
+    let (snap_local, _) = last_submit(&hub);
+    hub.0
+        .borrow_mut()
+        .inbox
+        .extend([submit_refused(snap_local, "read-only access to this file"), submit_refused(snap_local, "read-only access to this file")]);
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::CheckpointRefused { .. })), "{work:?}");
+    assert!(live.ready_to_type(), "a refused snapshot is not a lost edit");
+
+    live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
+    let (local, _) = last_submit(&hub);
+    live.notices.clear();
+    hub.0.borrow_mut().inbox.push(submit_refused(local, "relay could not order that edit"));
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::TextIncomplete { .. })), "{work:?}");
+    assert!(!live.ready_to_type());
+    assert!(!live.notices.is_empty(), "the app is told");
     assert!(live.edit(|d| d.insert_text(1, 0, "y", &Map::new())).is_err());
 }

@@ -126,6 +126,8 @@ pub enum Refusal {
     /// A save report whose checkpoint snapshot was ordered but is larger than the text cap,
     /// so it was never retained for joiners. Permanent for that document size.
     TooLargeToRetain { bytes: usize },
+    /// A checkpoint snapshot from a peer that is not the service saver.
+    NotTheSaver,
 }
 
 impl Refusal {
@@ -141,6 +143,7 @@ impl Refusal {
             Refusal::TooLargeToRetain { bytes } => {
                 format!("that checkpoint is {bytes} bytes, too large to retain for joining editors; nothing was dropped")
             }
+            Refusal::NotTheSaver => "only the document service may checkpoint; editors send edits".to_owned(),
         }
     }
 }
@@ -209,6 +212,11 @@ impl TextLog {
         let before = self.bytes;
         self.keep(|_, snap, index| !snap || index == 0);
         before - self.bytes
+    }
+
+    /// The bytes [`TextLog::drop_later_snapshots`] would free.
+    fn later_snapshot_bytes(&self) -> usize {
+        self.ops.iter().zip(&self.snaps).skip(1).filter(|(_, snap)| **snap).map(|(op, _)| value_bytes(op)).sum()
     }
 
     /// Keep the ops `keep(seq, is_snapshot, index)` says to, recounting the bytes.
@@ -551,15 +559,17 @@ impl Room {
             // A scope keeps at most two snapshots: the one it starts from after a save, and the
             // newest, which the next save would start from. The room keeps at most two caps of
             // them, so snapshots in many scopes cannot add up either.
-            let freed = log.drop_later_snapshots();
-            self.text_bytes -= freed;
-            self.snap_bytes -= freed;
-            if bytes > cap || self.snap_bytes + bytes > cap.saturating_mul(2) {
+            // The older unsaved ones are dropped only once this one is known to be retained, so
+            // a refused snapshot never costs the scope the one a pending save needs.
+            if bytes > cap || self.snap_bytes - log.later_snapshot_bytes() + bytes > cap.saturating_mul(2) {
                 // Not retained, and nothing else is lost: the snapshot holds only what the ops
                 // before it already carry. The save report for it is refused as permanent.
                 self.oversized_snapshot = Some((op.seq, bytes));
                 return;
             }
+            let freed = log.drop_later_snapshots();
+            self.text_bytes -= freed;
+            self.snap_bytes -= freed;
             log.snap_bytes += bytes;
             self.snap_bytes += bytes;
         } else if (log.bytes - log.snap_bytes) + bytes > cap || (self.text_bytes - self.snap_bytes) + bytes > total {

@@ -151,7 +151,10 @@ pub enum Work {
 /// past what the relay carries, and a checkpoint past what it retains for joiners.
 #[must_use]
 pub fn refusal_is_permanent(detail: &str) -> bool {
-    detail.starts_with("read-only access") || detail.contains("more than this relay will carry") || detail.contains("too large to retain")
+    detail.starts_with("read-only access")
+        || detail.starts_with("only the document service may checkpoint")
+        || detail.contains("more than this relay will carry")
+        || detail.contains("too large to retain")
 }
 
 /// How long a checkpoint may wait for its ordering and the save acknowledgement.
@@ -269,8 +272,20 @@ pub struct Live<H> {
     checkpoint: Option<PendingCheckpoint>,
     /// How long [`Live::checkpoint`] waits for an answer.
     checkpoint_timeout: Duration,
-    /// The largest snapshot, in wire bytes, the relay retains (`Joined.text_cap`).
+    /// The largest submit, as the relay measures its params, the relay takes and retains
+    /// (`Joined.text_cap`).
     text_cap: Option<u64>,
+    /// A piece of the `text_ops` catch-up arrived and more follow (`TextOps.more`). The
+    /// catch-up is not over, so a rejoin re-arms it and no checkpoint goes out.
+    text_more: bool,
+    /// This catch-up already told the app its text is incomplete. Told once, not per piece.
+    told_incomplete: bool,
+    /// The submit counters of recent checkpoint snapshots, so a late refusal of one is not
+    /// mistaken for a refused edit.
+    snap_locals: Vec<u64>,
+    /// The submit counter of the newest edit sent. A refusal naming a counter past it is not
+    /// for an edit of this replica.
+    last_edit: Option<u64>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -304,6 +319,10 @@ impl<H: Hub> Live<H> {
             checkpoint: None,
             checkpoint_timeout: CHECKPOINT_TIMEOUT,
             text_cap: None,
+            text_more: false,
+            told_incomplete: false,
+            snap_locals: Vec::new(),
+            last_edit: None,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -408,7 +427,9 @@ impl<H: Hub> Live<H> {
 
     /// Send a checkpoint snapshot of the whole document.
     ///
-    /// For the replica that saves the file. When the relay orders it, [`pump`](Live::pump)
+    /// For the service saver only: the replica that saves the file, connected with the
+    /// relay's service identity (`COLLABCRAFT_SERVICE_UID`). The relay refuses a snapshot from
+    /// any other peer, permanently ([`Work::CheckpointRefused`]). When the relay orders it, [`pump`](Live::pump)
     /// reports [`Work::Checkpointed`] and tells the relay the save covers everything before it.
     /// [`Work::CheckpointRaced`] means try again; [`Work::CheckpointRefused`] means a retry
     /// will not help. One at a time.
@@ -439,15 +460,18 @@ impl<H: Hub> Live<H> {
             return Err(Error::malformed("client", "the join's catch-up has not arrived yet"));
         }
         let state = self.sound_doc()?.state();
-        let payload = TextPayload::snapshot(&state);
-        if let Some(bytes) = self.over_cap(&payload) {
+        let params = serde_json::to_value(TextPayload::snapshot(&state)).map_err(|e| Error::malformed("client", e.to_string()))?;
+        if let Some(bytes) = self.over_cap(&params) {
             return Err(Error::Refused(format!("that checkpoint is {bytes} bytes, too large to retain for joining editors")));
         }
-        let params = serde_json::to_value(payload).map_err(|e| Error::malformed("client", e.to_string()))?;
         let msg = self.wire.submit_crdt(CRDT_TEXT, params);
         let ClientMsg::Submit { local, .. } = &msg else {
             return Err(Error::malformed("client", "a checkpoint must be a submit"));
         };
+        self.snap_locals.push(*local);
+        if self.snap_locals.len() > 16 {
+            self.snap_locals.remove(0);
+        }
         self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms() });
         self.hub.send(msg)?;
         Ok(state)
@@ -580,6 +604,10 @@ impl<H: Hub> Live<H> {
         }
         self.marked = replay_until.is_some();
         self.since_join.clear();
+        // Pieces of an earlier catch-up that never finished are abandoned: the relay sends the
+        // whole catch-up again from its first piece.
+        self.text_more = false;
+        self.told_incomplete = false;
         self.joined_once = true;
         self.lose_checkpoint(work, "the link rejoined");
     }
@@ -615,13 +643,14 @@ impl<H: Hub> Live<H> {
         }
     }
 
-    /// The payload's size as the relay counts it, when that is past the cap it advertised.
+    /// The submit's size as the relay measures it, when that is past the cap it advertised.
     ///
-    /// The relay counts a retained op as its JSON, the base64 string and its quotes. The
-    /// transport carries the cap plus a margin for the submit around it, so a payload within
-    /// the cap is never dropped at the socket.
-    fn over_cap(&self, payload: &TextPayload) -> Option<u64> {
-        let bytes = payload.ops.iter().map(|op| op.len() as u64 + 2).sum::<u64>();
+    /// The relay measures a submit by its serialized params, the same bytes counted here, and
+    /// takes any up to the cap; the ops it retains are a part of them. The transport carries
+    /// the cap plus a margin for the message around the params, so a submit within the cap is
+    /// never dropped at the socket.
+    fn over_cap(&self, params: &serde_json::Value) -> Option<u64> {
+        let bytes = serde_json::to_vec(params).map_or(u64::MAX, |v| v.len() as u64);
         self.text_cap.is_some_and(|cap| bytes > cap).then_some(bytes)
     }
 
@@ -632,14 +661,16 @@ impl<H: Hub> Live<H> {
     /// already landed in this replica, which the room will never see, so the replica is
     /// broken too: carrying on would let the two drift apart for the rest of the session.
     fn send_update(&mut self, update: &[u8]) -> Result<()> {
-        let payload = TextPayload::new(update);
-        if let Some(bytes) = self.over_cap(&payload) {
+        let params = serde_json::to_value(TextPayload::new(update)).map_err(|e| Error::malformed("client", e.to_string()))?;
+        if let Some(bytes) = self.over_cap(&params) {
             self.break_replica(&format!("a local edit of {bytes} bytes is past what the relay carries"));
             self.notices.push("that change is too large to share with the other editors; reopen the file".to_owned());
             return Err(Error::Refused(format!("that change is {bytes} bytes, more than this relay will carry")));
         }
-        let params = serde_json::to_value(payload).map_err(|e| Error::malformed("client", e.to_string()))?;
         let msg: ClientMsg = self.wire.submit_crdt(CRDT_TEXT, params);
+        if let ClientMsg::Submit { local, .. } = &msg {
+            self.last_edit = self.last_edit.max(Some(*local));
+        }
         self.hub.send(msg)
     }
 
@@ -684,7 +715,7 @@ impl<H: Hub> Live<H> {
             // Live ops that overtook the text ops landed on the replica the restart may just
             // have replaced. Applying them again is harmless when it did not.
             updates.append(&mut self.since_join);
-        } else if self.text_catchup && self.marked && self.from_file && self.doc.is_some() {
+        } else if self.text_catchup && !self.text_more && self.marked && self.from_file && self.doc.is_some() {
             // Only for a relay that marks its fallback: there the text ops are the very next
             // message, so this holds the few live ops that overtook them and nothing more.
             self.since_join.extend(updates.iter().cloned());
@@ -777,7 +808,11 @@ impl<H: Hub> Live<H> {
             }
             Some(_) => false,
             None => {
-                self.settled = true;
+                // A live op before a marked fallback's text ops does not end the catch-up:
+                // only its last piece does.
+                if !(self.text_catchup && self.marked) {
+                    self.settled = true;
+                }
                 false
             }
         }
@@ -847,10 +882,12 @@ impl<H: Hub> Live<H> {
                 self.first_of_catchup(seq);
                 work.push(Work::Command { command, params });
             }
-            Effect::TextOps { scope, ops, complete, snap } => {
+            Effect::TextOps { scope, ops, complete, snap, more } => {
                 // The fallback catch-up: it replaces the ordered replay, so it is the catch-up.
-                let restart = std::mem::take(&mut self.text_catchup);
-                self.settled = true;
+                // It may come in pieces; only the first can start from a snapshot, and only
+                // the last ends it.
+                let first = !self.text_more;
+                let restart = self.text_catchup && first;
                 if !self.marked {
                     // An older relay sends text ops instead of a replay, and does not say so.
                     // They are the catch-up, so the ordered one it seemed to promise is over:
@@ -859,20 +896,32 @@ impl<H: Hub> Live<H> {
                     self.catchup = None;
                 }
                 if !complete {
-                    log::warn!("collab: the relay could not keep every change to {scope}");
-                    self.notices.push(format!("{scope} has changes this session cannot rebuild; reopen the file"));
-                    work.push(Work::TextIncomplete { scope });
+                    if !std::mem::replace(&mut self.told_incomplete, true) {
+                        log::warn!("collab: the relay could not keep every change to {scope}");
+                        self.notices.push(format!("{scope} has changes this session cannot rebuild; reopen the file"));
+                        work.push(Work::TextIncomplete { scope });
+                    }
                 } else {
+                    let snap = snap && first;
                     match serde_json::from_value::<Vec<String>>(ops) {
                         Ok(ops) => self.merge_updates(scope, &ops, snap, snap && restart, work),
                         Err(e) => {
                             log::warn!("collab: replayed operations for {scope} did not decode: {e}");
-                            self.notices.push(format!("{scope} could not be caught up; reopen the file"));
-                            work.push(Work::TextIncomplete { scope });
+                            if !std::mem::replace(&mut self.told_incomplete, true) {
+                                self.notices.push(format!("{scope} could not be caught up; reopen the file"));
+                                work.push(Work::TextIncomplete { scope });
+                            }
                         }
                     }
                 }
-                self.since_join.clear();
+                if more {
+                    self.text_more = true;
+                } else {
+                    self.text_more = false;
+                    self.text_catchup = false;
+                    self.settled = true;
+                    self.since_join.clear();
+                }
             }
             Effect::Frame { origin, payload } => work.push(Work::Frame { origin, payload }),
             Effect::Ephemeral { origin, kind, payload } => work.push(Work::Ephemeral { origin, kind, payload }),
@@ -910,6 +959,12 @@ impl<H: Hub> Live<H> {
                 // checkpoint's own only while that has not been ordered.
                 if self.checkpoint.as_ref().is_some_and(|p| p.local == local && p.ordered.is_none()) {
                     self.refuse_checkpoint(work, &detail);
+                } else if self.last_edit.is_some_and(|last| local <= last) && !self.snap_locals.contains(&local) && !self.broken {
+                    // An edit. It already landed in this replica and the room will never order
+                    // it, so the two have parted for good.
+                    self.lose_checkpoint(work, "an edit was refused");
+                    self.break_replica(&format!("the relay refused an edit: {detail}"));
+                    work.push(Work::TextIncomplete { scope: DOC_SCOPE.to_owned() });
                 }
             }
             Effect::SavedAck { seq } => self.save_answered(seq, None, work),

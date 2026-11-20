@@ -150,6 +150,11 @@ mod e2e {
         token::sign_at(SECRET, room, pid, pid, true, pid, now()).unwrap()
     }
 
+    /// A token for the service saver: only its uid may send a checkpoint snapshot.
+    fn service_token(room: &str, pid: &str) -> String {
+        token::sign_at(SECRET, room, "craft_office", pid, true, pid, now()).unwrap()
+    }
+
     /// Issue 27 positive check through the real socket, saved the way an app saves: alice's
     /// edit is confirmed, she checkpoints, and only once that is accepted is the file written.
     /// A late joiner loading that file must see the edit once.
@@ -159,7 +164,7 @@ mod e2e {
         let Some(h) = start().await else { return };
         let room = unique_room("saved-ok");
         let doc = format!("doc:{room}");
-        let mut a = LivePeer::open(&h.url, &peer_token(&room, "alice"), &doc, "hello").await;
+        let mut a = LivePeer::open(&h.url, &service_token(&room, "alice"), &doc, "hello").await;
         a.insert(5, "!");
         a.until(Duration::from_millis(500), |_, _| false).await;
         assert!(a.save().await, "the checkpoint was not accepted: {:?}", a.work);
@@ -180,7 +185,7 @@ mod e2e {
         let Some(h) = start().await else { return };
         let room = unique_room("saved-inflight");
         let doc = format!("doc:{room}");
-        let mut a = LivePeer::open(&h.url, &peer_token(&room, "alice"), &doc, "hello").await;
+        let mut a = LivePeer::open(&h.url, &service_token(&room, "alice"), &doc, "hello").await;
         // The edit is still in flight when the checkpoint goes out.
         a.insert(5, "!");
         assert!(a.save().await, "the checkpoint was not accepted: {:?}", a.work);

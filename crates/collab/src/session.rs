@@ -67,7 +67,7 @@ pub enum Effect {
     /// Outside the sequence, so no ordering applies. `complete` false means the relay could
     /// not keep them all and the text cannot be rebuilt from the file plus these. `snap` true
     /// means the first op is a checkpoint snapshot.
-    TextOps { scope: Scope, ops: Value, complete: bool, snap: bool },
+    TextOps { scope: Scope, ops: Value, complete: bool, snap: bool, more: bool },
     /// An opaque frame from another peer, unread by the relay and by this session.
     Frame { origin: PeerId, payload: String },
     /// Latest-wins state about another peer.
@@ -315,7 +315,7 @@ impl Session {
                 vec![Effect::Roster { roster }]
             }
 
-            ServerMsg::TextOps { scope, ops, complete, snap, .. } => vec![Effect::TextOps { scope, ops, complete, snap }],
+            ServerMsg::TextOps { scope, ops, complete, snap, more, .. } => vec![Effect::TextOps { scope, ops, complete, snap, more }],
 
             ServerMsg::Frame { origin, payload, .. } => vec![Effect::Frame { origin, payload }],
 
