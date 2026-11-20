@@ -454,4 +454,40 @@ mod e2e {
         let refused = a.live.checkpoint();
         assert!(matches!(&refused, Err(craft_collab::Error::Refused(reason)) if craft_collab::refusal_is_permanent(reason)), "{refused:?}");
     }
+
+    /// Round 4, 4: a scope retaining more than one native client frame (a near-cap snapshot
+    /// plus the edits after it) reaches a fallback joiner in pieces it can read, and the joiner
+    /// converges. The snapshot pushes everything else out of the op history, so the join has to
+    /// fall back to the retained text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_scope_past_one_client_frame_reaches_a_fallback_joiner() {
+        let Some(h) = start_with("", crate::DEFAULT_TEXT_BYTES).await else { return };
+        let room = unique_room("full-scope");
+        let doc = format!("doc:{room}");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let file = "ab".repeat(5 * 1024 * 1024);
+        let mut a = LivePeer::open(&h.url, &t, &doc, &file).await;
+        a.insert(0, &"1".repeat(1024 * 1024));
+        assert!(a.save().await, "the near-cap checkpoint was not acknowledged: {:?}", a.work);
+        a.insert(0, &"2".repeat(1024 * 1024));
+        a.until(Duration::from_secs(3), |_, _| false).await;
+        let retained: usize = h
+            .relay
+            .rooms
+            .lock()
+            .await
+            .get(&room)
+            .map(|r| r.texts().values().map(|l| l.ops().iter().map(|o| o.to_string().len()).sum::<usize>()).sum())
+            .unwrap_or(0);
+        assert!(retained > 16 * 1024 * 1024, "the scope holds more than one client frame: {retained}");
+
+        let t = token::sign_at(SECRET, &room, "bob", "bob", true, "bob", now()).unwrap();
+        let mut b = LivePeer::connect(&h.url, &t, &doc).await;
+        let pieces = |work: &[craft_collab::Work]| work.iter().filter(|w| matches!(w, craft_collab::Work::SeedWanted { .. })).count();
+        assert!(b.until(Duration::from_secs(20), |_, work| pieces(work) >= 2).await, "the catch-up did not arrive in pieces: {:?}", b.work);
+        b.live.seed(&crate::test_text::para(&file)).expect("restores");
+        assert_eq!(b.text().len(), a.text().len());
+        assert!(b.text() == a.text(), "the fallback joiner did not converge");
+    }
 }

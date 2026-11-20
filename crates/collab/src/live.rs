@@ -392,6 +392,10 @@ impl<H: Hub> Live<H> {
     /// Make one local edit and send the update it produced. Lock-free.
     ///
     /// For example `live.edit(|d| d.insert_text(id, at, "x", &attrs))`.
+    ///
+    /// An edit whose update is past the relay's advertised cap (`Joined.text_cap`) is refused
+    /// with [`Error::Refused`], permanently: the replica is broken and the file has to be
+    /// reopened. Split very large pastes so each stays under it.
     pub fn edit<F>(&mut self, edit: F) -> Result<()>
     where
         F: FnOnce(&mut LiveDoc) -> std::result::Result<Vec<u8>, LiveError>,
@@ -436,11 +440,7 @@ impl<H: Hub> Live<H> {
         }
         let state = self.sound_doc()?.state();
         let payload = TextPayload::snapshot(&state);
-        // The relay counts a retained op as its JSON: the base64 string and its quotes.
-        let bytes = payload.ops.iter().map(|op| op.len() as u64 + 2).sum::<u64>();
-        if let Some(cap) = self.text_cap
-            && bytes > cap
-        {
+        if let Some(bytes) = self.over_cap(&payload) {
             return Err(Error::Refused(format!("that checkpoint is {bytes} bytes, too large to retain for joining editors")));
         }
         let params = serde_json::to_value(payload).map_err(|e| Error::malformed("client", e.to_string()))?;
@@ -615,8 +615,30 @@ impl<H: Hub> Live<H> {
         }
     }
 
+    /// The payload's size as the relay counts it, when that is past the cap it advertised.
+    ///
+    /// The relay counts a retained op as its JSON, the base64 string and its quotes. The
+    /// transport carries the cap plus a margin for the submit around it, so a payload within
+    /// the cap is never dropped at the socket.
+    fn over_cap(&self, payload: &TextPayload) -> Option<u64> {
+        let bytes = payload.ops.iter().map(|op| op.len() as u64 + 2).sum::<u64>();
+        self.text_cap.is_some_and(|cap| bytes > cap).then_some(bytes)
+    }
+
+    /// Send one local update.
+    ///
+    /// An update past the relay's cap would be dropped with the socket, and the reconnect
+    /// would send it again, so it is refused here for good with [`Error::Refused`]. It has
+    /// already landed in this replica, which the room will never see, so the replica is
+    /// broken too: carrying on would let the two drift apart for the rest of the session.
     fn send_update(&mut self, update: &[u8]) -> Result<()> {
-        let params = serde_json::to_value(TextPayload::new(update)).map_err(|e| Error::malformed("client", e.to_string()))?;
+        let payload = TextPayload::new(update);
+        if let Some(bytes) = self.over_cap(&payload) {
+            self.break_replica(&format!("a local edit of {bytes} bytes is past what the relay carries"));
+            self.notices.push("that change is too large to share with the other editors; reopen the file".to_owned());
+            return Err(Error::Refused(format!("that change is {bytes} bytes, more than this relay will carry")));
+        }
+        let params = serde_json::to_value(payload).map_err(|e| Error::malformed("client", e.to_string()))?;
         let msg: ClientMsg = self.wire.submit_crdt(CRDT_TEXT, params);
         self.hub.send(msg)
     }

@@ -120,8 +120,42 @@ const MAX_SAVE_BYTES: usize = 256 * 1024 * 1024;
 /// The protocol version a peer must name in the handshake.
 const PROTO: &str = "craft-live/1";
 
-/// Default per-scope retained-text cap, overridden by `COLLABCRAFT_TEXT_BYTES`.
-const DEFAULT_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// The largest WebSocket frame the native client reads. rust_socketio 0.6 connects through
+/// tokio-tungstenite with its default config (16 MiB a frame, 64 MiB a message) and does not
+/// let a caller change it, and the relay sends every message as one frame. So no message to
+/// a client may be larger than this. A browser's WebSocket has no such limit.
+const CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default per-scope retained-text cap, overridden by `COLLABCRAFT_TEXT_BYTES`. As large as
+/// it can be: one op as large as the cap, broadcast with its wrapper, still fits one client
+/// frame.
+const DEFAULT_TEXT_BYTES: usize = MAX_TEXT_BYTES;
+
+/// The largest piece of a `text_ops` catch-up, so a scope retaining more than one frame
+/// reaches a client in several messages.
+const TEXT_OPS_PIECE_BYTES: usize = CLIENT_FRAME_BYTES - FRAME_HEADROOM;
+
+/// Split retained ops into pieces of at most `budget` bytes, in order. An op larger than the
+/// budget goes alone; the text cap keeps every op below it.
+fn text_pieces(ops: &[serde_json::Value], budget: usize) -> Vec<Vec<serde_json::Value>> {
+    let mut pieces: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut used = budget;
+    for op in ops {
+        let size = serde_json::to_vec(op).map_or(0, |v| v.len()) + 1;
+        if used + size > budget {
+            pieces.push(Vec::new());
+            used = 0;
+        }
+        used += size;
+        if let Some(piece) = pieces.last_mut() {
+            piece.push(op.clone());
+        }
+    }
+    if pieces.is_empty() {
+        pieces.push(Vec::new());
+    }
+    pieces
+}
 
 /// How often the transport pings. Idle proxies in front of the relay drop a quiet connection
 /// at 100 s, so this stays well under that.
@@ -191,8 +225,9 @@ fn saved_allowed(claims: &Claims, service_uid: &str) -> bool {
     claims.may_edit() && claims.uid == service_uid
 }
 
-/// Upper bound for `COLLABCRAFT_TEXT_BYTES`.
-const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+/// Upper bound for `COLLABCRAFT_TEXT_BYTES`: the native client's frame limit, less the
+/// wrapper an op travels in (see [`CLIENT_FRAME_BYTES`]).
+const MAX_TEXT_BYTES: usize = CLIENT_FRAME_BYTES - FRAME_HEADROOM;
 
 /// Parse `COLLABCRAFT_TEXT_BYTES`: empty means the default, 0 is refused, large values clamp.
 fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
@@ -733,9 +768,16 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // could not be built. The file the joiner opens is behind the edits made
     // since it was written, and the sequence is already past those edits, so
     // these carry no sequence.
+    // In pieces no larger than a client can read in one WebSocket frame: a scope can retain
+    // up to three caps (edits plus two snapshots). Only the first piece can start with the
+    // snapshot, and a client treats the rest as ordinary updates.
     for (scope, ops, complete, snap) in texts {
-        let _ =
-            socket.emit("text_ops", &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": ops, "complete": complete, "snap": snap }));
+        for (i, piece) in text_pieces(&ops, TEXT_OPS_PIECE_BYTES).into_iter().enumerate() {
+            let _ = socket.emit(
+                "text_ops",
+                &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": piece, "complete": complete, "snap": snap && i == 0 }),
+            );
+        }
     }
     socket.join(room_name.clone());
     drop(ordered);
@@ -854,9 +896,13 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         }
     };
 
-    // Held until the op is broadcast. See `Relay::gate`.
+    // Held only while the op is recorded. That is enough: a join holds the gate from reading
+    // its replay until its socket is in the broadcast room, so an op recorded before the join
+    // read is in its replay (a later broadcast copy is dropped by sequence), and one recorded
+    // after had to wait for the join to finish, so its broadcast, whenever it goes out,
+    // reaches the joined socket. The Valkey round trip below runs without it.
     let gate = relay.gate(&claims.rm);
-    let _ordered = gate.lock().await;
+    let ordered = gate.lock().await;
     let outcome = {
         let mut rooms = relay.rooms.lock().await;
         let room = relay.room(&mut rooms, &claims.rm);
@@ -872,6 +918,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             },
         )
     };
+    drop(ordered);
 
     match outcome {
         Ok(op) => {

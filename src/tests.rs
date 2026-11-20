@@ -1745,6 +1745,94 @@ mod relay_proto {
         assert_eq!(r.texts()["doc"].ops().len(), 1, "only the snapshot is kept");
     }
 
+    /// Round 4, 1: typing while a checkpoint is on its way to being saved is normal. The
+    /// snapshot does not count against the edits' cap, so the scope stays complete through
+    /// the round trip, and a fallback joiner starting from it converges.
+    #[test]
+    fn typing_during_a_checkpoint_round_trip_keeps_the_scope_complete() {
+        use crate::test_text::Replica;
+        let cap = 64 * 1024;
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        let file = "f".repeat(cap * 6 / 10);
+        let mut saver = Replica::seeded(1, &file);
+        let mut peer = Replica::seeded(2, &file);
+        let e1 = saver.insert(0, "s");
+        peer.apply(e1["ops"].as_array().unwrap());
+        submit(&mut r, 1, "crdt.text", e1).expect("an edit");
+        let snap = saver.snapshot();
+        assert!(value_len(&snap) > cap * 3 / 4, "the snapshot is most of the cap");
+        submit(&mut r, 2, "crdt.text", snap).expect("the snapshot");
+        // Typed during the round trip: with the snapshot, past the cap; without it, well under.
+        for (seq, text) in [(3, "a".repeat(cap / 8)), (4, "b".repeat(cap / 8))] {
+            let edit = peer.insert(1, &text);
+            saver.apply(edit["ops"].as_array().unwrap());
+            submit(&mut r, seq, "crdt.text", edit).expect("an edit");
+        }
+        assert!(r.texts()["doc"].complete(), "typing did not overflow the scope");
+        assert_eq!(r.checkpoint(1), Ok(()));
+        let log = &r.texts()["doc"];
+        assert!(log.complete() && log.starts_with_snapshot());
+        let mut joiner = Replica::from_snapshot(3, &log.ops()[0]);
+        joiner.apply(&log.ops()[1..]);
+        assert_eq!(joiner.render(), peer.render());
+        assert_eq!(joiner.render(), saver.render());
+    }
+
+    /// Round 4, 1: a scope whose edits overflowed is incomplete, and a save that starts it at
+    /// a snapshot again makes it complete.
+    #[test]
+    fn a_save_onto_a_snapshot_makes_an_overflowed_scope_complete() {
+        let cap = 64 * 1024;
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        submit(&mut r, 1, "crdt.text", json!({"scope": "doc", "ops": ["e".repeat(cap + 1)]})).expect("ordered");
+        assert!(!r.texts()["doc"].complete());
+        submit(&mut r, 2, "crdt.text", snapshot_of(cap / 2)).expect("a snapshot");
+        assert_eq!(r.checkpoint(1), Ok(()));
+        assert!(r.texts()["doc"].complete());
+    }
+
+    /// Round 4, 1: an unsaved snapshot is replaced by the next one, so retried checkpoints do
+    /// not pile up in the scope.
+    #[test]
+    fn a_newer_snapshot_replaces_an_unsaved_one() {
+        let cap = 64 * 1024;
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        for seq in 1..=10 {
+            submit(&mut r, seq, "crdt.text", snapshot_of(cap * 9 / 10)).expect("a snapshot");
+        }
+        let log = &r.texts()["doc"];
+        assert!(log.complete());
+        assert_eq!(log.ops().len(), 2, "the first and the newest");
+        assert_eq!(r.checkpoint(9), Ok(()));
+        assert_eq!(r.texts()["doc"].ops().len(), 1);
+    }
+
+    fn value_len(v: &serde_json::Value) -> usize {
+        serde_json::to_vec(v).map_or(0, |b| b.len())
+    }
+
+    /// Round 4, 4: a `text_ops` catch-up larger than a client frame goes in pieces, in order,
+    /// each within the budget unless one op alone is larger.
+    #[test]
+    fn text_ops_are_split_to_fit_a_client_frame() {
+        let ops: Vec<serde_json::Value> = (0..10).map(|i| json!("x".repeat(100 + i))).collect();
+        let pieces = crate::text_pieces(&ops, 350);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat(), ops, "nothing lost or reordered");
+        for piece in &pieces {
+            let size: usize = piece.iter().map(|op| value_len(op) + 1).sum();
+            assert!(size <= 350 || piece.len() == 1, "{size}");
+        }
+        assert_eq!(crate::text_pieces(&[], 350), vec![Vec::<serde_json::Value>::new()], "an empty scope is still sent");
+        let huge = vec![json!("y".repeat(1000))];
+        assert_eq!(crate::text_pieces(&huge, 350), vec![huge.clone()]);
+        const { assert!(crate::TEXT_OPS_PIECE_BYTES + 64 * 1024 <= 16 * 1024 * 1024) };
+        const { assert!(crate::MAX_TEXT_BYTES + 64 * 1024 <= 16 * 1024 * 1024, "one op at the cap fits a client frame") };
+    }
+
     /// The client hubs name the version this relay checks for.
     #[test]
     fn the_client_speaks_this_relays_protocol() {
@@ -1842,10 +1930,10 @@ mod relay_proto {
     #[test]
     fn text_bytes_config_is_bounded() {
         use crate::parse_text_bytes;
-        assert_eq!(parse_text_bytes(""), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_text_bytes(""), Ok(16 * 1024 * 1024 - 64 * 1024), "the default fits one native client frame with its wrapper");
         assert!(parse_text_bytes("0").is_err());
         assert!(parse_text_bytes("abc").is_err());
-        assert_eq!(parse_text_bytes("999999999999"), Ok(64 * 1024 * 1024));
+        assert_eq!(parse_text_bytes("999999999999"), Ok(16 * 1024 * 1024 - 64 * 1024));
         assert_eq!(parse_text_bytes("1048576"), Ok(1048576));
     }
 

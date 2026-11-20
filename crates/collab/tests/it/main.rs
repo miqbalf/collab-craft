@@ -1315,3 +1315,28 @@ fn a_held_op_survives_a_restart_after_seeding() {
     assert_eq!(live.doc().unwrap().block(4).unwrap().text, ">last paragraph");
     assert_same(&worker, live.doc().unwrap(), &whole(&worker));
 }
+
+// ---- fix round 4 -------------------------------------------------------------------------
+
+/// Round 4, 2: an edit past the advertised cap would be dropped with the socket and resent on
+/// every reconnect. It is refused once, permanently, and nothing goes out.
+#[test]
+fn an_edit_over_the_advertised_cap_is_refused_for_good() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    let mut join = joined_at("alice", 1, 0, Some(0));
+    if let ServerMsg::Joined { text_cap, .. } = &mut join {
+        *text_cap = Some(4096);
+    }
+    hub.0.borrow_mut().inbox.push(join);
+    live.pump();
+    live.edit(|d| d.insert_text(1, 0, "small", &Map::new())).unwrap();
+    hub.0.borrow_mut().sent.clear();
+    let big = "x".repeat(8192);
+    let refused = live.edit(|d| d.insert_text(1, 0, &big, &Map::new()));
+    assert!(matches!(&refused, Err(craft_collab::Error::Refused(reason)) if craft_collab::refusal_is_permanent(reason)), "{refused:?}");
+    assert!(hub.0.borrow().sent.is_empty(), "nothing was sent");
+    assert!(!live.ready_to_type(), "the replica holds an edit the room never saw");
+    assert!(live.edit(|d| d.insert_text(1, 0, "y", &Map::new())).is_err());
+}

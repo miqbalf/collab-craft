@@ -30,11 +30,11 @@ pub const HISTORY: usize = 2048;
 /// ([`TEXT_BYTES`] per scope by default, `COLLABCRAFT_TEXT_BYTES` in a deployment, and
 /// [`TOTAL_TEXT_BYTES`] or that cap across scopes). A checkpoint snapshot is one op carrying a
 /// whole document, so it may be as large as the text cap, which can exceed this budget: a
-/// CRDT op up to the text cap is accepted and the history then evicts down to it. The same
-/// snapshot sits in both pools, and a snapshot is retained even over a full scope (the save
-/// that follows it drops everything before it). So the worst case for one room is about
-/// `max(HISTORY_BYTES, cap) + max(TOTAL_TEXT_BYTES, cap) + cap`: 48 MiB at the 16 MiB
-/// default cap, 192 MiB at the 64 MiB maximum.
+/// CRDT op up to the text cap is accepted and the history then evicts down to it. Snapshots
+/// are counted apart from edits: a scope keeps edits up to the cap plus at most two
+/// snapshots, and a room at most two caps of snapshots. So the worst case for one room is
+/// about `max(HISTORY_BYTES, cap) + max(TOTAL_TEXT_BYTES, cap) + 2 * cap`: 64 MiB at the
+/// default (and maximum) cap of just under 16 MiB.
 pub const HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Peers one document may hold at once.
@@ -156,6 +156,10 @@ pub struct TextLog {
     /// Which ops are checkpoint snapshots (`"snap": true` on their submit). Same length as `ops`.
     snaps: Vec<bool>,
     bytes: usize,
+    /// The part of [`TextLog::bytes`] that is checkpoint snapshots. Ordinary edits are
+    /// measured against the cap without it, so typing while a checkpoint is on its way to
+    /// being saved does not find the scope full of the snapshot itself.
+    snap_bytes: usize,
     /// Whether everything since the file was opened is still here.
     complete: bool,
 }
@@ -187,23 +191,51 @@ impl TextLog {
     /// Everything ordered at or before `seq` is now in the saved file, so
     /// replaying it to a joiner who loads that file would apply it a second
     /// time. Only the operations after the save are kept.
+    ///
+    /// A log that now starts at a retained snapshot is complete again, whatever was lost
+    /// before: a joiner starts from that snapshot, which a save only follows when nothing was
+    /// ordered between it being taken and being ordered.
     fn drop_through(&mut self, seq: u64) {
-        let mut kept_ops = Vec::new();
-        let mut kept_seqs = Vec::new();
-        let mut kept_snaps = Vec::new();
-        let mut bytes = 0;
-        for ((op, op_seq), snap) in self.ops.drain(..).zip(self.seqs.drain(..)).zip(self.snaps.drain(..)) {
-            if op_seq > seq {
-                bytes += value_bytes(&op);
-                kept_ops.push(op);
-                kept_seqs.push(op_seq);
-                kept_snaps.push(snap);
+        self.keep(|op_seq, _, _| op_seq > seq);
+        if self.starts_with_snapshot() {
+            self.complete = true;
+        }
+    }
+
+    /// Drop the snapshots that are not the first op. Every op they cover is still retained
+    /// (the first op, then the edits after it), so only a save could make them useful, and a
+    /// newer snapshot replaces them for that. Returns the bytes freed.
+    fn drop_later_snapshots(&mut self) -> usize {
+        let before = self.bytes;
+        self.keep(|_, snap, index| !snap || index == 0);
+        before - self.bytes
+    }
+
+    /// Keep the ops `keep(seq, is_snapshot, index)` says to, recounting the bytes.
+    fn keep(&mut self, keep: impl Fn(u64, bool, usize) -> bool) {
+        let (mut ops, mut seqs, mut snaps) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut bytes, mut snap_bytes) = (0, 0);
+        for (index, ((op, op_seq), snap)) in self.ops.drain(..).zip(self.seqs.drain(..)).zip(self.snaps.drain(..)).enumerate() {
+            if keep(op_seq, snap, index) {
+                let size = value_bytes(&op);
+                bytes += size;
+                if snap {
+                    snap_bytes += size;
+                }
+                ops.push(op);
+                seqs.push(op_seq);
+                snaps.push(snap);
             }
         }
-        self.ops = kept_ops;
-        self.seqs = kept_seqs;
-        self.snaps = kept_snaps;
-        self.bytes = bytes;
+        (self.ops, self.seqs, self.snaps, self.bytes, self.snap_bytes) = (ops, seqs, snaps, bytes, snap_bytes);
+    }
+
+    fn clear(&mut self) {
+        self.ops.clear();
+        self.seqs.clear();
+        self.snaps.clear();
+        self.bytes = 0;
+        self.snap_bytes = 0;
     }
 }
 
@@ -264,6 +296,8 @@ pub struct Room {
     /// The newest checkpoint snapshot that was ordered but not retained because it is larger
     /// than the cap, `(seq, bytes)`, so the save report for it is refused as permanent.
     oversized_snapshot: Option<(u64, usize)>,
+    /// The part of [`Room::text_bytes`] that is checkpoint snapshots, across every scope.
+    snap_bytes: usize,
 }
 
 /// The ephemeral kind that records a save: `{seq, etag}`.
@@ -512,38 +546,35 @@ impl Room {
         let (cap, total) = (self.scope_cap(), self.total_cap());
         // A snapshot submit carries one full state; its flag marks that op, not the batch.
         let snap = op.params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        if snap && bytes > cap {
-            // Not retained, and nothing else is lost: the snapshot holds only what the ops
-            // before it already carry. The save report for it is refused as permanent.
-            self.oversized_snapshot = Some((op.seq, bytes));
-            return;
-        }
-        let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog {
-            ops: Vec::new(),
-            seqs: Vec::new(),
-            snaps: Vec::new(),
-            bytes: 0,
-            complete: true,
-        });
-        // Both bounds, because either alone leaves the other kind of growth unbounded: one
-        // scope filled past its own cap, or many scopes each under it but summing past what
-        // the room as a whole may hold. `self.text_bytes` still counts this scope's current
-        // bytes, which is why the comparison is against the total after adding `bytes` rather
-        // than before.
-        // A snapshot that fits the cap on its own is retained even over a full scope, by up to
-        // one cap: the save that follows it drops everything before it, which is how a scope
-        // shrinks again. Snapshots that are never saved still meet the doubled bound.
-        let (cap, total) = if snap { (cap.saturating_mul(2), total.saturating_add(cap)) } else { (cap, total) };
-        if log.bytes + bytes > cap || self.text_bytes + bytes > total {
+        let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog { complete: true, ..TextLog::default() });
+        if snap {
+            // A scope keeps at most two snapshots: the one it starts from after a save, and the
+            // newest, which the next save would start from. The room keeps at most two caps of
+            // them, so snapshots in many scopes cannot add up either.
+            let freed = log.drop_later_snapshots();
+            self.text_bytes -= freed;
+            self.snap_bytes -= freed;
+            if bytes > cap || self.snap_bytes + bytes > cap.saturating_mul(2) {
+                // Not retained, and nothing else is lost: the snapshot holds only what the ops
+                // before it already carry. The save report for it is refused as permanent.
+                self.oversized_snapshot = Some((op.seq, bytes));
+                return;
+            }
+            log.snap_bytes += bytes;
+            self.snap_bytes += bytes;
+        } else if (log.bytes - log.snap_bytes) + bytes > cap || (self.text_bytes - self.snap_bytes) + bytes > total {
+            // Both bounds on edits, because either alone leaves the other kind of growth
+            // unbounded: one scope filled past its own cap, or many scopes each under it but
+            // summing past what the room as a whole may hold. Snapshots are not counted here;
+            // they have their own bound above.
+            //
             // Dropping the oldest would leave a replay that cannot be applied, because later
             // operations anchor on characters the dropped ones created. Saying so is the only
-            // honest answer.
+            // honest answer, until a save starts the scope at a snapshot again.
             log.complete = false;
-            self.text_bytes = self.text_bytes.saturating_sub(log.bytes);
-            log.ops.clear();
-            log.seqs.clear();
-            log.snaps.clear();
-            log.bytes = 0;
+            self.text_bytes -= log.bytes;
+            self.snap_bytes -= log.snap_bytes;
+            log.clear();
             return;
         }
         log.ops.extend(ops.iter().cloned());
@@ -581,6 +612,7 @@ impl Room {
         // walks every surviving op to rebuild `bytes`; summing here is the same cost repeated
         // once per save, not once per op, and cannot drift from what the scopes actually hold.
         self.text_bytes = self.texts.values().map(|log| log.bytes).sum();
+        self.snap_bytes = self.texts.values().map(|log| log.snap_bytes).sum();
         Ok(())
     }
 
