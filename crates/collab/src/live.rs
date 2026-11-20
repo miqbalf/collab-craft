@@ -329,6 +329,16 @@ impl<H: Hub> Live<H> {
         }
     }
 
+    /// The hub this link runs on.
+    pub fn hub(&self) -> &H {
+        &self.hub
+    }
+
+    /// The hub this link runs on, for a host that steers its transport (a fresh ticket).
+    pub fn hub_mut(&mut self) -> &mut H {
+        &mut self.hub
+    }
+
     /// The replica, once seeded.
     pub fn doc(&self) -> Option<&LiveDoc> {
         self.doc.as_ref()

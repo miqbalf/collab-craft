@@ -57,6 +57,9 @@ const ATTRS: &str = "a";
 const LOCAL: &str = "craft-collab/local";
 /// The origin of updates from other replicas, and of the state carried across `set_client`.
 const REMOTE: &str = "craft-collab/remote";
+/// The origin of this replica's own edits made through [`LiveDoc::untracked`]: sent like any
+/// local edit, never undone.
+const UNTRACKED: &str = "craft-collab/untracked";
 /// The key the change observer is registered under.
 const OBSERVER: &str = "craft-collab/changes";
 
@@ -141,6 +144,8 @@ pub struct LiveDoc {
     seen: Arc<Mutex<Vec<BlockChange>>>,
     /// yrs panicked part way through an apply, so this replica may hold half an update.
     damaged: bool,
+    /// Local edits are made outside the undo history ([`LiveDoc::untracked`]).
+    untracked: bool,
 }
 
 impl LiveDoc {
@@ -437,6 +442,17 @@ impl LiveDoc {
         self.doc.transact().encode_state_as_update_v1(&StateVector::default())
     }
 
+    /// Run `edits` with this replica's local edits kept out of its undo history: they are sent
+    /// like any other, and [`undo`](Self::undo) never takes them back. For edits the app makes
+    /// on the user's behalf in answer to a remote edit (text recovered from a block this
+    /// replica removed), which the user's own Undo must not erase.
+    pub fn untracked<R>(&mut self, edits: impl FnOnce(&mut LiveDoc) -> R) -> R {
+        let was = std::mem::replace(&mut self.untracked, true);
+        let out = edits(self);
+        self.untracked = was;
+        out
+    }
+
     /// Run one local edit in its own transaction and return its update.
     ///
     /// `edit` checks everything before it changes anything, because a yrs transaction commits
@@ -453,7 +469,7 @@ impl LiveDoc {
         }
         let roots = Roots { body: self.body.clone(), blocks: self.blocks.clone() };
         let update = {
-            let mut txn = self.doc.transact_mut_with(LOCAL);
+            let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
             edit(&mut txn, &roots)?;
             txn.encode_update_v1()
         };
@@ -602,7 +618,7 @@ fn assemble(doc: Doc, client: Option<u32>) -> LiveDoc {
     undo.expand_scope(&doc, &body);
     undo.expand_scope(&doc, &blocks);
     undo.include_origin(Origin::from(LOCAL));
-    LiveDoc { undo, doc, body, blocks, client, seen, damaged: false }
+    LiveDoc { undo, doc, body, blocks, client, seen, damaged: false, untracked: false }
 }
 
 /// The block a nested event belongs to, from its path below `"blocks"`.

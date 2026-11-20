@@ -238,6 +238,27 @@ fn undo_only_undoes_local() {
 }
 
 #[test]
+fn untracked_edits_are_sent_but_never_undone() {
+    let mut a = replica(&[plain(1, "hello")], 1);
+    let mut b = replica(&[plain(1, "hello")], 2);
+    let typed = a.insert_text(1, 5, " A", &Map::new()).unwrap();
+    let kept = a.untracked(|d| d.insert_text(1, 0, "U ", &Map::new())).unwrap();
+    b.apply(&typed).unwrap();
+    b.apply(&kept).unwrap();
+    assert_eq!(b.block(1).unwrap().text, "U hello A", "an untracked edit travels like any other");
+    // Undo passes over the untracked edit, newer as it is, to the tracked one before it.
+    let undo = a.undo().expect("the tracked edit is undone");
+    b.apply(&undo).unwrap();
+    for d in [&a, &b] {
+        assert_eq!(d.block(1).unwrap().text, "U hello");
+    }
+    assert_eq!(a.undo(), None, "nothing tracked is left");
+    // Edits after the closure are tracked again.
+    a.insert_text(1, 0, "x", &Map::new()).unwrap();
+    assert!(a.undo().is_some());
+}
+
+#[test]
 fn undo_covers_structure_too() {
     let mut a = replica(&sample(), 1);
     a.split(2, 4, 100).unwrap();
