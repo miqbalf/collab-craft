@@ -175,6 +175,9 @@ struct JoinedMsg<'a> {
     space: u32,
     roster: &'a [Peer],
     locks: Vec<LockEntry>,
+    /// The last sequence of the ordered replay that follows, so a client can tell it from
+    /// live ops that overtake it.
+    replay_until: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -554,6 +557,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             space,
             roster: &roster,
             locks: locks.iter().map(|(s, h)| LockEntry { scope: s.clone(), holder: h.clone() }).collect(),
+            replay_until: replay.last().map_or(seq, |op| op.seq),
         },
     );
 
@@ -914,8 +918,10 @@ async fn on_saved(socket: SocketRef, Data(msg): Data<SavedMsg>, State(relay): St
         return;
     }
     let mut rooms = relay.rooms.lock().await;
-    if let Some(room) = rooms.get_mut(&claims.rm) {
-        room.checkpoint(msg.seq);
+    if let Some(room) = rooms.get_mut(&claims.rm)
+        && let Err(refusal) = room.checkpoint(msg.seq)
+    {
+        let _ = socket.emit("error", &ErrorMsg { doc: claims.room(), detail: refusal.detail() });
     }
 }
 

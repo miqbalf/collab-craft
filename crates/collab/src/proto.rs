@@ -126,6 +126,11 @@ pub enum ServerMsg {
         space: u32,
         roster: Vec<Presence>,
         locks: Vec<LockState>,
+        /// The last sequence of the ordered catch-up the relay replays right after this
+        /// message, or `seq` itself when it replays none. Ops past it are live, even when the
+        /// socket delivers one of them before the replay. Absent from an older relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_until: Option<u64>,
     },
     /// CRDT operations a joining peer missed, outside the sequence.
     ///

@@ -17,8 +17,9 @@ pub struct Replica(LiveDoc);
 impl Replica {
     /// Seed one paragraph holding `text`, as the file would, and mint in `space`.
     pub fn seeded(space: u32, text: &str) -> Replica {
-        let mut doc = LiveDoc::seeded(&[SeedBlock { id: PARA, text: text.to_owned(), attrs: Map::new(), runs: Vec::new() }]);
-        doc.set_client(space);
+        let mut doc =
+            LiveDoc::seeded(&[SeedBlock { id: PARA, text: text.to_owned(), attrs: Map::new(), runs: Vec::new() }]).expect("one block seeds");
+        doc.set_client(space).expect("the client id is adopted");
         Replica(doc)
     }
 
@@ -27,7 +28,7 @@ impl Replica {
     pub fn from_snapshot(space: u32, op: &Value) -> Replica {
         let state = update_from_wire(op.as_str().expect("an op is a string")).expect("an op is base64");
         let mut doc = LiveDoc::from_state(&state).expect("a snapshot restores");
-        doc.set_client(space);
+        doc.set_client(space).expect("the client id is adopted");
         Replica(doc)
     }
 

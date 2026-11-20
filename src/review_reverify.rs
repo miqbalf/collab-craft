@@ -112,7 +112,7 @@ mod e2e {
                 // ADAPTATION (8cae690): the join now replays text as ordered `op` events
                 // (Effect::Apply of `crdt.text`) instead of `text_ops`. Count both, so the
                 // assertions see every replayed text op the joiner would apply.
-                if let Effect::Apply { command, params } = e
+                if let Effect::Apply { command, params, .. } = e
                     && command == "crdt.text"
                     && params.get("scope").and_then(|s| s.as_str()) == Some(scope)
                 {
@@ -152,7 +152,7 @@ mod e2e {
         a.send(m);
         assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await, "edit never confirmed: {:?}", a.fx);
         let saved_file = t.render();
-        let m = a.s.saved();
+        let m = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
         a.send(m);
         a.settle(Duration::from_millis(300)).await;
 
@@ -188,7 +188,7 @@ mod e2e {
         a.send(m);
         // The app saves what it shows, which already includes the "!", then reports the save.
         let saved_file = t.render();
-        let saved_msg = a.s.saved();
+        let saved_msg = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
         let reported = match &saved_msg {
             ClientMsg::Saved { seq, .. } => *seq,
             _ => unreachable!(),

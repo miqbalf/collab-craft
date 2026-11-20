@@ -30,7 +30,7 @@ const MAX_PENDING: usize = 64;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     /// Run this command against the document. It came from another peer and is next in order.
-    Apply { command: String, params: Value },
+    Apply { command: String, params: Value, seq: u64 },
     /// A command this client sent has been ordered. Nothing to apply, the local copy is already
     /// correct, but any optimistic marker on it can be cleared.
     Confirmed { local: u64, seq: u64 },
@@ -166,24 +166,14 @@ impl Session {
         ClientMsg::Lock { doc: self.doc.clone(), scope: scope.into() }
     }
 
-    /// The message to send after the document has been written to the file.
+    /// The message reporting that the saved file is covered through `seq`.
     ///
-    /// It reports the sequence the save reflects, which is everything this
-    /// replica has applied in order. The relay then stops replaying the CRDT
-    /// operations the file already contains, so a late joiner that loads the
-    /// saved file does not apply them again and see a character twice. The app
-    /// calls this once a save to the provider has succeeded.
-    ///
-    /// Call it only once every edit the saved file reflects has actually been confirmed
-    /// ([`Effect::Confirmed`] received, [`Session::inflight`] back to the count it was before
-    /// those edits). This reports [`Session::applied`], which is what the relay has ordered,
-    /// not what this replica has rendered: an app that renders a local edit optimistically,
-    /// writes that rendering to the file, and calls this before the edit comes back ordered
-    /// reports a sequence that understates what the file already holds. The relay then keeps
-    /// replaying an operation the saved file already contains, and a later joiner sees it
-    /// twice.
-    pub fn saved(&self) -> ClientMsg {
-        ClientMsg::Saved { doc: self.doc.clone(), seq: self.applied }
+    /// Crate-private on purpose. The relay accepts a save only when the op right after `seq`
+    /// is a checkpoint snapshot, because a joiner can start from a snapshot but not from a file
+    /// the room has edited. So an app saves through [`crate::Live::checkpoint`], which sends
+    /// the snapshot first and reports the save once it is ordered cleanly.
+    pub(crate) fn saved_through(&self, seq: u64) -> ClientMsg {
+        ClientMsg::Saved { doc: self.doc.clone(), seq }
     }
 
     /// Give a scope back. Dropping it locally is immediate, because a release cannot be refused.
@@ -364,7 +354,7 @@ impl Session {
             // Ours but with no counter, which should not happen. Applying it would duplicate the
             // edit, so it is dropped with a note in the log.
             (true, None) => log::warn!("doc {}: own op at seq {seq} carried no local counter", self.doc),
-            (false, _) => out.push(Effect::Apply { command, params }),
+            (false, _) => out.push(Effect::Apply { command, params, seq }),
         }
     }
 }

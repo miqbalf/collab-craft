@@ -15,6 +15,7 @@ fn joined(seq: u64) -> ServerMsg {
         space: 7,
         roster: vec![Presence { peer: "me".to_owned(), display: "Alice".to_owned() }],
         locks: Vec::new(),
+        replay_until: None,
     }
 }
 
@@ -60,13 +61,13 @@ fn a_remote_lock_announced_to_the_room_is_recorded() {
 }
 
 #[test]
-fn saved_reports_the_sequence_the_client_has_applied() {
+fn saved_reports_the_sequence_it_is_given() {
     let mut s = Session::new(DOC);
     s.handle(joined(17));
-    match s.saved() {
+    match s.saved_through(16) {
         ClientMsg::Saved { doc, seq } => {
             assert_eq!(doc, DOC);
-            assert_eq!(seq, 17, "a save reflects everything the client has applied in order");
+            assert_eq!(seq, 16, "a checkpoint at 17 reports the save through 16");
         }
         other => panic!("expected Saved, got {other:?}"),
     }
@@ -82,6 +83,7 @@ fn a_join_sorts_existing_locks_into_mine_and_theirs() {
         space: 7,
         roster: Vec::new(),
         locks: vec![LockState { scope: "A1".to_owned(), holder: "me".to_owned() }, LockState { scope: "B2".to_owned(), holder: "bob".to_owned() }],
+        replay_until: None,
     });
     assert!(s.holds("A1"), "a lock already held by us must be recognised as ours");
     assert!(!s.holds("B2"));
@@ -115,7 +117,7 @@ fn an_in_order_remote_op_is_applied() {
     let out = s.handle(op(1, "bob", None, "B2"));
     assert_eq!(out.len(), 1);
     match &out[0] {
-        Effect::Apply { command, params } => {
+        Effect::Apply { command, params, .. } => {
             assert_eq!(command, "cell.set");
             assert_eq!(params["cell"], "B2");
         }
@@ -135,8 +137,15 @@ fn the_granted_id_space_arrives_as_an_effect() {
     assert!(effects.contains(&Effect::Space { space: 7 }), "the space is announced, not left to be polled");
 
     let mut old_relay = Session::new(DOC);
-    let effects =
-        old_relay.handle(ServerMsg::Joined { doc: DOC.to_owned(), peer: "me".to_owned(), seq: 0, space: 0, roster: Vec::new(), locks: Vec::new() });
+    let effects = old_relay.handle(ServerMsg::Joined {
+        doc: DOC.to_owned(),
+        peer: "me".to_owned(),
+        seq: 0,
+        space: 0,
+        roster: Vec::new(),
+        locks: Vec::new(),
+        replay_until: None,
+    });
     assert_eq!(old_relay.space(), None);
     assert!(!effects.iter().any(|e| matches!(e, Effect::Space { .. })));
 }

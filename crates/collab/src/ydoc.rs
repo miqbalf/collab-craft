@@ -120,6 +120,10 @@ pub enum LiveError {
     /// A merge named the same block twice.
     #[error("cannot merge a block with itself")]
     SameBlock,
+    /// yrs panicked during an earlier apply, so this replica may hold half an update. It takes
+    /// no more local edits; rebuild it from a snapshot or reopen the file.
+    #[error("the shared document is damaged; reopen the file")]
+    Damaged,
 }
 
 /// One replica of a block document.
@@ -145,8 +149,14 @@ impl LiveDoc {
     /// Deterministic: equal blocks give equal [`state`](Self::state) bytes on every replica.
     /// Attribute values that are JSON objects are the exception for the bytes only, because yrs
     /// encodes a nested map in hash order. The item ids, and so convergence, are unaffected.
-    #[must_use]
-    pub fn seeded(blocks: &[SeedBlock]) -> LiveDoc {
+    ///
+    /// Two blocks with the same id are refused with [`LiveError::Exists`]: the order could not
+    /// say which of them is meant.
+    pub fn seeded(blocks: &[SeedBlock]) -> Result<LiveDoc, LiveError> {
+        let mut ids = BTreeSet::new();
+        if !blocks.iter().all(|b| ids.insert(b.id)) {
+            return Err(LiveError::Exists);
+        }
         let doc = build_doc(0);
         let body = doc.get_or_insert_array(BODY);
         let map = doc.get_or_insert_map(BLOCKS);
@@ -158,7 +168,7 @@ impl LiveDoc {
                 put_block(&mut txn, &map, block);
             }
         }
-        assemble(doc, None)
+        Ok(assemble(doc, None))
     }
 
     /// Mint later local edits with client id `space`.
@@ -166,23 +176,26 @@ impl LiveDoc {
     /// Space 0 is the seed's own, so `set_client(0)` is a no-op (logged): the replica keeps
     /// refusing local edits. Setting the space this replica already has is also a no-op.
     /// Any other space rebuilds the `Doc` with that client id and the current state, and starts a
-    /// fresh undo history.
-    pub fn set_client(&mut self, space: u32) {
+    /// fresh undo history. The carried state includes updates yrs is still holding for missing
+    /// dependencies and the whole delete set. If it does not carry across, the replica is left
+    /// as it was (still without a client id) and the error says so.
+    pub fn set_client(&mut self, space: u32) -> Result<(), LiveError> {
         if space == 0 {
             log::warn!("collab: client id 0 belongs to the seed and is never adopted");
-            return;
+            return Ok(());
         }
         if self.client == Some(space) {
-            return;
+            return Ok(());
         }
         let doc = build_doc(u64::from(space));
         if let Err(e) = integrate(&doc, &self.state()) {
             log::warn!("collab: this replica's own state did not carry across a client change: {e}");
-            return;
+            return Err(LiveError::from(e));
         }
         let damaged = self.damaged;
         *self = assemble(doc, Some(space));
         self.damaged = damaged;
+        Ok(())
     }
 
     /// A replica restored from a full state, such as a checkpoint snapshot.
@@ -299,6 +312,10 @@ impl LiveDoc {
     /// Move the text and runs from `char_at` onward into a new block `new_id`, placed right
     /// after `id`. The new block's attributes copy the original's.
     ///
+    /// The tail is moved by deleting it here and writing it afresh into the new block, so the
+    /// new block's characters are new items. Typing another peer does in the tail at the same
+    /// time therefore lands in the original block, at the split point, not in the new one.
+    ///
     /// Two peers splitting the same block at the same time each move the tail, so the merged
     /// document holds it twice. Every replica still ends identical; only the intent is lost.
     /// That is accepted for phase 1.
@@ -337,7 +354,7 @@ impl LiveDoc {
         }
         self.local(|txn, s| {
             let (a, _) = s.live_block(txn, first).map_err(|_| LiveError::Gone)?;
-            let (b, index) = s.live_block(txn, second).map_err(|_| LiveError::Gone)?;
+            let (b, _) = s.live_block(txn, second).map_err(|_| LiveError::Gone)?;
             let into = text_of(txn, &a).ok_or(LiveError::UnknownBlock)?;
             let from = text_of(txn, &b).ok_or(LiveError::UnknownBlock)?;
             let moved = chunks(txn, &from);
@@ -347,7 +364,7 @@ impl LiveDoc {
                 into.insert_with_attributes(txn, at, &text, run_attrs_of(&attrs));
                 at += len;
             }
-            s.body.remove(txn, index);
+            s.remove_all(txn, second);
             Ok(())
         })
     }
@@ -355,10 +372,7 @@ impl LiveDoc {
     /// Insert a new block at `at` in the order.
     pub fn insert_block(&mut self, at: usize, block: &SeedBlock) -> Result<Vec<u8>, LiveError> {
         self.local(|txn, s| {
-            let index = u32::try_from(at).map_err(|_| LiveError::OutOfRange)?;
-            if index > s.body.len(txn) {
-                return Err(LiveError::OutOfRange);
-            }
+            let index = s.raw_index(txn, at)?;
             if s.blocks.get(txn, &key(block.id)).is_some() {
                 return Err(LiveError::Exists);
             }
@@ -371,8 +385,8 @@ impl LiveDoc {
     /// Take a block out of the order. Its content stays, as a tombstone.
     pub fn remove_block(&mut self, id: u64) -> Result<Vec<u8>, LiveError> {
         self.local(|txn, s| {
-            let (_, index) = s.live_block(txn, id)?;
-            s.body.remove(txn, index);
+            s.live_block(txn, id)?;
+            s.remove_all(txn, id);
             Ok(())
         })
     }
@@ -398,8 +412,9 @@ impl LiveDoc {
     }
 
     /// Undo this replica's last local edit and return the update to send.
+    /// `None` on a [`damaged`](Self::damaged) replica too.
     pub fn undo(&mut self) -> Option<Vec<u8>> {
-        if !self.undo.can_undo() {
+        if self.damaged || !self.undo.can_undo() {
             return None;
         }
         let before = self.doc.transact().state_vector();
@@ -407,8 +422,9 @@ impl LiveDoc {
     }
 
     /// Redo the last undone local edit and return the update to send.
+    /// `None` on a [`damaged`](Self::damaged) replica too.
     pub fn redo(&mut self) -> Option<Vec<u8>> {
-        if !self.undo.can_redo() {
+        if self.damaged || !self.undo.can_redo() {
             return None;
         }
         let before = self.doc.transact().state_vector();
@@ -429,13 +445,33 @@ impl LiveDoc {
     where
         F: FnOnce(&mut TransactionMut, &Roots) -> Result<(), LiveError>,
     {
+        if self.damaged {
+            return Err(LiveError::Damaged);
+        }
         if self.client.is_none() {
             return Err(LiveError::NoClient);
         }
         let roots = Roots { body: self.body.clone(), blocks: self.blocks.clone() };
-        let mut txn = self.doc.transact_mut_with(LOCAL);
-        edit(&mut txn, &roots)?;
-        Ok(txn.encode_update_v1())
+        let update = {
+            let mut txn = self.doc.transact_mut_with(LOCAL);
+            edit(&mut txn, &roots)?;
+            txn.encode_update_v1()
+        };
+        // The observer saw this replica's own change; nobody needs it reported back.
+        self.drain_seen();
+        Ok(update)
+    }
+
+    /// Mark the replica damaged, as a caught yrs panic would.
+    #[cfg(test)]
+    pub(crate) fn force_damaged(&mut self) {
+        self.damaged = true;
+    }
+
+    /// How many changes the observer is holding, for a test of local edits draining them.
+    #[cfg(test)]
+    pub(crate) fn seen_len(&self) -> usize {
+        self.seen.lock().map(|s| s.len()).unwrap_or(0)
     }
 
     fn drain_seen(&self) -> Vec<BlockChange> {
@@ -454,12 +490,41 @@ struct Roots {
 
 impl Roots {
     /// A block that is in the order, with its index there.
+    /// A block that is in the order, with the body index of its first occurrence.
     fn live_block<T: ReadTxn>(&self, txn: &T, id: u64) -> Result<(MapRef, u32), LiveError> {
         let Some(Out::YMap(block)) = self.blocks.get(txn, &key(id)) else {
             return Err(LiveError::UnknownBlock);
         };
-        let index = order_of(txn, &self.body).iter().position(|o| *o == id).ok_or(LiveError::Gone)?;
+        let index = raw_ids(txn, &self.body).iter().position(|o| *o == Some(id)).ok_or(LiveError::Gone)?;
         Ok((block, u32::try_from(index).map_err(|_| LiveError::OutOfRange)?))
+    }
+
+    /// Take every occurrence of `id` out of the body. Two peers inserting the same id at once
+    /// leave it there twice; removing only one would leave the block in the order.
+    fn remove_all(&self, txn: &mut TransactionMut, id: u64) {
+        let at: Vec<u32> =
+            raw_ids(txn, &self.body).iter().enumerate().filter(|(_, o)| **o == Some(id)).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
+        for i in at.into_iter().rev() {
+            self.body.remove(txn, i);
+        }
+    }
+
+    /// The body index that position `at` of [`order_of`] maps to, which may be the end.
+    fn raw_index<T: ReadTxn>(&self, txn: &T, at: usize) -> Result<u32, LiveError> {
+        let raw = raw_ids(txn, &self.body);
+        let mut seen = BTreeSet::new();
+        let mut visible = 0;
+        for (i, id) in raw.iter().enumerate() {
+            if let Some(id) = id
+                && seen.insert(*id)
+            {
+                if visible == at {
+                    return u32::try_from(i).map_err(|_| LiveError::OutOfRange);
+                }
+                visible += 1;
+            }
+        }
+        if visible == at { u32::try_from(raw.len()).map_err(|_| LiveError::OutOfRange) } else { Err(LiveError::OutOfRange) }
     }
 
     fn live_text<T: ReadTxn>(&self, txn: &T, id: u64) -> Result<TextRef, LiveError> {
@@ -562,13 +627,21 @@ fn id_any(id: u64) -> Any {
     Any::Number(Number::Int(id as i64))
 }
 
-fn order_of<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<u64> {
+/// Every body entry, by index. `None` for an entry that is not an id.
+fn raw_ids<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<Option<u64>> {
     body.iter(txn)
-        .filter_map(|v| match v {
+        .map(|v| match v {
             Out::Any(Any::Number(n)) => n.as_i64().map(|i| i as u64),
             _ => None,
         })
         .collect()
+}
+
+/// The order: body ids, each kept at its first occurrence only. Two peers inserting the same id
+/// at once leave it in the body twice, and every replica keeps the same (first) one.
+fn order_of<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<u64> {
+    let mut seen = BTreeSet::new();
+    raw_ids(txn, body).into_iter().flatten().filter(|id| seen.insert(*id)).collect()
 }
 
 fn text_of<T: ReadTxn>(txn: &T, block: &MapRef) -> Option<TextRef> {
@@ -743,5 +816,39 @@ fn to_json(a: &Any) -> Value {
         Any::Buffer(b) => Value::Array(b.iter().map(|x| Value::from(*x)).collect()),
         Any::Array(items) => Value::Array(items.iter().map(to_json).collect()),
         Any::Map(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn doc() -> LiveDoc {
+        let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "hello".to_owned(), ..SeedBlock::default() }]).unwrap();
+        d.set_client(1).unwrap();
+        d
+    }
+
+    /// The observer sees local changes too; they are drained, not left to pile up.
+    #[test]
+    fn local_edits_leave_nothing_in_the_change_buffer() {
+        let mut d = doc();
+        for i in 0..50 {
+            d.insert_text(1, i, "x", &Map::new()).unwrap();
+        }
+        assert_eq!(d.seen_len(), 0);
+    }
+
+    /// A damaged replica takes no local edit, undo or redo.
+    #[test]
+    fn a_damaged_replica_refuses_local_edits() {
+        let mut d = doc();
+        d.insert_text(1, 0, "x", &Map::new()).unwrap();
+        d.force_damaged();
+        assert_eq!(d.insert_text(1, 0, "y", &Map::new()), Err(LiveError::Damaged));
+        assert_eq!(d.undo(), None);
+        assert_eq!(d.redo(), None);
     }
 }

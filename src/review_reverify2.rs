@@ -29,7 +29,15 @@ mod unit {
     fn unit_client_behind_hole_recovers_promptly() {
         const DOC: &str = "doc:hole";
         let mut carol = Session::new(DOC);
-        carol.handle(ServerMsg::Joined { doc: DOC.to_owned(), peer: "carol".to_owned(), seq: 2, space: 3, roster: vec![], locks: vec![] });
+        carol.handle(ServerMsg::Joined {
+            doc: DOC.to_owned(),
+            peer: "carol".to_owned(),
+            seq: 2,
+            space: 3,
+            roster: vec![],
+            locks: vec![],
+            replay_until: None,
+        });
         let mut fx = Vec::new();
         for seq in 4..=100u64 {
             fx.extend(carol.handle(op(DOC, seq)));
@@ -191,7 +199,7 @@ mod e2e {
                 // ADAPTATION (8cae690): the join now replays text as ordered `op` events
                 // (Effect::Apply of `crdt.text`) instead of `text_ops`. Count both, so the
                 // assertions see every replayed text op the joiner would apply.
-                if let Effect::Apply { command, params } = e
+                if let Effect::Apply { command, params, .. } = e
                     && command == "crdt.text"
                     && params.get("scope").and_then(|s| s.as_str()) == Some(scope)
                 {
@@ -247,7 +255,7 @@ mod e2e {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let before = bob_session.applied();
         cell_edits(&mut a, &[1, 2]).await;
-        let m = a.s.saved();
+        let m = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
         a.send(m);
         a.settle(Duration::from_millis(200)).await;
         cell_edits(&mut a, &[3]).await;

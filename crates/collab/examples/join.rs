@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for effect in session.handle(msg) {
                 match effect {
-                    Effect::Apply { command, params } => println!("APPLY   {command} {params}"),
+                    Effect::Apply { command, params, seq } => println!("APPLY   {seq} {command} {params}"),
                     Effect::Confirmed { local, seq } => println!("OK      local {local} ordered at seq {seq}"),
                     Effect::Replace { seq, .. } => println!("REPLACE from seq {seq}"),
                     Effect::LockHeld { scope } => println!("LOCK    held {scope}"),

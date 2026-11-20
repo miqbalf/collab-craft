@@ -243,30 +243,34 @@ fn a_replay_rebuilds_the_text_on_a_joining_replica() {
     assert_eq!(bob.render(), alice.render());
 }
 
-/// Issue 27. Alice types "!" into "hello" and saves "hello!" while connected.
-/// The client tells the relay the save reflects that edit, so the operation is
-/// no longer replayed. A joiner that opens the saved file does not apply the "!"
-/// a second time and see "hello!!".
+/// Issue 27. Alice types "!" into "hello" and saves "hello!" while connected. A plain save
+/// report is refused now (the joiner would seed a file the room had edited), so the save goes
+/// through a snapshot: the joiner restores it, is replayed nothing else, and sees "hello!" once.
 #[test]
 fn a_save_checkpoint_stops_a_joiner_double_applying_the_saved_text() {
+    use crate::room::Refusal;
     use crate::test_text::{Replica, SCOPE};
     let mut alice = Replica::seeded(1, "hello");
     let params = alice.insert(5, "!");
-    let saved = alice.render();
-    assert_eq!(saved, "hello!");
+    assert_eq!(alice.render(), "hello!");
 
     let mut r = room_with(&[("alice", true)]);
     r.submit(1, sub("alice", true, "crdt.text", params, None)).expect("ok");
 
-    // Alice saves "hello!", which reflects the edit ordered at sequence 1.
-    r.checkpoint(1);
+    // A plain save through 1 has no snapshot after it: refused, and nothing is dropped.
+    assert_eq!(r.checkpoint(1), Err(Refusal::NotACheckpoint { seq: 1 }));
+    assert_eq!(r.texts().get(SCOPE).expect("retained").ops().len(), 1);
 
-    // Bob joins, loads the saved file, and is replayed nothing.
+    // Alice checkpoints: the snapshot is ordered at 2, and the save through 1 is accepted.
+    r.submit(2, sub("alice", true, "crdt.text", alice.snapshot(), None)).expect("ok");
+    r.checkpoint(1).expect("a save right before a snapshot");
+
+    // Bob joins from the snapshot and is replayed nothing else.
     let log = r.texts().get(SCOPE).expect("retained");
-    assert!(log.ops().is_empty(), "the saved edit is not replayed again");
-    let mut bob = Replica::seeded(2, &saved);
-    bob.apply(log.ops());
-    assert_eq!(bob.render(), "hello!", "the file's text is not doubled");
+    assert!(log.starts_with_snapshot());
+    assert_eq!(log.ops().len(), 1, "the saved edit is not replayed again");
+    let bob = Replica::from_snapshot(2, &log.ops()[0]);
+    assert_eq!(bob.render(), "hello!", "the text is not doubled");
 }
 
 /// The snapshot checkpoint, through the real `Room`. The worker submits a snapshot op, ordered
@@ -286,7 +290,7 @@ fn a_snapshot_checkpoint_is_retained_first_and_a_joiner_converges_from_it() {
     let snap = worker.snapshot();
     assert_eq!(snap["snap"], json!(true));
     r.submit(2, sub("alice", true, "crdt.text", snap, None)).expect("ok");
-    r.checkpoint(1);
+    r.checkpoint(1).expect("a save right before a snapshot");
     let e3 = alice.insert(12, "!");
     r.submit(3, sub("alice", true, "crdt.text", e3, None)).expect("ok");
 
@@ -307,9 +311,9 @@ fn a_snapshot_checkpoint_is_retained_first_and_a_joiner_converges_from_it() {
     assert_eq!(carol.render(), "AheCllo, world!");
     assert_eq!(alice.render(), carol.render());
 
-    // A later save drops the snapshot too, and the log no longer starts with one.
-    r.checkpoint(2);
-    assert!(!r.texts().get(SCOPE).expect("retained").starts_with_snapshot());
+    // A later plain save (no snapshot after it) is refused, and the snapshot still leads.
+    assert!(r.checkpoint(2).is_err());
+    assert!(r.texts().get(SCOPE).expect("retained").starts_with_snapshot());
 }
 
 /// Latest wins, and the newest value per kind is what a joining peer is handed.

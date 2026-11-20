@@ -41,7 +41,7 @@ fn op_msg(doc: &str, op: &crate::room::Op) -> craft_collab::ServerMsg {
 }
 
 fn joined(doc: &str, me: &str, seq: u64) -> craft_collab::ServerMsg {
-    craft_collab::ServerMsg::Joined { doc: doc.to_owned(), peer: me.to_owned(), seq, space: 3, roster: vec![], locks: vec![] }
+    craft_collab::ServerMsg::Joined { doc: doc.to_owned(), peer: me.to_owned(), seq, space: 3, roster: vec![], locks: vec![], replay_until: None }
 }
 
 // ---- hygiene H1: service token vs client doc_from_token ---------------------------------
@@ -183,23 +183,18 @@ fn unit_replay_after_save_does_not_duplicate() {
     let mut r = Room::default();
     r.join(peer("alice")).unwrap();
     r.submit(1, sub("alice", "crdt.text", params, None, None)).unwrap();
-    // ADAPTATION: the scenario is "alice saves 'hello!' while still connected", which is what
-    // makes bob's load of the saved file valid in the first place. That save is what main.rs's
-    // on_saved reports to the room as a checkpoint; without calling it here, the submitted op
-    // is still retained unsaved, and replaying it on top of a file that already contains it is
-    // exactly the double-apply this test exists to rule out, not something it should find.
-    r.checkpoint(1);
+    // ADAPTATION (snapshot checkpoints): a save is accepted only right before a checkpoint
+    // snapshot, and a joiner starts from that snapshot rather than from the saved file, whose
+    // client-0 items are not the room's. Alice's save is that snapshot at seq 2 plus Saved{1}.
+    r.submit(2, sub("alice", "crdt.text", alice.snapshot(), None, None)).unwrap();
+    r.checkpoint(1).unwrap();
 
     let log = r.texts().get(SCOPE).unwrap();
-    let mut bob = Replica::seeded(2, &saved); // bob loads the SAVED file
-    bob.apply(log.ops());
+    assert!(log.starts_with_snapshot());
+    let mut bob = Replica::from_snapshot(2, &log.ops()[0]);
+    bob.apply(&log.ops()[1..]);
     let seen = bob.render();
-    assert_eq!(
-        seen,
-        saved,
-        "late joiner seeded from the saved file {saved:?} then replayed retained ops (complete={}) and sees {seen:?}",
-        log.complete()
-    );
+    assert_eq!(seen, saved, "late joiner restored from the checkpoint then replayed retained ops (complete={}) and sees {seen:?}", log.complete());
 }
 
 // ---- relay H5 / hygiene N2: retained CRDT scopes are unbounded per room ------------------

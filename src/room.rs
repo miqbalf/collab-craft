@@ -109,6 +109,8 @@ pub enum Refusal {
     Full,
     /// The message is larger than a document may retain.
     TooLarge { bytes: usize },
+    /// A save report that does not sit right before a retained checkpoint snapshot.
+    NotACheckpoint { seq: u64 },
 }
 
 impl Refusal {
@@ -118,6 +120,9 @@ impl Refusal {
             Refusal::Locked { holder } => format!("{holder} is editing that region"),
             Refusal::Full => format!("this document already has {MAX_PEERS} editors"),
             Refusal::TooLarge { bytes } => format!("that change is {bytes} bytes, more than this relay will carry"),
+            Refusal::NotACheckpoint { seq } => {
+                format!("a save through {seq} is kept only when a checkpoint snapshot follows it; nothing was dropped")
+            }
         }
     }
 }
@@ -152,6 +157,11 @@ impl TextLog {
     /// than from the file. The payload stays opaque; this is only the submit's own flag.
     pub fn starts_with_snapshot(&self) -> bool {
         self.snaps.first().copied().unwrap_or(false)
+    }
+
+    /// Whether the op ordered at `seq` is retained here and is a checkpoint snapshot.
+    fn snapshot_at(&self, seq: u64) -> bool {
+        self.seqs.iter().zip(&self.snaps).any(|(s, snap)| *s == seq && *snap)
     }
 
     /// Drop the operations a save has baked into the file.
@@ -460,17 +470,19 @@ impl Room {
 
     /// Note that the document has been saved up to `seq`.
     ///
-    /// Every ordered edit through `seq` is now in the file, so the retained CRDT
-    /// operations at or below it are dropped. A joiner that loads the saved file
-    /// then receives only the operations after the save, rather than replaying
-    /// text the file already contains and seeing it twice.
+    /// Accepted only when the retained op ordered at `seq + 1` is a checkpoint snapshot. A
+    /// joiner then starts from that snapshot, so dropping everything at or below `seq` loses
+    /// nothing. Any other report is refused and the log is kept whole: a joiner seeding a file
+    /// the room has edited would hold different items from the live replicas and diverge.
     ///
-    /// `seq` is capped at [`Room::seq`]. It is a client's report of what its own save reflects,
-    /// and a save can only reflect edits this room has actually ordered: a claim past that
-    /// would move the join baseline ahead of live edits and strand a later joiner, who would
-    /// then treat them as already seen and never receive them.
-    pub fn checkpoint(&mut self, seq: u64) {
-        let seq = seq.min(self.seq);
+    /// Because the snapshot has to be retained, `seq` is always below [`Room::seq`], and a
+    /// report at or below an earlier save finds its snapshot already dropped and is refused,
+    /// so `saved_seq` only moves forward.
+    pub fn checkpoint(&mut self, seq: u64) -> Result<(), Refusal> {
+        let snapshot_next = seq.checked_add(1).is_some_and(|next| self.texts.values().any(|log| log.snapshot_at(next)));
+        if !snapshot_next {
+            return Err(Refusal::NotACheckpoint { seq });
+        }
         self.saved_seq = self.saved_seq.max(seq);
         for log in self.texts.values_mut() {
             log.drop_through(seq);
@@ -479,6 +491,7 @@ impl Room {
         // walks every surviving op to rebuild `bytes`; summing here is the same cost repeated
         // once per save, not once per op, and cannot drift from what the scopes actually hold.
         self.text_bytes = self.texts.values().map(|log| log.bytes).sum();
+        Ok(())
     }
 
     /// The sequence the saved file reflects. See [`Room::saved_seq`] field.
@@ -608,25 +621,49 @@ mod tests {
         }
     }
 
+    fn snap_sub(peer: &str, scope: &str) -> Submission {
+        Submission { params: serde_json::json!({ "scope": scope, "snap": true, "ops": ["c25hcA=="] }), ..crdt_sub(peer, scope) }
+    }
+
     #[test]
-    fn a_save_checkpoint_drops_the_operations_the_file_now_holds() {
-        // Three text edits are retained. A save reflecting the first two drops
-        // them, because the file now carries that text. Only the edit after the
-        // save is still replayed, so a joiner loading the file does not apply
-        // the saved text a second time.
+    fn a_save_checkpoint_drops_the_operations_its_snapshot_covers() {
+        // Two text edits, then a snapshot at 3, then an edit. A save through 2 sits right
+        // before the snapshot, so the edits it covers are dropped and the snapshot leads.
         let mut r = Room::default();
         r.join(peer("alice")).unwrap();
         r.submit(1, crdt_sub("alice", "/body/0")).unwrap();
         r.submit(2, crdt_sub("alice", "/body/0")).unwrap();
+        r.submit(3, snap_sub("alice", "/body/0")).unwrap();
+        r.submit(4, crdt_sub("alice", "/body/0")).unwrap();
+        assert_eq!(r.texts().get("/body/0").unwrap().ops().len(), 4);
+
+        r.checkpoint(2).unwrap();
+        let log = r.texts().get("/body/0").unwrap();
+        assert_eq!(log.ops().len(), 2, "the snapshot and the edit after it survive");
+        assert!(log.starts_with_snapshot());
+        assert_eq!(r.saved_seq(), 2);
+    }
+
+    /// A save that is not right before a snapshot is refused and drops nothing, because a
+    /// joiner can start from a snapshot but not from a file the room has edited.
+    #[test]
+    fn a_save_not_followed_by_a_snapshot_is_refused() {
+        let mut r = Room::default();
+        r.join(peer("alice")).unwrap();
+        r.submit(1, crdt_sub("alice", "/body/0")).unwrap();
+        r.submit(2, snap_sub("alice", "/body/0")).unwrap();
         r.submit(3, crdt_sub("alice", "/body/0")).unwrap();
-        assert_eq!(r.texts().get("/body/0").unwrap().ops().len(), 3);
+        for seq in [0, 2, 3, u64::MAX] {
+            assert_eq!(r.checkpoint(seq), Err(Refusal::NotACheckpoint { seq }), "a save through {seq}");
+        }
+        assert_eq!(r.texts().get("/body/0").unwrap().ops().len(), 3, "the log is kept whole");
+        assert_eq!(r.saved_seq(), 0);
 
-        r.checkpoint(2);
-        assert_eq!(r.texts().get("/body/0").unwrap().ops().len(), 1, "only the edit after the save survives");
-
-        // A save reflecting everything leaves nothing to replay.
-        r.checkpoint(3);
-        assert!(r.texts().get("/body/0").unwrap().ops().is_empty());
+        // The accepted save, then an older report: its snapshot is gone, so it is refused and
+        // the baseline does not move back.
+        r.checkpoint(1).unwrap();
+        assert_eq!(r.checkpoint(0), Err(Refusal::NotACheckpoint { seq: 0 }));
+        assert_eq!(r.saved_seq(), 1);
     }
 
     fn plain_sub(peer: &str) -> Submission {
@@ -670,23 +707,23 @@ mod tests {
         let from_top = r.since(r.saved_seq()).map(|ops| ops.iter().map(|o| o.seq).collect::<Vec<_>>());
         assert_eq!(from_top, Some(vec![1, 2]), "with no save, a joiner replays every op");
 
-        r.submit(3, plain_sub("alice")).unwrap();
-        r.checkpoint(2);
+        r.submit(3, snap_sub("alice", "doc")).unwrap();
+        r.checkpoint(2).unwrap();
         assert_eq!(r.saved_seq(), 2);
         let after_save = r.since(r.saved_seq()).map(|ops| ops.iter().map(|o| o.seq).collect::<Vec<_>>());
         assert_eq!(after_save, Some(vec![3]), "after a save, only the later ops replay");
     }
 
     #[test]
-    fn a_checkpoint_past_the_room_s_own_sequence_is_capped() {
-        // A client's report of what its save reflects is capped at the room's own sequence.
-        // Otherwise a save claiming it covers edits the room never ordered would move the
-        // join baseline past live edits and strand a later joiner behind them.
+    fn a_checkpoint_past_the_room_s_own_sequence_is_refused() {
+        // A save claiming it covers edits the room never ordered would move the join baseline
+        // past live edits and strand a later joiner behind them. No snapshot follows it, so it
+        // is refused outright.
         let mut r = Room::default();
         r.join(peer("alice")).unwrap();
         r.submit(1, plain_sub("alice")).unwrap();
-        r.checkpoint(u64::MAX);
-        assert_eq!(r.saved_seq(), 1, "the claimed save cannot reach past the room's own sequence");
+        assert!(r.checkpoint(u64::MAX).is_err());
+        assert_eq!(r.saved_seq(), 0, "the claimed save moves nothing");
     }
 
     #[test]
