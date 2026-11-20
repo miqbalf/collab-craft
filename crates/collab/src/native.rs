@@ -14,6 +14,7 @@
 //! functions the browser hub calls, so the two peers cannot drift apart over
 //! an event name.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,12 +70,14 @@ impl Shared {
 
 /// What the callbacks and the hub tell the socket task.
 enum Control {
-    /// The socket of this generation is gone: the relay closed it, or a heartbeat could not be
-    /// sent on it.
+    /// The socket of this generation is gone: the relay closed it.
     Closed(u64),
-    /// The relay joined the connection of this generation; the backoff starts over and what
-    /// was queued while the link was down goes out.
-    Joined(u64),
+    /// The relay joined the connection of this generation, and says whether it acknowledges
+    /// heartbeats. The backoff starts over and what was queued while the link was down goes
+    /// out, before anything sent after.
+    Joined(u64, bool),
+    /// The relay acknowledged heartbeat `n` on the connection of this generation.
+    Alive(u64, u64),
     /// The relay refused the connection of this generation itself (a bad or expired token,
     /// another protocol). Reconnecting with the same auth cannot help, so the task stops until
     /// a new token, unless one arrived since that connection was made.
@@ -122,15 +125,28 @@ impl NativeHub {
     }
 }
 
-/// How often the task sends a heartbeat on an idle socket. rust_socketio's own reconnect is
-/// off, and with it the only place it notices a dropped link, so the hub notices it here:
-/// an emit on a socket whose transport has closed fails.
-const HEARTBEAT: Duration = Duration::from_secs(2);
+/// How often the task sends a heartbeat.
+///
+/// rust_socketio's own reconnect is off, and with it the only place it notices a closed
+/// transport, so the hub notices a dead link itself. A relay that says so in `Joined`
+/// (`heartbeat`) acknowledges each `alive`; one not acknowledged within [`HEARTBEAT_TIMEOUT`]
+/// means a dead link, which also catches a half-open one (laptop sleep, a Wi-Fi roam, a NAT
+/// that dropped the mapping) where sends succeed into a socket nothing reads. With an older
+/// relay, which has no handler and would never acknowledge, only an emit that fails or hangs
+/// counts, so it never sees false drops, but a half-open link there waits for the transport.
+const HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// The heartbeat's event. The relay has no handler for it and drops it.
+/// How long a heartbeat may go unacknowledged.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one emit, or one connection attempt, may take before the link counts as dead.
+/// An emit into a stalled transport can otherwise hang the task.
+const EMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The heartbeat's event.
 const HEARTBEAT_EVENT: &str = "alive";
 
-/// Messages queued while the link is down, at most. Older ones are dropped past it.
+/// Messages queued while the link is down, at most.
 const MAX_QUEUED: usize = 256;
 
 /// What a socket to the relay is built from, kept so the task can build another.
@@ -139,6 +155,49 @@ struct Link {
     in_tx: UnboundedSender<ServerMsg>,
     control: UnboundedSender<Control>,
     shared: Arc<Shared>,
+}
+
+/// How an emit went.
+enum Emitted {
+    Sent,
+    /// It failed or did not finish in time: the link is dead.
+    Dead,
+    /// The hub was dropped meanwhile.
+    Stopped,
+}
+
+/// One emit, bounded by [`EMIT_TIMEOUT`] and abandoned when the hub is dropped.
+async fn emit_on(socket: &Client, msg: &ClientMsg, stopped: &mut oneshot::Receiver<()>) -> Emitted {
+    let (event, body) = emit(msg);
+    tokio::select! {
+        _ = stopped => Emitted::Stopped,
+        sent = tokio::time::timeout(EMIT_TIMEOUT, socket.emit(event, body)) => match sent {
+            Ok(Ok(())) => Emitted::Sent,
+            Ok(Err(e)) => {
+                log::warn!("relay send failed: {e}");
+                Emitted::Dead
+            }
+            Err(_) => {
+                log::warn!("relay send did not finish in {EMIT_TIMEOUT:?}");
+                Emitted::Dead
+            }
+        },
+    }
+}
+
+/// The connection the task holds, and what it knows about it.
+struct Connection {
+    client: Client,
+    generation: u64,
+    /// The token generation it was made with.
+    token: u64,
+    /// The relay joined it. Until then sends are held, so what was queued goes out first.
+    joined: bool,
+    /// The relay acknowledges heartbeats on it.
+    acks: bool,
+    /// The heartbeat in flight, and when it was sent.
+    beat: Option<(u64, tokio::time::Instant)>,
+    beats: u64,
 }
 
 impl Link {
@@ -167,8 +226,8 @@ impl Link {
                     }
                     for msg in decode_payload(event, payload) {
                         match &msg {
-                            ServerMsg::Joined { .. } => {
-                                let _ = control.send(Control::Joined(generation));
+                            ServerMsg::Joined { heartbeat, .. } => {
+                                let _ = control.send(Control::Joined(generation, *heartbeat));
                             }
                             msg if msg.refuses_connection().is_some() => {
                                 let _ = control.send(Control::Refused(generation));
@@ -202,8 +261,49 @@ impl Link {
         })
     }
 
+    /// Hold `msg` until the relay has joined the connection again, or drop it when the rejoin
+    /// covers it ([`while_down`]). Lock commands keep only the newest per scope. A submit
+    /// that does not fit is refused back to the session, so it is not in flight forever.
+    fn hold(&self, queued: &mut VecDeque<ClientMsg>, msg: ClientMsg) {
+        if matches!(while_down(&msg), WhileDown::Drop) {
+            log::debug!("relay link down; dropping a message the rejoin covers");
+            return;
+        }
+        if let ClientMsg::Lock { scope, .. } | ClientMsg::Unlock { scope, .. } = &msg {
+            let scope = scope.clone();
+            queued.retain(|m| !matches!(m, ClientMsg::Lock { scope: s, .. } | ClientMsg::Unlock { scope: s, .. } if *s == scope));
+        }
+        if queued.len() < MAX_QUEUED {
+            queued.push_back(msg);
+            return;
+        }
+        match msg {
+            ClientMsg::Submit { doc, local, .. } => {
+                let _ = self.in_tx.send(ServerMsg::Error {
+                    doc,
+                    detail: "not connected to the relay for too long; that change was not sent".to_owned(),
+                    local: Some(local),
+                    code: None,
+                });
+            }
+            other => {
+                log::warn!("relay link down too long; dropping the oldest queued message");
+                queued.pop_front();
+                queued.push_back(other);
+            }
+        }
+    }
+
+    /// The link of `conn` is dead: count it as closed.
+    fn dead(&self, conn: &Connection) {
+        if self.shared.current(conn.generation) {
+            self.shared.connected.store(false, Ordering::SeqCst);
+            let _ = self.control.send(Control::Closed(conn.generation));
+        }
+    }
+
     /// Own the socket: send what the hub queues, and replace the socket when it is gone. Ends
-    /// when the hub is dropped, also in the middle of an outage.
+    /// when the hub is dropped, also in the middle of an outage or of an emit.
     async fn run(
         self,
         client: Client,
@@ -211,60 +311,52 @@ impl Link {
         mut control_rx: UnboundedReceiver<Control>,
         mut stopped: oneshot::Receiver<()>,
     ) {
-        let mut client = Some(client);
-        // The token generation the current connection was made with.
-        let mut client_token = 0;
-        let mut queued: std::collections::VecDeque<ClientMsg> = std::collections::VecDeque::new();
+        let mut conn = Some(Connection { client, generation: 0, token: 0, joined: false, acks: false, beat: None, beats: 0 });
+        let mut queued: VecDeque<ClientMsg> = VecDeque::new();
         let mut backoff = Backoff::default();
         let mut refused = false;
         // When the next connection attempt is due, while there is no socket.
         let mut retry: Option<tokio::time::Instant> = None;
         let mut heartbeat = tokio::time::interval(HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
+        'run: loop {
             let due = retry.unwrap_or_else(tokio::time::Instant::now);
+            // When the heartbeat in flight is overdue, on a relay that acknowledges them.
+            let overdue = conn.as_ref().and_then(|c| c.beat).map(|(_, sent)| sent + HEARTBEAT_TIMEOUT);
+            // Biased: a control message was sent before the inbox message the app reacts to,
+            // so handling it first means a `Joined` is seen before anything sent because of it.
             tokio::select! {
+                biased;
                 _ = &mut stopped => break,
-                msg = out_rx.recv() => {
-                    let Some(msg) = msg else { break };
-                    match client.as_ref().filter(|_| self.shared.connected.load(Ordering::SeqCst)) {
-                        Some(socket) => send(socket, &msg).await,
-                        None => match while_down(&msg) {
-                            WhileDown::Drop => log::debug!("relay link down; dropping a message the rejoin covers"),
-                            WhileDown::Queue => {
-                                if queued.len() >= MAX_QUEUED {
-                                    log::warn!("relay link down too long; dropping the oldest queued message");
-                                    queued.pop_front();
-                                }
-                                queued.push_back(msg);
-                            }
-                        },
-                    }
-                }
-                _ = heartbeat.tick(), if client.is_some() && self.shared.connected.load(Ordering::SeqCst) => {
-                    if let Some(socket) = client.as_ref()
-                        && socket.emit(HEARTBEAT_EVENT, serde_json::json!({})).await.is_err()
-                    {
-                        let generation = self.shared.generation.load(Ordering::SeqCst);
-                        self.shared.connected.store(false, Ordering::SeqCst);
-                        let _ = self.control.send(Control::Closed(generation));
-                    }
-                }
                 control = control_rx.recv() => {
                     let Some(control) = control else { break };
                     match control {
-                        Control::Joined(generation) if self.shared.current(generation) => {
+                        Control::Joined(generation, acks) if self.shared.current(generation) => {
                             backoff.reset();
-                            if let Some(socket) = client.as_ref() {
+                            if let Some(c) = conn.as_mut() {
+                                c.joined = true;
+                                c.acks = acks;
                                 while let Some(msg) = queued.pop_front() {
-                                    send(socket, &msg).await;
+                                    match emit_on(&c.client, &msg, &mut stopped).await {
+                                        Emitted::Sent => {}
+                                        Emitted::Dead => {
+                                            self.dead(c);
+                                            break;
+                                        }
+                                        Emitted::Stopped => break 'run,
+                                    }
                                 }
+                            }
+                        }
+                        Control::Alive(generation, n) => {
+                            if let Some(c) = conn.as_mut().filter(|c| c.generation == generation && c.beat.is_some_and(|(b, _)| b == n)) {
+                                c.beat = None;
                             }
                         }
                         Control::Refused(generation) if self.shared.current(generation) => {
                             // Refused for a ticket that has been replaced since: try the new one
                             // as soon as this socket is gone.
-                            if self.shared.token().1 == client_token {
+                            if conn.as_ref().is_some_and(|c| c.token == self.shared.token().1) {
                                 refused = true;
                             } else {
                                 backoff.reset();
@@ -274,35 +366,77 @@ impl Link {
                             if refused {
                                 refused = false;
                                 backoff.reset();
-                                retry = client.is_none().then(tokio::time::Instant::now);
+                                retry = conn.is_none().then(tokio::time::Instant::now);
                             }
                         }
-                        Control::Closed(generation) if self.shared.current(generation) && client.is_some() => {
-                            if let Some(old) = client.take() {
-                                let _ = old.disconnect().await;
+                        Control::Closed(generation) if self.shared.current(generation) && conn.is_some() => {
+                            if let Some(old) = conn.take() {
+                                let _ = tokio::time::timeout(EMIT_TIMEOUT, old.client.disconnect()).await;
                             }
                             retry = (!refused).then(|| tokio::time::Instant::now() + backoff.next());
                         }
-                        Control::Closed(_) | Control::Joined(_) | Control::Refused(_) => {}
+                        Control::Closed(_) | Control::Joined(..) | Control::Refused(_) => {}
                     }
                 }
-                () = tokio::time::sleep_until(due), if retry.is_some() && client.is_none() && !refused => {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    match conn.as_ref().filter(|c| c.joined && self.shared.connected.load(Ordering::SeqCst)) {
+                        Some(c) => match emit_on(&c.client, &msg, &mut stopped).await {
+                            Emitted::Sent => {}
+                            Emitted::Dead => self.dead(c),
+                            Emitted::Stopped => break 'run,
+                        },
+                        None => self.hold(&mut queued, msg),
+                    }
+                }
+                _ = heartbeat.tick(), if conn.as_ref().is_some_and(|c| c.joined) => {
+                    let Some(c) = conn.as_mut() else { continue };
+                    if c.beat.is_some() {
+                        continue;
+                    }
+                    c.beats += 1;
+                    let (n, generation, control) = (c.beats, c.generation, self.control.clone());
+                    let beat = c.client.emit_with_ack(HEARTBEAT_EVENT, serde_json::json!({}), HEARTBEAT_TIMEOUT, move |_, _| {
+                        let _ = control.send(Control::Alive(generation, n));
+                        Box::pin(async {})
+                    });
+                    let sent = tokio::select! {
+                        _ = &mut stopped => break,
+                        sent = tokio::time::timeout(EMIT_TIMEOUT, beat) => matches!(sent, Ok(Ok(()))),
+                    };
+                    if sent {
+                        // Only a relay that acknowledges is waited on; for an older one the
+                        // emit succeeding is all there is to know.
+                        c.beat = c.acks.then(|| (n, tokio::time::Instant::now()));
+                    } else {
+                        self.dead(c);
+                    }
+                }
+                () = tokio::time::sleep_until(overdue.unwrap_or_else(tokio::time::Instant::now)), if overdue.is_some() => {
+                    if let Some(c) = conn.as_mut() {
+                        log::warn!("relay did not acknowledge a heartbeat in {HEARTBEAT_TIMEOUT:?}; the link is dead");
+                        c.beat = None;
+                        self.dead(c);
+                    }
+                }
+                () = tokio::time::sleep_until(due), if retry.is_some() && conn.is_none() && !refused => {
                     retry = None;
                     let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
                     let (auth, token) = self.shared.rejoin();
                     let attempt = tokio::select! {
                         // Dropped while connecting: no join on behalf of a hub that is gone.
                         _ = &mut stopped => break,
-                        attempt = self.builder(generation).auth(auth).connect() => attempt,
+                        attempt = tokio::time::timeout(EMIT_TIMEOUT, self.builder(generation).auth(auth).connect()) => attempt,
                     };
                     match attempt {
-                        Ok(socket) => {
-                            client = Some(socket);
-                            client_token = token;
-                        }
-                        Err(e) => {
+                        Ok(Ok(client)) => conn = Some(Connection { client, generation, token, joined: false, acks: false, beat: None, beats: 0 }),
+                        failed => {
                             let wait = backoff.next();
-                            log::info!("relay reconnect failed, trying again in {wait:?}: {e}");
+                            let why = match failed {
+                                Ok(Err(e)) => e.to_string(),
+                                _ => format!("no answer in {EMIT_TIMEOUT:?}"),
+                            };
+                            log::info!("relay reconnect failed, trying again in {wait:?}: {why}");
                             retry = Some(tokio::time::Instant::now() + wait);
                         }
                     }
@@ -310,18 +444,9 @@ impl Link {
             }
         }
         // The hub is gone. Close the socket rather than leaking it for the process lifetime.
-        if let Some(socket) = client {
-            let _ = socket.disconnect().await;
+        if let Some(c) = conn {
+            let _ = tokio::time::timeout(EMIT_TIMEOUT, c.client.disconnect()).await;
         }
-    }
-}
-
-/// Send one message. A failure is logged and left to the heartbeat and the relay's close,
-/// which are what move the link state.
-async fn send(socket: &Client, msg: &ClientMsg) {
-    let (event, body) = emit(msg);
-    if let Err(e) = socket.emit(event, body).await {
-        log::warn!("relay send failed: {e}");
     }
 }
 

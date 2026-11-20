@@ -39,6 +39,7 @@ mod unit {
             replay_until: None,
             fallback: false,
             text_cap: None,
+            heartbeat: false,
         });
         let mut fx = Vec::new();
         for seq in 4..=100u64 {

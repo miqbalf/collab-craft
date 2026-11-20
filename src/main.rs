@@ -350,6 +350,8 @@ struct JoinedMsg<'a> {
     /// The largest checkpoint snapshot, in wire bytes, this relay retains for a joiner, so a
     /// saver can refuse a larger one itself rather than have the transport drop it.
     text_cap: usize,
+    /// This relay acknowledges the `alive` heartbeat (see `on_alive`).
+    heartbeat: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -660,6 +662,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     socket.on("frame", on_frame);
     socket.on("ephemeral", on_ephemeral);
     socket.on("saved", on_saved);
+    socket.on("alive", on_alive);
     socket.on_disconnect(on_disconnect);
     // The socket joins the broadcast room only below, under the rooms lock, once its replay
     // is fixed. Joined earlier, a live op broadcast during the bus calls in between reached it
@@ -779,6 +782,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             replay_until: replay.last().map_or(seq, |op| op.seq),
             fallback: !texts.is_empty(),
             text_cap: relay.text_cap,
+            heartbeat: true,
         },
     );
 
@@ -1203,6 +1207,13 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
 /// two cases apart afterwards. [`Room::checkpoint`] additionally caps the claimed
 /// sequence at the room's own, so a save cannot move the join baseline ahead of
 /// edits the room has actually ordered.
+/// The client's heartbeat. Acknowledged with nothing and not logged: it exists so a client
+/// can tell a live link from a half-open one (laptop sleep, a Wi-Fi roam, a NAT that dropped
+/// the mapping), where its sends succeed into a socket nothing reads.
+async fn on_alive(ack: socketioxide::extract::AckSender) {
+    let _ = ack.send(&());
+}
+
 async fn on_saved(socket: SocketRef, Data(msg): Data<SavedMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
     let doc = claims.room();

@@ -151,6 +151,10 @@ pub enum ServerMsg {
         /// Absent from an older relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text_cap: Option<u64>,
+        /// The relay acknowledges the `alive` heartbeat, so a missing acknowledgement means a
+        /// dead link. Absent (false) from an older relay, which has no handler for it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        heartbeat: bool,
     },
     /// CRDT operations a joining peer missed, outside the sequence.
     ///

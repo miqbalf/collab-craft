@@ -581,6 +581,7 @@ fn joined(peer: &str, space: u32) -> ServerMsg {
         replay_until: None,
         fallback: false,
         text_cap: None,
+        heartbeat: false,
     }
 }
 
@@ -781,6 +782,7 @@ fn joined_at(peer: &str, space: u32, seq: u64, replay_until: Option<u64>) -> Ser
         replay_until,
         fallback: false,
         text_cap: None,
+        heartbeat: false,
     }
 }
 
@@ -996,6 +998,7 @@ fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
         replay_until: Some(seq),
         fallback: true,
         text_cap: None,
+        heartbeat: false,
     }
 }
 

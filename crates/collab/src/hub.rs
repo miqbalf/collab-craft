@@ -215,11 +215,11 @@ pub(crate) enum WhileDown {
     /// [`crate::Live`] after the rejoin, merged; a checkpoint snapshot and its save report
     /// are reported as raced on the rejoin, and must not reach the relay after that, or the
     /// baseline would move for a save the saver was told did not happen; presence is resent
-    /// by the app with its newest value.
+    /// by the app with its newest value; a resync request is moot, because the rejoin replays.
     Drop,
     /// Sent once the link is back: queued by the native hub until the relay has joined the
-    /// connection again, buffered by socket.io-client in a browser (lock commands, other
-    /// submits, resync requests).
+    /// connection again (lock commands coalesced per scope, other submits), buffered by
+    /// socket.io-client in a browser.
     Queue,
 }
 
@@ -227,7 +227,7 @@ pub(crate) enum WhileDown {
 pub(crate) fn while_down(msg: &ClientMsg) -> WhileDown {
     match msg {
         ClientMsg::Submit { command, .. } if crate::proto::is_crdt_command(command) => WhileDown::Drop,
-        ClientMsg::Saved { .. } | ClientMsg::Ephemeral { .. } | ClientMsg::Frame { .. } => WhileDown::Drop,
+        ClientMsg::Saved { .. } | ClientMsg::Ephemeral { .. } | ClientMsg::Frame { .. } | ClientMsg::Resync { .. } => WhileDown::Drop,
         _ => WhileDown::Queue,
     }
 }

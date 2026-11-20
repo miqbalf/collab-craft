@@ -51,6 +51,7 @@ fn joined(doc: &str, me: &str, seq: u64) -> craft_collab::ServerMsg {
         replay_until: None,
         fallback: false,
         text_cap: None,
+        heartbeat: false,
     }
 }
 

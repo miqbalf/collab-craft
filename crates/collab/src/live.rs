@@ -288,13 +288,8 @@ pub struct Live<H> {
     text_more: bool,
     /// This catch-up already told the app its text is incomplete. Told once, not per piece.
     told_incomplete: bool,
-    /// The submit counters of recent checkpoint snapshots, so a late refusal of one is not
-    /// mistaken for a refused edit.
-    snap_locals: Vec<u64>,
-    /// The submit counter of the newest edit sent. A refusal naming a counter past it is not
-    /// for an edit of this replica.
-    last_edit: Option<u64>,
-    /// Local updates sent and not yet confirmed, by submit counter. Sent again on a rejoin.
+    /// Local updates sent and not yet confirmed, by submit counter. Sent again on a rejoin, and
+    /// what tells a refused edit (broken replica) from any other refused submit.
     unconfirmed: std::collections::BTreeMap<u64, Vec<u8>>,
     /// The bytes in [`Live::unconfirmed`], bounded by [`MAX_UNCONFIRMED_BYTES`].
     unconfirmed_bytes: usize,
@@ -333,8 +328,6 @@ impl<H: Hub> Live<H> {
             text_cap: None,
             text_more: false,
             told_incomplete: false,
-            snap_locals: Vec::new(),
-            last_edit: None,
             unconfirmed: std::collections::BTreeMap::new(),
             unconfirmed_bytes: 0,
             notices: Vec::new(),
@@ -492,10 +485,6 @@ impl<H: Hub> Live<H> {
         let ClientMsg::Submit { local, .. } = &msg else {
             return Err(Error::malformed("client", "a checkpoint must be a submit"));
         };
-        self.snap_locals.push(*local);
-        if self.snap_locals.len() > 16 {
-            self.snap_locals.remove(0);
-        }
         self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms() });
         self.hub.send(msg)?;
         Ok(state)
@@ -702,7 +691,6 @@ impl<H: Hub> Live<H> {
         }
         let msg: ClientMsg = self.wire.submit_crdt(CRDT_TEXT, params);
         if let ClientMsg::Submit { local, .. } = &msg {
-            self.last_edit = self.last_edit.max(Some(*local));
             self.unconfirmed.insert(*local, update.to_vec());
             self.unconfirmed_bytes += update.len();
         }
@@ -745,16 +733,35 @@ impl<H: Hub> Live<H> {
     /// [`Live::over_cap`] measures a submit. An update that does not fit merged with anything
     /// goes as it was: it was sent once, so it fits alone.
     fn chunked(&self, updates: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+        // The params a submit of `bytes` of update would serialize to, about: base64, the
+        // quotes, and the scope around it. Merged updates are no larger than the parts summed.
+        let estimate = |bytes: usize| bytes.div_ceil(3) * 4 + 32;
         let fits = |update: &[u8]| serde_json::to_value(TextPayload::new(update)).map(|params| self.over_cap(&params).is_none()).unwrap_or(false);
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let cap = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        // Each chunk, with the summed size of the updates in it.
+        let mut chunks: Vec<(Vec<u8>, usize)> = Vec::new();
         for update in updates {
-            let grown = chunks.last().and_then(|last| yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok()).filter(|merged| fits(merged));
+            let grown = chunks.last().and_then(|(last, summed)| {
+                let summed = summed + update.len();
+                // Only near the cap is the exact measure worth its serialization.
+                let (sure, maybe) = match cap {
+                    None => (true, true),
+                    Some(cap) => (estimate(summed) <= cap / 10 * 9, estimate(summed) <= cap / 10 * 11),
+                };
+                if !maybe {
+                    return None;
+                }
+                yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok().filter(|merged| sure || fits(merged)).map(|merged| (merged, summed))
+            });
             match (grown, chunks.last_mut()) {
                 (Some(merged), Some(last)) => *last = merged,
-                _ => chunks.push(update),
+                _ => {
+                    let size = update.len();
+                    chunks.push((update, size));
+                }
             }
         }
-        chunks
+        chunks.into_iter().map(|(chunk, _)| chunk).collect()
     }
 
     /// Merge a batch of wire updates, or hold them until the document is loaded.
@@ -1048,7 +1055,7 @@ impl<H: Hub> Live<H> {
                 // checkpoint's own only while that has not been ordered.
                 if self.checkpoint.as_ref().is_some_and(|p| p.local == local && p.ordered.is_none()) {
                     self.refuse_checkpoint(work, &detail);
-                } else if self.last_edit.is_some_and(|last| local <= last) && !self.snap_locals.contains(&local) && !self.broken {
+                } else if self.unconfirmed.contains_key(&local) && !self.broken {
                     // An edit. It already landed in this replica and the room will never order
                     // it, so the two have parted for good.
                     self.lose_checkpoint(work, "an edit was refused");
@@ -1138,6 +1145,7 @@ mod tests {
             replay_until: None,
             fallback: false,
             text_cap: None,
+            heartbeat: false,
         });
         live.pump();
         live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();

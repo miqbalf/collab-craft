@@ -127,6 +127,73 @@ async fn proxy(to: SocketAddr, down_for: Duration) -> Proxy {
     Proxy { url: format!("http://{addr}"), cut, accepted }
 }
 
+/// A TCP forwarder that, once `hole` is notified, stops forwarding on the connections it has
+/// without closing them, as a sleeping laptop or a NAT that dropped the mapping looks to both
+/// ends. Connections made after that are forwarded normally.
+async fn black_hole(to: SocketAddr) -> (String, Arc<Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hole = Arc::new(Notify::new());
+    let generation = Arc::new(AtomicU64::new(0));
+    let (on_hole, bump) = (hole.clone(), generation.clone());
+    tokio::spawn(async move {
+        loop {
+            on_hole.notified().await;
+            bump.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let born = generation.load(Ordering::SeqCst);
+            let generation = generation.clone();
+            tokio::spawn(async move {
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await else { return };
+                {
+                    let copy = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+                    tokio::pin!(copy);
+                    loop {
+                        tokio::select! {
+                            _ = &mut copy => return,
+                            () = tokio::time::sleep(Duration::from_millis(20)) => {
+                                if generation.load(Ordering::SeqCst) != born {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Held open, and nothing goes through.
+                let _held = (inbound, outbound);
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), hole)
+}
+
+/// A half-open link: sends succeed into a socket nothing reads. The missing heartbeat
+/// acknowledgement takes `connected()` false, the hub reconnects, and edits converge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_half_open_link_is_noticed_and_reconnects() {
+    let Some(h) = start().await else { return };
+    let (url, hole) = black_hole(relay_addr(&h)).await;
+    let room = unique_room("half-open");
+    let doc = format!("doc:{room}");
+    let mut a = LivePeer::open(&url, &ticket(&room, "alice", now()), &doc, "hello").await;
+    let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
+
+    hole.notify_one();
+    let went = tokio::time::Instant::now();
+    a.insert(5, "!");
+    assert!(a.until(Duration::from_secs(20), |live, _| !live.hub().connected()).await, "the half-open link was never noticed");
+    assert!(went.elapsed() <= Duration::from_secs(17), "noticed only after {:?}", went.elapsed());
+    assert!(link_is(&mut a, true).await, "alice never came back");
+    b.insert(0, ">");
+    assert!(b.until(Duration::from_secs(10), |live, _| shows(live, ">hello!")).await, "bob has {:?}", b.text());
+    assert!(a.until(Duration::from_secs(10), |live, _| shows(live, ">hello!")).await, "alice has {:?}", a.text());
+}
+
 fn relay_addr(h: &Harness) -> SocketAddr {
     h.url.trim_start_matches("http://").parse().unwrap()
 }
@@ -144,7 +211,8 @@ async fn e2e_a_dropped_link_reconnects_and_the_outage_edit_lands_once() {
     let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
     let before = seq_of(&h, &room).await;
     // Nothing but the relay may be reached on a reconnect (an older build sent its internal
-    // attempt, ticket included, to 127.0.0.1:1). The port needs root to bind; skipped without.
+    // attempt, ticket included, to 127.0.0.1:1). Binding port 1 needs root on Linux (not on
+    // macOS or Windows, which is what made the decoy a leak); skipped when it cannot be bound.
     let decoy = tokio::net::TcpListener::bind("127.0.0.1:1").await.ok();
 
     p.cut.notify_one();
@@ -207,7 +275,7 @@ async fn e2e_a_refused_ticket_stops_reconnecting_until_a_new_one() {
     let from = a.work.len();
     p.cut.notify_one();
     assert!(
-        a.until(Duration::from_secs(10), |_, work| work[from..]
+        a.until(Duration::from_secs(20), |_, work| work[from..]
             .iter()
             .any(|w| matches!(w, Work::ConnectionRefused { code, .. } if code == craft_collab::REFUSED_AUTH)))
             .await,
