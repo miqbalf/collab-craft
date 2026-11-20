@@ -97,6 +97,29 @@ impl WebHub {
             handlers.push(handler);
         }
 
+        // A reconnect joins without `applied`: what this connection applied may be mid
+        // catch-up, so the relay joins it at the saved sequence instead. socket.io-client
+        // sends the same `auth` object on every attempt, so it is cleared once the first
+        // connection is up.
+        let first = auth.clone();
+        let cleared = Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
+            let _ = Reflect::set(&first, &JsValue::from_str("applied"), &JsValue::NULL);
+        });
+        on.call2(&socket, &JsValue::from_str("connect"), cleared.as_ref()).map_err(js)?;
+        handlers.push(cleared);
+        // socket.io-client reconnects a dropped link on its own, but not one the server closed
+        // (a relay restart, or a join it had to cut). That one is reconnected here.
+        let reopen = socket.clone();
+        let reopened = Closure::<dyn FnMut(JsValue)>::new(move |reason: JsValue| {
+            if reason.as_string().as_deref() == Some("io server disconnect")
+                && let Some(connect) = function(&reopen, "connect")
+            {
+                let _ = connect.call0(&reopen);
+            }
+        });
+        on.call2(&socket, &JsValue::from_str("disconnect"), reopened.as_ref()).map_err(js)?;
+        handlers.push(reopened);
+
         Ok(WebHub { socket, inbox, _handlers: handlers })
     }
 }

@@ -107,6 +107,7 @@ mod e2e {
     struct Harness {
         relay: Arc<Relay>,
         url: String,
+        io: SocketIo,
     }
 
     async fn start() -> Option<Harness> {
@@ -136,13 +137,14 @@ mod e2e {
         });
         let (layer, io) = crate::sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
+        let handle = io.clone();
         let app = axum::Router::new().layer(layer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Some(Harness { relay, url: format!("http://{addr}{base}") })
+        Some(Harness { relay, url: format!("http://{addr}{base}"), io: handle })
     }
 
     fn now() -> i64 {
@@ -542,5 +544,115 @@ mod e2e {
         let r = room_state.get(&room).expect("the room");
         assert_eq!(r.saved_seq(), 0);
         assert!(r.texts().values().all(|l| !l.starts_with_snapshot() && l.ops().len() == 1), "no snapshot was retained");
+    }
+
+    /// Wait until `peer`'s hub says `up`.
+    async fn link_is(peer: &mut LivePeer, up: bool) -> bool {
+        peer.until(Duration::from_secs(15), |live, _| craft_collab::Hub::connected(live.hub()) == up).await
+    }
+
+    /// Forward TCP from a local port to `to`, until `cut` is notified: then every forwarded
+    /// connection is dropped, as a network drop or a relay restart would, new ones are refused
+    /// for a second and a half (the relay "restarting"), and then forwarded again.
+    async fn cuttable_proxy(to: std::net::SocketAddr, cut: Arc<tokio::sync::Notify>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (bump, going_down) = (generation.clone(), down.clone());
+        tokio::spawn(async move {
+            loop {
+                cut.notified().await;
+                going_down.store(true, std::sync::atomic::Ordering::SeqCst);
+                bump.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                going_down.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if down.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let born = generation.load(std::sync::atomic::Ordering::SeqCst);
+                let generation = generation.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await else { return };
+                    let copy = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+                    tokio::pin!(copy);
+                    loop {
+                        tokio::select! {
+                            _ = &mut copy => return,
+                            () = tokio::time::sleep(Duration::from_millis(20)) => {
+                                if generation.load(std::sync::atomic::Ordering::SeqCst) != born {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The native hub follows its own reconnect: `connected()` goes false when the relay
+    /// closes the socket, true once it is back, and edits made while it was down reach the
+    /// other editor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_hub_closed_by_the_relay_reconnects_and_converges() {
+        let Some(h) = start().await else { return };
+        let room = unique_room("server-close");
+        let doc = format!("doc:{room}");
+        let ta = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let tb = token::sign_at(SECRET, &room, "bob", "bob", true, "bob", now()).unwrap();
+        let mut a = LivePeer::open(&h.url, &ta, &doc, "hello").await;
+        let mut b = LivePeer::open(&h.url, &tb, &doc, "hello").await;
+        a.insert(5, "!");
+        assert!(b.until(Duration::from_secs(5), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == "hello!")).await);
+
+        let sockets = h.io.sockets().len();
+        h.io.disconnect().await.expect("the relay closes every socket");
+        a.insert(0, ">");
+        // The relay accepts the reconnect at once, so the hub's down window is too short to
+        // poll for; the dropped-link test below covers false-then-true. Here: both are back.
+        let back = tokio::time::Instant::now() + Duration::from_secs(15);
+        while h.io.sockets().len() < sockets && tokio::time::Instant::now() < back {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(h.io.sockets().len(), sockets, "both hubs reconnected");
+        assert!(link_is(&mut a, true).await, "alice never came back");
+        assert!(link_is(&mut b, true).await, "bob never came back");
+        b.insert(6, "?");
+        let converged = |p: &LivePeer| p.text() == ">hello?!" || p.text() == ">hello!?";
+        a.until(Duration::from_secs(10), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text.len() == 8)).await;
+        b.until(Duration::from_secs(10), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text.len() == 8)).await;
+        assert!(converged(&a) && a.text() == b.text(), "alice {:?}, bob {:?}", a.text(), b.text());
+    }
+
+    /// The same through a dropped link, as a relay restart looks to a client: the connection
+    /// dies without a close, the hub reconnects, and edits made while it was down converge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_dropped_link_reconnects_and_converges() {
+        let Some(h) = start().await else { return };
+        let relay: std::net::SocketAddr = h.url.trim_start_matches("http://").parse().unwrap();
+        let cut = Arc::new(tokio::sync::Notify::new());
+        let url = format!("http://{}", cuttable_proxy(relay, cut.clone()).await);
+        let room = unique_room("link-drop");
+        let doc = format!("doc:{room}");
+        let ta = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let tb = token::sign_at(SECRET, &room, "bob", "bob", true, "bob", now()).unwrap();
+        let mut a = LivePeer::open(&url, &ta, &doc, "hello").await;
+        let mut b = LivePeer::open(&h.url, &tb, &doc, "hello").await;
+
+        cut.notify_one();
+        assert!(link_is(&mut a, false).await, "alice never saw the link drop");
+        a.insert(5, "!");
+        assert!(link_is(&mut a, true).await, "alice never came back");
+        let done = |live: &craft_collab::Live<NativeHub>| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == "hello!");
+        assert!(b.until(Duration::from_secs(10), |live, _| done(live)).await, "bob has {:?}", b.text());
+        assert!(a.until(Duration::from_secs(5), |live, _| done(live)).await, "alice has {:?}", a.text());
     }
 }

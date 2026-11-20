@@ -27,7 +27,7 @@ rust_socketio = { version = "0.6", features = ["async"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["sync", "rt"], optional = true }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"], optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 # The shared document. Yjs-compatible, so a browser peer can speak the same updates later.
 # `sync` keeps the document `Send`, as the text replica it replaces was, so an app can own

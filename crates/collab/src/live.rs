@@ -286,6 +286,8 @@ pub struct Live<H> {
     /// The submit counter of the newest edit sent. A refusal naming a counter past it is not
     /// for an edit of this replica.
     last_edit: Option<u64>,
+    /// Local updates sent and not yet confirmed, by submit counter. Sent again on a rejoin.
+    unconfirmed: std::collections::BTreeMap<u64, Vec<u8>>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -323,6 +325,7 @@ impl<H: Hub> Live<H> {
             told_incomplete: false,
             snap_locals: Vec::new(),
             last_edit: None,
+            unconfirmed: std::collections::BTreeMap::new(),
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -594,6 +597,7 @@ impl<H: Hub> Live<H> {
         log::warn!("collab: {why}");
         self.broken = true;
         self.snapshot = None;
+        self.unconfirmed.clear();
         self.held.clear();
         self.notices.push("the shared document could not be restored; reopen the file".to_owned());
     }
@@ -618,6 +622,9 @@ impl<H: Hub> Live<H> {
         // whole catch-up again from its first piece.
         self.text_more = false;
         self.told_incomplete = false;
+        if self.joined_once {
+            self.resend_unconfirmed();
+        }
         self.joined_once = true;
         self.lose_checkpoint(work, "the link rejoined");
     }
@@ -680,8 +687,30 @@ impl<H: Hub> Live<H> {
         let msg: ClientMsg = self.wire.submit_crdt(CRDT_TEXT, params);
         if let ClientMsg::Submit { local, .. } = &msg {
             self.last_edit = self.last_edit.max(Some(*local));
+            self.unconfirmed.insert(*local, update.to_vec());
         }
         self.hub.send(msg)
+    }
+
+    /// Send again every local update the relay has not confirmed, after a rejoin.
+    ///
+    /// A link that drops can take submits with it: sent into a socket that was already dying,
+    /// or refused at a hub that was reconnecting. They are in this replica and maybe never in
+    /// the room. Sending them again is safe either way: an update the room already has merges
+    /// as a no-op.
+    fn resend_unconfirmed(&mut self) {
+        if self.broken || self.doc.is_none() {
+            return;
+        }
+        let updates = std::mem::take(&mut self.unconfirmed);
+        if !updates.is_empty() {
+            log::info!("collab: sending {} unconfirmed edits again after the rejoin", updates.len());
+        }
+        for update in updates.into_values() {
+            if let Err(e) = self.send_update(&update) {
+                log::warn!("collab: an unconfirmed edit could not be sent again: {e}");
+            }
+        }
     }
 
     /// Merge a batch of wire updates, or hold them until the document is loaded.
@@ -936,6 +965,7 @@ impl<H: Hub> Live<H> {
             Effect::Frame { origin, payload } => work.push(Work::Frame { origin, payload }),
             Effect::Ephemeral { origin, kind, payload } => work.push(Work::Ephemeral { origin, kind, payload }),
             Effect::Confirmed { local, seq } => {
+                self.unconfirmed.remove(&local);
                 self.first_of_catchup(seq);
                 self.confirmed(local, seq, work);
             }
