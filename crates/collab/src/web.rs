@@ -25,12 +25,25 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::error::{Error, Result};
-use crate::hub::{EVENTS, Endpoint, Hub, emit, receive};
+use crate::hub::{Backoff, EVENTS, Endpoint, Hub, emit, receive};
+
+/// Reconnect state the socket's handlers share with the hub.
+#[derive(Default)]
+struct Link {
+    backoff: Backoff,
+    /// The relay refused the connection itself; nothing reconnects until a new token.
+    refused: bool,
+    /// A reconnect is scheduled on a timer.
+    scheduled: bool,
+}
 use crate::proto::{ClientMsg, ServerMsg};
 
 /// A connection to the relay from a browser.
 pub struct WebHub {
     socket: JsValue,
+    /// The handshake auth socket.io-client sends on every attempt; [`Hub::set_token`] edits it.
+    auth: Object,
+    link: Rc<RefCell<Link>>,
     inbox: Rc<RefCell<VecDeque<ServerMsg>>>,
     /// The handlers, kept alive while the socket can still call them. Dropping a [`Closure`]
     /// invalidates the function JavaScript is holding, and the next event would then tear the
@@ -86,10 +99,17 @@ impl WebHub {
         let mut handlers = Vec::with_capacity(EVENTS.len());
         // "error" is in the set because the relay reports its own refusals that way, and an app
         // has to show them rather than have them swallowed into a log.
+        let link = Rc::new(RefCell::new(Link::default()));
         for event in EVENTS {
             let queue = Rc::clone(&inbox);
+            let state = Rc::clone(&link);
             let handler = Closure::<dyn FnMut(JsValue)>::new(move |payload: JsValue| {
                 if let Some(msg) = read(event, &payload) {
+                    if matches!(msg, ServerMsg::Joined { .. }) {
+                        state.borrow_mut().backoff.reset();
+                    } else if msg.refuses_connection().is_some() {
+                        state.borrow_mut().refused = true;
+                    }
                     queue.borrow_mut().push_back(msg);
                 }
             });
@@ -108,19 +128,38 @@ impl WebHub {
         on.call2(&socket, &JsValue::from_str("connect"), cleared.as_ref()).map_err(js)?;
         handlers.push(cleared);
         // socket.io-client reconnects a dropped link on its own, but not one the server closed
-        // (a relay restart, or a join it had to cut). That one is reconnected here.
+        // (a relay restart, or a join it had to cut). That one is reconnected here, after a
+        // backoff kept across attempts, and not at all once the relay refused the connection
+        // itself: the same ticket would be refused again.
         let reopen = socket.clone();
+        let state = Rc::clone(&link);
         let reopened = Closure::<dyn FnMut(JsValue)>::new(move |reason: JsValue| {
-            if reason.as_string().as_deref() == Some("io server disconnect")
-                && let Some(connect) = function(&reopen, "connect")
-            {
-                let _ = connect.call0(&reopen);
+            if reason.as_string().as_deref() != Some("io server disconnect") {
+                return;
+            }
+            let wait = {
+                let mut link = state.borrow_mut();
+                if link.refused || link.scheduled {
+                    return;
+                }
+                link.scheduled = true;
+                link.backoff.next()
+            };
+            let (socket, state) = (reopen.clone(), Rc::clone(&state));
+            let later = Closure::once_into_js(move || {
+                state.borrow_mut().scheduled = false;
+                if !state.borrow().refused {
+                    connect_now(&socket);
+                }
+            });
+            if let Some(timer) = function(js_sys::global().as_ref(), "setTimeout") {
+                let _ = timer.call2(js_sys::global().as_ref(), &later, &JsValue::from_f64(wait.as_millis() as f64));
             }
         });
         on.call2(&socket, &JsValue::from_str("disconnect"), reopened.as_ref()).map_err(js)?;
         handlers.push(reopened);
 
-        Ok(WebHub { socket, inbox, _handlers: handlers })
+        Ok(WebHub { socket, auth, link, inbox, _handlers: handlers })
     }
 }
 
@@ -143,6 +182,21 @@ impl Hub for WebHub {
         // Read off the socket each time rather than tracked here. Socket.IO reconnects on its
         // own, and a flag of ours would have to be told about every one of those.
         Reflect::get(&self.socket, &JsValue::from_str("connected")).ok().and_then(|value| value.as_bool()).unwrap_or(false)
+    }
+
+    fn set_token(&mut self, token: String) {
+        let _ = Reflect::set(&self.auth, &JsValue::from_str("token"), &JsValue::from_str(&token));
+        let restart = {
+            let mut link = self.link.borrow_mut();
+            let restart = std::mem::take(&mut link.refused);
+            if restart {
+                link.backoff.reset();
+            }
+            restart
+        };
+        if restart {
+            connect_now(&self.socket);
+        }
     }
 }
 
@@ -183,6 +237,13 @@ fn to_js(value: &serde_json::Value) -> Result<JsValue> {
     }
     let text = serde_json::to_string(value).map_err(|e| Error::malformed("client", e.to_string()))?;
     JSON::parse(&text).map_err(js)
+}
+
+/// Ask socket.io-client to connect the socket again.
+fn connect_now(socket: &JsValue) {
+    if let Some(connect) = function(socket, "connect") {
+        let _ = connect.call0(socket);
+    }
 }
 
 /// One function off an object, by name.

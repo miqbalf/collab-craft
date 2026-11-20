@@ -1000,7 +1000,7 @@ fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
 }
 
 fn submit_refused(local: u64, detail: &str) -> ServerMsg {
-    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: Some(local) }
+    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: Some(local), code: None }
 }
 
 fn saved_ack(seq: u64) -> ServerMsg {
@@ -1008,7 +1008,7 @@ fn saved_ack(seq: u64) -> ServerMsg {
 }
 
 fn relay_error(detail: &str) -> ServerMsg {
-    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: None }
+    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: None, code: None }
 }
 
 /// 1b: a checkpoint needs a ready replica and waits for the join's catch-up, ordered or not,
@@ -1480,26 +1480,57 @@ fn a_refused_edit_breaks_the_replica_and_says_so() {
 
 // ---- reconnect ---------------------------------------------------------------------------
 
-/// A rejoin sends again every edit the relay never confirmed: a link that drops can take
-/// submits with it. A confirmed edit is not sent again.
+/// A rejoin sends again, as one merged update, every edit the relay never confirmed: a link
+/// that drops can take submits with it. A confirmed edit is not sent again.
 #[test]
-fn a_rejoin_sends_the_unconfirmed_edits_again() {
+fn a_rejoin_sends_the_unconfirmed_edits_again_merged() {
     let hub = FakeHub::default();
     let mut live = Live::new(hub.clone(), "d");
     live.seed(&sample()).unwrap();
     hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
     live.pump();
-    live.edit(|d| d.insert_text(1, 0, "kept", &Map::new())).unwrap();
+    live.edit(|d| d.insert_text(1, 0, "kept ", &Map::new())).unwrap();
     let (confirmed_local, confirmed) = last_submit(&hub);
-    live.edit(|d| d.insert_text(1, 0, "lost", &Map::new())).unwrap();
-    let (_, lost) = last_submit(&hub);
+    live.edit(|d| d.insert_text(1, 0, "lost ", &Map::new())).unwrap();
+    live.edit(|d| d.insert_text(1, 0, "also ", &Map::new())).unwrap();
+    hub.0.borrow_mut().sent.clear();
     hub.0.borrow_mut().inbox.push(op(1, "alice", Some(confirmed_local), confirmed.clone()));
     live.pump();
-    assert!(hub.0.borrow().sent.is_empty());
 
     hub.0.borrow_mut().inbox.push(joined_at("alice", 4, 1, Some(1)));
     live.pump();
-    let (_, again) = last_submit(&hub);
-    assert_eq!(again["ops"], lost["ops"], "the unconfirmed edit went out again");
-    assert!(hub.0.borrow().sent.iter().all(|m| !matches!(m, ClientMsg::Submit { .. })), "and only that one");
+    let submits: Vec<Value> = hub
+        .0
+        .borrow()
+        .sent
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::Submit { params, .. } => Some(params.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(submits.len(), 1, "one merged resend: {submits:?}");
+    // A replica that has only the confirmed edit gets the rest from the resend alone.
+    let mut other = replica(&sample(), 7);
+    for up in bytes_of(&confirmed).into_iter().chain(bytes_of(&submits[0])) {
+        other.apply(&up).unwrap();
+    }
+    assert_eq!(other.block(1).unwrap().text, live.doc().unwrap().block(1).unwrap().text);
+}
+
+/// The relay refusing the connection itself reaches the app as a typed event.
+#[test]
+fn a_refused_connection_is_a_typed_event() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    hub.0.borrow_mut().inbox.push(ServerMsg::Error {
+        doc: String::new(),
+        detail: "token rejected".to_owned(),
+        local: None,
+        code: Some(craft_collab::REFUSED_AUTH.to_owned()),
+    });
+    let work = live.pump();
+    assert!(matches!(work.as_slice(), [Work::ConnectionRefused { code, .. }] if code == craft_collab::REFUSED_AUTH), "{work:?}");
+    hub.0.borrow_mut().inbox.push(ServerMsg::Error { doc: String::new(), detail: "busy".to_owned(), local: None, code: None });
+    assert!(live.pump().is_empty(), "an ordinary error is not one");
 }

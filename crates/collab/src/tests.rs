@@ -363,7 +363,7 @@ fn presence_updates_the_roster() {
 #[test]
 fn an_error_is_advisory_and_does_not_disturb_ordering() {
     let mut s = session();
-    let out = s.handle(ServerMsg::Error { doc: DOC.to_owned(), detail: "scope busy".to_owned(), local: None });
+    let out = s.handle(ServerMsg::Error { doc: DOC.to_owned(), detail: "scope busy".to_owned(), local: None, code: None });
     assert_eq!(out, vec![Effect::Notice { detail: "scope busy".to_owned() }]);
     assert_eq!(s.applied(), 0);
     assert_eq!(s.handle(op(1, "bob", None, "A1")).len(), 1, "ordering continues after a notice");
@@ -405,7 +405,7 @@ fn server_messages_round_trip() {
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::Presence { doc: DOC.to_owned(), roster: Vec::new() },
         ServerMsg::Snapshot { doc: DOC.to_owned(), seq: 9, document: json!({}) },
-        ServerMsg::Error { doc: DOC.to_owned(), detail: "x".to_owned(), local: None },
+        ServerMsg::Error { doc: DOC.to_owned(), detail: "x".to_owned(), local: None, code: None },
     ];
     for m in msgs {
         let text = serde_json::to_string(&m).expect("encodes");
@@ -506,7 +506,7 @@ fn every_event_name_carries_exactly_one_server_message() {
         ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true, snap: false, more: false },
         ServerMsg::Frame { doc: DOC.to_owned(), origin: "bob".to_owned(), payload: "c2lnbmVk".to_owned() },
         ServerMsg::Ephemeral { doc: DOC.to_owned(), origin: "bob".to_owned(), kind: "camera".to_owned(), payload: json!({"eye": [0, 0, 1]}) },
-        ServerMsg::Error { doc: DOC.to_owned(), detail: "refused".to_owned(), local: Some(3) },
+        ServerMsg::Error { doc: DOC.to_owned(), detail: "refused".to_owned(), local: Some(3), code: None },
         ServerMsg::SavedAck { doc: DOC.to_owned(), seq: 4 },
         ServerMsg::SavedRefused { doc: DOC.to_owned(), seq: 4, reason: "no checkpoint follows".to_owned() },
     ];

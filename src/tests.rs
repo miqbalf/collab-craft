@@ -1861,6 +1861,17 @@ mod relay_proto {
         assert_eq!(r.checkpoint(1), Ok(()), "the snapshot at 2 is still there");
     }
 
+    /// The relay's connection refusal codes are the ones the client stops reconnecting on.
+    #[test]
+    fn the_refusal_codes_match_the_client() {
+        let msg = |code| serde_json::to_value(crate::RefusedMsg { doc: String::new(), detail: "x".to_owned(), code }).expect("encodes");
+        for (code, client) in [("auth", craft_collab::REFUSED_AUTH), ("proto", craft_collab::REFUSED_PROTO)] {
+            assert_eq!(code, client);
+            let read = craft_collab::receive("error", msg(code)).expect("the client reads it");
+            assert_eq!(read.refuses_connection(), Some(client));
+        }
+    }
+
     /// The client hubs name the version this relay checks for.
     #[test]
     fn the_client_speaks_this_relays_protocol() {

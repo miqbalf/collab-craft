@@ -42,6 +42,13 @@ pub const CRDT_TEXT: &str = "crdt.text";
 /// other value, so a mismatched client fails loudly instead of misreading the relay.
 pub const PROTO: &str = "craft-live/1";
 
+/// [`ServerMsg::Error`] `code`: the token was rejected (bad, or expired). Connect again only
+/// with a new one ([`crate::Hub::set_token`]).
+pub const REFUSED_AUTH: &str = "auth";
+
+/// [`ServerMsg::Error`] `code`: this client speaks another protocol version than the relay.
+pub const REFUSED_PROTO: &str = "proto";
+
 /// Insert or move a sibling by fractional key. Payload is a position change.
 pub const CRDT_POS: &str = "crdt.pos";
 
@@ -255,6 +262,11 @@ pub enum ServerMsg {
         /// an older relay and on errors that are not about a submit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local: Option<u64>,
+        /// Set when the relay refused the connection itself and is closing it:
+        /// [`REFUSED_AUTH`] or [`REFUSED_PROTO`]. Reconnecting with the same auth cannot help.
+        /// Absent from an older relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     /// The relay took a [`ClientMsg::Saved`] through `seq`: the join baseline is `seq` now,
     /// so the file this save reflects may be written.
@@ -289,6 +301,14 @@ impl ServerMsg {
             | ServerMsg::Error { doc, .. }
             | ServerMsg::SavedAck { doc, .. }
             | ServerMsg::SavedRefused { doc, .. } => doc,
+        }
+    }
+
+    /// The code of a refusal of the connection itself, when this is one.
+    pub fn refuses_connection(&self) -> Option<&str> {
+        match self {
+            ServerMsg::Error { code: Some(code), local: None, .. } => Some(code),
+            _ => None,
         }
     }
 }

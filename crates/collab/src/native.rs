@@ -14,25 +14,66 @@
 //! functions the browser hub calls, so the two peers cannot drift apart over
 //! an event name.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rust_socketio::asynchronous::{Client, ClientBuilder, ReconnectSettings};
 use rust_socketio::{Event, Payload};
-use std::time::Duration;
-
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
-use crate::hub::{EVENTS, Endpoint, Hub, emit, receive};
+use crate::hub::{Backoff, EVENTS, Endpoint, Hub, emit, receive};
 use crate::proto::{ClientMsg, ServerMsg};
 
 /// A connection to the relay from a native app.
 pub struct NativeHub {
     outbox: UnboundedSender<ClientMsg>,
     inbox: UnboundedReceiver<ServerMsg>,
-    connected: Arc<AtomicBool>,
+    control: UnboundedSender<Control>,
+    shared: Arc<Shared>,
+    /// Dropped with the hub, which ends the socket task wherever it is, mid outage included.
+    _stop: oneshot::Sender<()>,
+}
+
+/// What the socket callbacks and the hub share with the task that owns the socket.
+struct Shared {
+    /// Set by the relay's connect acknowledgement, cleared by a close or a dropped link.
+    connected: AtomicBool,
+    /// Which client the callbacks belong to. A callback of a client already replaced is
+    /// ignored, so a late close from the old socket cannot take down the new one.
+    generation: AtomicU64,
+    /// The token the next (re)connect joins with. [`Hub::set_token`] replaces it.
+    token: Mutex<String>,
+}
+
+impl Shared {
+    fn token(&self) -> String {
+        self.token.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// The auth a reconnect sends: the current token, and never `applied`, because what a
+    /// connection applied may be mid catch-up and is not a baseline the relay can replay from.
+    fn rejoin(&self) -> serde_json::Value {
+        serde_json::json!({ "token": self.token(), "proto": crate::proto::PROTO })
+    }
+
+    fn current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+}
+
+/// What the callbacks and the hub tell the socket task.
+enum Control {
+    /// The relay closed the socket of this generation.
+    Closed(u64),
+    /// The relay joined this connection; the reconnect backoff starts over.
+    Joined,
+    /// The relay refused the connection itself (a bad or expired token, another protocol).
+    /// Reconnecting with the same auth cannot help, so the task stops until a new token.
+    Refused,
+    /// A new token: reconnect with it if stopped.
+    Token,
 }
 
 impl NativeHub {
@@ -50,101 +91,82 @@ impl NativeHub {
     /// `applied` is the sequence this connection has already applied, when it is resuming a
     /// [`crate::Session`] rather than opening the document fresh. Pass `Session::applied()`
     /// when reconnecting with a session that survived the drop, and `None` on a first join or
-    /// after reloading the file. The relay joins at `applied` when it is given and at the
-    /// saved file's sequence otherwise, so a reconnect is caught up on exactly what it missed
-    /// rather than on what the file happened to be saved at.
+    /// after reloading the file. Only this first connection sends it.
     ///
-    /// The hub reconnects on its own when the link drops or the relay closes it, and
-    /// [`Hub::connected`] follows: false from the drop, true again once the relay accepts the
-    /// new connection. A reconnect joins with the same token and without `applied`, because
-    /// what this connection applied may be mid catch-up and is not a baseline the relay can
-    /// replay from; the relay joins it at the saved sequence and the replica merges the replay.
+    /// The hub reconnects on its own when the link drops or the relay closes it, backing off
+    /// from 250 ms to 5 s until the relay joins it again, and [`Hub::connected`] follows the
+    /// relay's acknowledgements. A reconnect joins with the newest token
+    /// ([`Hub::set_token`]) and without `applied`. A relay that refuses the connection itself
+    /// (`ServerMsg::Error` with a `code`) stops the reconnecting until [`Hub::set_token`].
+    /// Messages sent while the link is down are dropped; a [`crate::Live`] sends its
+    /// unconfirmed edits again once it has rejoined.
     pub async fn connect(url: &str, token: &str, applied: Option<u64>) -> Result<NativeHub> {
         let (in_tx, inbox) = unbounded_channel::<ServerMsg>();
-        let (outbox, mut out_rx) = unbounded_channel::<ClientMsg>();
-        let connected = Arc::new(AtomicBool::new(false));
-        let closed = Arc::new(Notify::new());
-        let link = Link { url: Endpoint::of(url).url(), in_tx, connected: connected.clone(), closed: closed.clone() };
+        let (outbox, out_rx) = unbounded_channel::<ClientMsg>();
+        let (control, control_rx) = unbounded_channel::<Control>();
+        let shared = Arc::new(Shared { connected: AtomicBool::new(false), generation: AtomicU64::new(0), token: Mutex::new(token.to_owned()) });
+        let link = Link { url: Endpoint::of(url).url(), in_tx, control: control.clone(), shared: shared.clone() };
 
-        let mut client = link
-            .builder(serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO }))
-            .connect()
-            .await
-            .map_err(|e| Error::Hub(e.to_string()))?;
-        connected.store(true, Ordering::Relaxed);
-        let rejoin = serde_json::json!({ "token": token, "proto": crate::proto::PROTO });
-
-        // One task owns the socket. Sends are queued rather than awaited by the
-        // caller, which is what lets [`Hub::send`] stay synchronous.
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    msg = out_rx.recv() => {
-                        let Some(msg) = msg else { break };
-                        let (event, body) = emit(&msg);
-                        if let Err(e) = client.emit(event, body).await {
-                            log::warn!("relay send failed: {e}");
-                            link.connected.store(false, Ordering::Relaxed);
-                        }
-                    }
-                    () = closed.notified() => {
-                        // The relay closed this socket. rust_socketio reconnects a dropped link
-                        // on its own but leaves a closed one closed (its reconnect on a server
-                        // disconnect waits for a transport close that may never come), so the
-                        // socket is replaced here. Sends queue in the outbox meanwhile.
-                        let _ = client.disconnect().await;
-                        client = link.reopen(&rejoin).await;
-                    }
-                }
-            }
-            // The outbox closed, so the hub is gone. Close the socket rather
-            // than leaking it for the process lifetime.
-            let _ = client.disconnect().await;
-        });
-
-        Ok(NativeHub { outbox, inbox, connected })
+        let first = serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO });
+        let client = link.builder(0, first).connect().await.map_err(|e| Error::Hub(e.to_string()))?;
+        let (stop, stopped) = oneshot::channel();
+        tokio::spawn(link.run(client, out_rx, control_rx, stopped));
+        Ok(NativeHub { outbox, inbox, control, shared, _stop: stop })
     }
 }
 
-/// What a socket to the relay is built from, kept so the hub can build another.
+/// Where rust_socketio's own reconnect attempt is sent: a closed port, so it fails at once.
+const NOWHERE: &str = "http://127.0.0.1:1/socket.io/";
+
+/// What a socket to the relay is built from, kept so the task can build another.
 struct Link {
     url: String,
     in_tx: UnboundedSender<ServerMsg>,
-    connected: Arc<AtomicBool>,
-    /// Notified when the relay closes the socket.
-    closed: Arc<Notify>,
+    control: UnboundedSender<Control>,
+    shared: Arc<Shared>,
 }
 
 impl Link {
-    /// A client that joins with `auth` and reports into this hub.
-    fn builder(&self, auth: serde_json::Value) -> ClientBuilder {
+    /// A client of `generation` that joins with `auth` and reports into this hub.
+    fn builder(&self, generation: u64, auth: serde_json::Value) -> ClientBuilder {
         // rust_socketio takes a non-root URL path as the transport path, so it is given the
         // derived one: `https://host/craft` connects to `https://host/craft/socket.io/`.
-        let rejoin = serde_json::json!({ "token": auth["token"], "proto": auth["proto"] });
-        let flag = self.connected.clone();
+        let (shared, control) = (self.shared.clone(), self.control.clone());
         let mut builder = ClientBuilder::new(self.url.clone())
             .auth(auth)
-            // Called before each attempt at reconnecting a dropped link: the link is down until
-            // the relay accepts the next one, which joins without `applied`.
+            // rust_socketio notices a dropped link only inside its own reconnect loop, which
+            // calls this before its attempt. That attempt is sent nowhere (a closed local
+            // port) and is its only one: the hub's task reconnects instead, so that every
+            // reconnect shares one backoff, one generation count, and stops with the hub.
+            .max_reconnect_attempts(1)
             .on_reconnect(move || {
-                flag.store(false, Ordering::Relaxed);
-                let rejoin = rejoin.clone();
-                Box::pin(async move {
-                    let mut settings = ReconnectSettings::new();
-                    settings.auth(rejoin);
-                    settings
-                })
+                if shared.current(generation) {
+                    shared.connected.store(false, Ordering::SeqCst);
+                    let _ = control.send(Control::Closed(generation));
+                }
+                let mut settings = ReconnectSettings::new();
+                settings.address(NOWHERE);
+                Box::pin(async move { settings })
             });
 
         // "error" is in the list because the relay reports its own refusals
         // that way, and an app needs to show them rather than have them
         // swallowed into a log.
         for event in EVENTS {
-            let tx = self.in_tx.clone();
+            let (tx, control) = (self.in_tx.clone(), self.control.clone());
             builder = builder.on(event, move |payload, _client| {
-                let tx = tx.clone();
+                let (tx, control) = (tx.clone(), control.clone());
                 Box::pin(async move {
                     for msg in decode_payload(event, payload) {
+                        match &msg {
+                            ServerMsg::Joined { .. } => {
+                                let _ = control.send(Control::Joined);
+                            }
+                            msg if msg.refuses_connection().is_some() => {
+                                let _ = control.send(Control::Refused);
+                            }
+                            _ => {}
+                        }
                         // A closed receiver means the app dropped the hub. Not
                         // an error, just nothing left to deliver to.
                         let _ = tx.send(msg);
@@ -153,39 +175,102 @@ impl Link {
             });
         }
 
-        // The relay accepted a connection, the first or a reconnect.
-        let flag = self.connected.clone();
+        // The relay acknowledged a connection (rust_socketio raises Connect on the server's
+        // CONNECT packet), the first or a reconnect.
+        let shared = self.shared.clone();
         builder = builder.on(Event::Connect, move |_, _| {
-            let flag = flag.clone();
-            Box::pin(async move {
-                flag.store(true, Ordering::Relaxed);
-            })
+            if shared.current(generation) {
+                shared.connected.store(true, Ordering::SeqCst);
+            }
+            Box::pin(async {})
         });
-        let (flag, closed) = (self.connected.clone(), self.closed.clone());
+        let (shared, control) = (self.shared.clone(), self.control.clone());
         builder.on(Event::Close, move |_, _| {
-            let (flag, closed) = (flag.clone(), closed.clone());
-            Box::pin(async move {
-                flag.store(false, Ordering::Relaxed);
-                closed.notify_one();
-            })
+            if shared.current(generation) {
+                shared.connected.store(false, Ordering::SeqCst);
+                let _ = control.send(Control::Closed(generation));
+            }
+            Box::pin(async {})
         })
     }
 
-    /// Connect again, with `auth`, until the relay takes it. Backs off to five seconds.
-    async fn reopen(&self, auth: &serde_json::Value) -> Client {
-        let mut delay = Duration::from_millis(250);
+    /// Own the socket: send what the hub queues, and replace the socket when the relay closes
+    /// it. Ends when the hub is dropped, also in the middle of an outage.
+    async fn run(
+        self,
+        client: Client,
+        mut out_rx: UnboundedReceiver<ClientMsg>,
+        mut control_rx: UnboundedReceiver<Control>,
+        mut stopped: oneshot::Receiver<()>,
+    ) {
+        let mut client = Some(client);
+        let mut backoff = Backoff::default();
+        let mut refused = false;
+        // When the next connection attempt is due, while there is no socket.
+        let mut retry: Option<tokio::time::Instant> = None;
         loop {
-            match self.builder(auth.clone()).connect().await {
-                Ok(client) => {
-                    self.connected.store(true, Ordering::Relaxed);
-                    return client;
+            let due = retry.unwrap_or_else(tokio::time::Instant::now);
+            tokio::select! {
+                _ = &mut stopped => break,
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let Some(socket) = client.as_ref().filter(|_| self.shared.connected.load(Ordering::SeqCst)) else {
+                        log::debug!("relay link down; dropping a message");
+                        continue;
+                    };
+                    let (event, body) = emit(&msg);
+                    if let Err(e) = socket.emit(event, body).await {
+                        // The link state is the relay's to say: a dead socket closes or
+                        // reconnects, and that is what moves `connected`.
+                        log::warn!("relay send failed: {e}");
+                    }
                 }
-                Err(e) => {
-                    log::info!("relay reconnect failed, trying again in {delay:?}: {e}");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(5));
+                control = control_rx.recv() => {
+                    let Some(control) = control else { break };
+                    match control {
+                        Control::Joined => backoff.reset(),
+                        Control::Refused => refused = true,
+                        Control::Token => {
+                            if refused {
+                                refused = false;
+                                backoff.reset();
+                                retry = client.is_none().then(tokio::time::Instant::now);
+                            }
+                        }
+                        Control::Closed(generation) if self.shared.current(generation) && client.is_some() => {
+                            // A dropped link, or a socket the relay closed (which rust_socketio
+                            // would leave closed). Either way it is replaced here, after the
+                            // backoff, unless the relay refused this connection's ticket.
+                            if let Some(old) = client.take() {
+                                let _ = old.disconnect().await;
+                            }
+                            retry = (!refused).then(|| tokio::time::Instant::now() + backoff.next());
+                        }
+                        Control::Closed(_) => {}
+                    }
+                }
+                () = tokio::time::sleep_until(due), if retry.is_some() && client.is_none() => {
+                    retry = None;
+                    let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    let attempt = tokio::select! {
+                        // Dropped while connecting: no join on behalf of a hub that is gone.
+                        _ = &mut stopped => break,
+                        attempt = self.builder(generation, self.shared.rejoin()).connect() => attempt,
+                    };
+                    match attempt {
+                        Ok(socket) => client = Some(socket),
+                        Err(e) => {
+                            let wait = backoff.next();
+                            log::info!("relay reconnect failed, trying again in {wait:?}: {e}");
+                            retry = Some(tokio::time::Instant::now() + wait);
+                        }
+                    }
                 }
             }
+        }
+        // The hub is gone. Close the socket rather than leaking it for the process lifetime.
+        if let Some(socket) = client {
+            let _ = socket.disconnect().await;
         }
     }
 }
@@ -205,7 +290,14 @@ impl Hub for NativeHub {
     }
 
     fn connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.shared.connected.load(Ordering::SeqCst)
+    }
+
+    fn set_token(&mut self, token: String) {
+        if let Ok(mut current) = self.shared.token.lock() {
+            *current = token;
+        }
+        let _ = self.control.send(Control::Token);
     }
 }
 

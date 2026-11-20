@@ -35,6 +35,46 @@ pub trait Hub {
     /// Whether the transport believes it is connected. A session stays usable across a brief
     /// disconnect, because the relay re-sends on rejoin.
     fn connected(&self) -> bool;
+
+    /// Use `token` for the next (re)connect. Tickets are short-lived, so a host refreshes them
+    /// while connected; after the relay refused the connection itself (an expired ticket), a
+    /// hub that stopped reconnecting starts again with this one. No-op by default.
+    fn set_token(&mut self, token: String) {
+        let _ = token;
+    }
+}
+
+/// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back
+/// to 250 ms once the relay has joined it again. Kept across attempts, so a relay that accepts
+/// the socket and then closes it is not reconnected to in a tight loop.
+#[derive(Debug)]
+#[cfg(any(feature = "native-hub", feature = "web-hub"))]
+pub(crate) struct Backoff {
+    next: std::time::Duration,
+}
+
+#[cfg(any(feature = "native-hub", feature = "web-hub"))]
+impl Backoff {
+    const FIRST: std::time::Duration = std::time::Duration::from_millis(250);
+    const MOST: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The wait before this attempt; the next one waits twice as long, up to the most.
+    pub(crate) fn next(&mut self) -> std::time::Duration {
+        let wait = self.next;
+        self.next = (wait * 2).min(Self::MOST);
+        wait
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.next = Self::FIRST;
+    }
+}
+
+#[cfg(any(feature = "native-hub", feature = "web-hub"))]
+impl Default for Backoff {
+    fn default() -> Backoff {
+        Backoff { next: Self::FIRST }
+    }
 }
 
 /// Where a relay URL points a Socket.IO client: the server, and the transport path on it.

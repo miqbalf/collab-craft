@@ -143,6 +143,11 @@ pub enum Work {
     /// Only a refusal the relay tied to this checkpoint (the snapshot submit's counter, or the
     /// save report's sequence) counts. Other relay errors leave a checkpoint in flight alone.
     CheckpointRefused { reason: String },
+    /// The relay refused the connection itself and closed it: `code` is
+    /// [`crate::REFUSED_AUTH`] (a bad or expired ticket) or [`crate::REFUSED_PROTO`]. The hub
+    /// stops reconnecting; give it a new ticket with [`Hub::set_token`] (through
+    /// [`Live::hub_mut`]) and it connects again.
+    ConnectionRefused { code: String, reason: String },
 }
 
 /// Whether a relay error says something a retry cannot change.
@@ -156,6 +161,9 @@ pub fn refusal_is_permanent(detail: &str) -> bool {
         || detail.contains("more than this relay will carry")
         || detail.contains("too large to retain")
 }
+
+/// The most local edit bytes a replica holds unconfirmed before it gives up on the link.
+const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
 
 /// How long a checkpoint may wait for its ordering and the save acknowledgement.
 pub const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -288,6 +296,8 @@ pub struct Live<H> {
     last_edit: Option<u64>,
     /// Local updates sent and not yet confirmed, by submit counter. Sent again on a rejoin.
     unconfirmed: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// The bytes in [`Live::unconfirmed`], bounded by [`MAX_UNCONFIRMED_BYTES`].
+    unconfirmed_bytes: usize,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -326,6 +336,7 @@ impl<H: Hub> Live<H> {
             snap_locals: Vec::new(),
             last_edit: None,
             unconfirmed: std::collections::BTreeMap::new(),
+            unconfirmed_bytes: 0,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -562,6 +573,10 @@ impl<H: Hub> Live<H> {
 
         let mut work = Vec::new();
         for msg in self.hub.poll() {
+            if let (Some(code), ServerMsg::Error { detail, .. }) = (msg.refuses_connection(), &msg) {
+                log::warn!("collab: the relay refused the connection ({code}): {detail}");
+                work.push(Work::ConnectionRefused { code: code.to_owned(), reason: detail.clone() });
+            }
             if let ServerMsg::Joined { seq, replay_until, fallback, text_cap, .. } = &msg {
                 self.text_cap = *text_cap;
                 self.joined(*seq, *replay_until, *fallback, &mut work);
@@ -598,6 +613,7 @@ impl<H: Hub> Live<H> {
         self.broken = true;
         self.snapshot = None;
         self.unconfirmed.clear();
+        self.unconfirmed_bytes = 0;
         self.held.clear();
         self.notices.push("the shared document could not be restored; reopen the file".to_owned());
     }
@@ -688,8 +704,15 @@ impl<H: Hub> Live<H> {
         if let ClientMsg::Submit { local, .. } = &msg {
             self.last_edit = self.last_edit.max(Some(*local));
             self.unconfirmed.insert(*local, update.to_vec());
+            self.unconfirmed_bytes += update.len();
         }
-        self.hub.send(msg)
+        self.hub.send(msg)?;
+        if self.unconfirmed_bytes > MAX_UNCONFIRMED_BYTES {
+            // The relay has not confirmed this much for so long that the link is as good as
+            // gone; holding more would grow without bound.
+            self.break_replica("too many edits are waiting for the relay");
+        }
+        Ok(())
     }
 
     /// Send again every local update the relay has not confirmed, after a rejoin.
@@ -698,18 +721,23 @@ impl<H: Hub> Live<H> {
     /// or refused at a hub that was reconnecting. They are in this replica and maybe never in
     /// the room. Sending them again is safe either way: an update the room already has merges
     /// as a no-op.
+    ///
+    /// They go as one update, merged. A hub drops what is sent while its link is down
+    /// ([`crate::native::NativeHub`]), so this is the one path an edit made in an outage takes.
     fn resend_unconfirmed(&mut self) {
-        if self.broken || self.doc.is_none() {
+        let updates = std::mem::take(&mut self.unconfirmed);
+        self.unconfirmed_bytes = 0;
+        if self.broken || self.doc.is_none() || updates.is_empty() {
             return;
         }
-        let updates = std::mem::take(&mut self.unconfirmed);
-        if !updates.is_empty() {
-            log::info!("collab: sending {} unconfirmed edits again after the rejoin", updates.len());
-        }
-        for update in updates.into_values() {
-            if let Err(e) = self.send_update(&update) {
-                log::warn!("collab: an unconfirmed edit could not be sent again: {e}");
+        log::info!("collab: sending {} unconfirmed edits again after the rejoin", updates.len());
+        match yrs::merge_updates_v1(updates.values()) {
+            Ok(merged) => {
+                if let Err(e) = self.send_update(&merged) {
+                    log::warn!("collab: the unconfirmed edits could not be sent again: {e}");
+                }
             }
+            Err(e) => self.break_replica(&format!("unconfirmed edits did not merge: {e}")),
         }
     }
 
@@ -965,12 +993,17 @@ impl<H: Hub> Live<H> {
             Effect::Frame { origin, payload } => work.push(Work::Frame { origin, payload }),
             Effect::Ephemeral { origin, kind, payload } => work.push(Work::Ephemeral { origin, kind, payload }),
             Effect::Confirmed { local, seq } => {
-                self.unconfirmed.remove(&local);
+                if let Some(update) = self.unconfirmed.remove(&local) {
+                    self.unconfirmed_bytes -= update.len();
+                }
                 self.first_of_catchup(seq);
                 self.confirmed(local, seq, work);
             }
             Effect::Replace { document, seq } => {
                 self.lose_checkpoint(work, "the relay replaced the document");
+                // Edits made against what is being replaced cannot be reconciled with it.
+                self.unconfirmed.clear();
+                self.unconfirmed_bytes = 0;
                 if document.is_null() {
                     // The relay keeps no document, so this is not a recovery. Saying nothing
                     // and carrying on would leave the peer believing it is current when it has

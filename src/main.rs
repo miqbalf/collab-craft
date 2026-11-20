@@ -60,6 +60,8 @@ mod review_repro;
 mod review_reverify;
 
 #[cfg(test)]
+mod e2e_reconnect;
+#[cfg(test)]
 mod review_reverify2;
 
 #[cfg(test)]
@@ -357,6 +359,15 @@ struct LockEntry {
 }
 
 #[derive(Debug, Serialize)]
+struct RefusedMsg {
+    doc: String,
+    detail: String,
+    /// What a client must change before it connects again; see `craft_collab::REFUSED_AUTH`.
+    /// A field an older client does not know, so it still reads the error as before.
+    code: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorMsg {
     doc: String,
     detail: String,
@@ -607,7 +618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(relay): State<Arc<Relay>>) {
     if let Err(detail) = check_proto(&handshake) {
         tracing::warn!("rejecting a connection: protocol version mismatch");
-        let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: detail.to_owned(), local: None });
+        let _ = socket.emit("error", &RefusedMsg { doc: String::new(), detail: detail.to_owned(), code: "proto" });
         let _ = socket.disconnect();
         return;
     }
@@ -618,7 +629,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             // The reason goes to the log, not to the peer. A caller learning
             // which check failed learns something about the secret.
             tracing::warn!(error = %e, "rejecting a connection");
-            let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: "token rejected".to_owned(), local: None });
+            let _ = socket.emit("error", &RefusedMsg { doc: String::new(), detail: "token rejected".to_owned(), code: "auth" });
             let _ = socket.disconnect();
             return;
         }
