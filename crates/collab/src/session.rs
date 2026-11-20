@@ -48,6 +48,13 @@ pub enum Effect {
     Roster { roster: Vec<Presence> },
     /// Tell the user something was refused.
     Notice { detail: String },
+    /// The relay refused this client's submit with counter `local`. Raised next to the
+    /// [`Effect::Notice`] for the same error, for a caller tracking that submit.
+    SubmitRefused { local: u64, detail: String },
+    /// The relay took this client's save report through `seq`.
+    SavedAck { seq: u64 },
+    /// The relay refused this client's save report through `seq`.
+    SavedRefused { seq: u64, reason: String },
     /// Send this back to the relay. The session asks for its own resyncs this way.
     Send { msg: ClientMsg },
     /// The relay granted this connection its CRDT id space.
@@ -313,7 +320,17 @@ impl Session {
 
             ServerMsg::Ephemeral { origin, kind, payload, .. } => vec![Effect::Ephemeral { origin, kind, payload }],
 
-            ServerMsg::Error { detail, .. } => vec![Effect::Notice { detail }],
+            ServerMsg::Error { detail, local, .. } => match local {
+                Some(local) => {
+                    self.inflight.remove(&local);
+                    vec![Effect::Notice { detail: detail.clone() }, Effect::SubmitRefused { local, detail }]
+                }
+                None => vec![Effect::Notice { detail }],
+            },
+
+            ServerMsg::SavedAck { seq, .. } => vec![Effect::SavedAck { seq }],
+
+            ServerMsg::SavedRefused { seq, reason, .. } => vec![Effect::SavedRefused { seq, reason }],
         }
     }
 

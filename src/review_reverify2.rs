@@ -109,6 +109,11 @@ mod e2e {
     }
 
     async fn start() -> Option<Harness> {
+        start_under("").await
+    }
+
+    /// The relay with Socket.IO mounted under `base`, as `COLLABCRAFT_BASE` mounts it.
+    async fn start_under(base: &str) -> Option<Harness> {
         // Unlike review_reverify.rs's harness, nothing in this file reaches Valkey directly
         // (no lease-expiry fault injection here), so the URL is read only to gate on its
         // presence and is not kept.
@@ -122,7 +127,8 @@ mod e2e {
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
         });
-        let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
+        let (layer, io) =
+            SocketIo::builder().req_path(format!("{base}/socket.io")).max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,7 +136,7 @@ mod e2e {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Some(Harness { relay, url: format!("http://{addr}") })
+        Some(Harness { relay, url: format!("http://{addr}{base}") })
     }
 
     fn now() -> i64 {
@@ -398,5 +404,19 @@ mod e2e {
             assert!(!resynced && j.s.applied() == last, "joiner {i} at {} of {last}, resync needed: {resynced}", j.s.applied());
             assert_eq!(seqs, (1..=last).collect::<Vec<_>>(), "joiner {i} did not apply every op once");
         }
+    }
+
+    /// Round 2b: a hub given the relay URL with its base path (`http://host/craft`) reaches
+    /// Socket.IO at `/craft/socket.io/`, joins, and saves with an acknowledged checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_relay_under_a_base_path_is_reached_and_acks_a_save() {
+        let Some(h) = start_under("/craft").await else { return };
+        let room = unique_room("base-path");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
+        a.insert(5, "!");
+        assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
+        assert_eq!(h.relay.rooms.lock().await.get(&room).map(|r| r.saved_seq()), Some(1));
     }
 }

@@ -22,7 +22,7 @@ use rust_socketio::{Event, Payload};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::error::{Error, Result};
-use crate::hub::{EVENTS, Hub, emit, receive};
+use crate::hub::{EVENTS, Endpoint, Hub, emit, receive};
 use crate::proto::{ClientMsg, ServerMsg};
 
 /// A connection to the relay from a native app.
@@ -38,7 +38,9 @@ impl NativeHub {
     /// Must be called from inside a Tokio runtime, which a native Craft app has
     /// because the relay client is the only async thing it owns.
     ///
-    /// `url` is the relay root. `token` is what the Nextcloud app minted; it
+    /// `url` is the relay as the deployment publishes it, base path included
+    /// (`https://host/craft`); the Socket.IO path is derived from it ([`Endpoint`]).
+    /// `token` is what the Nextcloud app minted; it
     /// travels in the Socket.IO handshake auth, so it never appears in a query
     /// string and therefore never lands in an access log.
     ///
@@ -53,7 +55,10 @@ impl NativeHub {
         let (outbox, mut out_rx) = unbounded_channel::<ClientMsg>();
         let connected = Arc::new(AtomicBool::new(false));
 
-        let mut builder = ClientBuilder::new(url).auth(serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO }));
+        // rust_socketio takes a non-root URL path as the transport path, so it is given the
+        // derived one: `https://host/craft` connects to `https://host/craft/socket.io/`.
+        let mut builder =
+            ClientBuilder::new(Endpoint::of(url).url()).auth(serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO }));
 
         // "error" is in the list because the relay reports its own refusals
         // that way, and an app needs to show them rather than have them

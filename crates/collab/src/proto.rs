@@ -242,6 +242,23 @@ pub enum ServerMsg {
     Error {
         doc: DocId,
         detail: String,
+        /// The `local` counter of the submit this refuses, when it refuses one. Absent from
+        /// an older relay and on errors that are not about a submit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local: Option<u64>,
+    },
+    /// The relay took a [`ClientMsg::Saved`] through `seq`: the join baseline is `seq` now,
+    /// so the file this save reflects may be written.
+    SavedAck {
+        doc: DocId,
+        seq: u64,
+    },
+    /// The relay refused a [`ClientMsg::Saved`] through `seq`. Nothing was dropped and the
+    /// baseline did not move. `reason` is in the relay's words.
+    SavedRefused {
+        doc: DocId,
+        seq: u64,
+        reason: String,
     },
 }
 
@@ -260,7 +277,9 @@ impl ServerMsg {
             | ServerMsg::TextOps { doc, .. }
             | ServerMsg::Frame { doc, .. }
             | ServerMsg::Ephemeral { doc, .. }
-            | ServerMsg::Error { doc, .. } => doc,
+            | ServerMsg::Error { doc, .. }
+            | ServerMsg::SavedAck { doc, .. }
+            | ServerMsg::SavedRefused { doc, .. } => doc,
         }
     }
 }

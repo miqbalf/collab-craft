@@ -260,6 +260,9 @@ struct LockEntry {
 struct ErrorMsg {
     doc: String,
     detail: String,
+    /// The `local` counter of the submit this refuses, when it refuses one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local: Option<u64>,
 }
 
 /// Key space for sessions and account links, kept apart from the relay's
@@ -500,7 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(relay): State<Arc<Relay>>) {
     if let Err(detail) = check_proto(&handshake) {
         tracing::warn!("rejecting a connection: protocol version mismatch");
-        let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: detail.to_owned() });
+        let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: detail.to_owned(), local: None });
         let _ = socket.disconnect();
         return;
     }
@@ -511,7 +514,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             // The reason goes to the log, not to the peer. A caller learning
             // which check failed learns something about the secret.
             tracing::warn!(error = %e, "rejecting a connection");
-            let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: "token rejected".to_owned() });
+            let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: "token rejected".to_owned(), local: None });
             let _ = socket.disconnect();
             return;
         }
@@ -568,7 +571,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
                 // either silent divergence or a window that cannot type, and neither is
                 // something a user could act on.
                 tracing::error!(error = %e, room = %room_key, "could not grant an id space");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned() });
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None });
                 let _ = socket.disconnect();
                 return;
             }
@@ -632,7 +635,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let Some((seq, replay, texts, roster, ephemeral)) = joined else {
         drop(rooms);
         tracing::warn!(room = %room_key, "refusing a peer: the document is full");
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: Refusal::Full.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: Refusal::Full.detail(), local: None });
         let _ = socket.disconnect();
         return;
     };
@@ -691,6 +694,8 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
 async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
     let room_name = claims.room();
+    // Echoed on a refusal, so the sender can tell which of its submits was refused.
+    let local = msg.local;
 
     // Arbitrate BEFORE taking a sequence number. INCR is not refundable, so a
     // submit refused after the increment would burn that number and leave a
@@ -767,7 +772,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         None => Ok(()),
     };
     if let Err(refusal) = preflight {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
         return;
     }
 
@@ -783,7 +788,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned() });
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local });
                 return;
             }
         }
@@ -823,7 +828,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             emit_live(socket.within(room_name), "op", &OpMsg::new(&claims, &op));
         }
         Err(refusal) => {
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail() });
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
         }
     }
 }
@@ -860,7 +865,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
     let room_name = claims.room();
 
     if !claims.may_edit() {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None });
         return;
     }
 
@@ -891,7 +896,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         }
         Err(e) => {
             tracing::error!(error = %e, room = %claims.rm, "lock failed");
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned() });
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned(), local: None });
         }
     }
 }
@@ -963,11 +968,11 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
     let room_name = claims.room();
 
     if !claims.may_edit() {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None });
         return;
     }
     if msg.payload.len() > MAX_FRAME_BYTES {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail(), local: None });
         return;
     }
 
@@ -1009,7 +1014,7 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
         relay.room(&mut rooms, &claims.rm).remember_ephemeral(&claims.pid, &msg.kind, msg.payload.clone())
     };
     if let Err(refusal) = remembered {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail() });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local: None });
         return;
     }
 
@@ -1034,14 +1039,26 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
 /// edits the room has actually ordered.
 async fn on_saved(socket: SocketRef, Data(msg): Data<SavedMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
-    if !claims.may_edit() {
-        return;
-    }
-    let mut rooms = relay.rooms.lock().await;
-    if let Some(room) = rooms.get_mut(&claims.rm)
-        && let Err(refusal) = room.checkpoint(msg.seq)
-    {
-        let _ = socket.emit("error", &ErrorMsg { doc: claims.room(), detail: refusal.detail() });
+    let doc = claims.room();
+    // Answered either way, so the saver knows whether it may write the file: the baseline
+    // moved (`saved_ack`) or it did not (`saved_refused`, with the same `seq`).
+    let outcome = if claims.may_edit() {
+        let mut rooms = relay.rooms.lock().await;
+        match rooms.get_mut(&claims.rm) {
+            Some(room) => room.checkpoint(msg.seq).map_err(|refusal| refusal.detail()),
+            None => Err("this document is not open on the relay".to_owned()),
+        }
+    } else {
+        Err(Refusal::ReadOnly.detail())
+    };
+    match outcome {
+        Ok(()) => {
+            let _ = socket.emit("saved_ack", &serde_json::json!({ "doc": doc, "seq": msg.seq }));
+        }
+        Err(reason) => {
+            let _ = socket.emit("saved_refused", &serde_json::json!({ "doc": doc, "seq": msg.seq, "reason": reason }));
+            let _ = socket.emit("error", &ErrorMsg { doc, detail: reason, local: None });
+        }
     }
 }
 

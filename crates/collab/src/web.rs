@@ -25,7 +25,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::error::{Error, Result};
-use crate::hub::{EVENTS, Hub, emit, receive};
+use crate::hub::{EVENTS, Endpoint, Hub, emit, receive};
 use crate::proto::{ClientMsg, ServerMsg};
 
 /// A connection to the relay from a browser.
@@ -41,7 +41,9 @@ pub struct WebHub {
 impl WebHub {
     /// Connect, through the `socket.io-client` the page loaded.
     ///
-    /// `url` is the relay root. `token` is what the service minted. It travels in the Socket.IO
+    /// `url` is the relay as the deployment publishes it, base path included
+    /// (`https://host/craft`); the Socket.IO path is derived from it ([`Endpoint`]).
+    /// `token` is what the service minted. It travels in the Socket.IO
     /// handshake auth, so it never appears in a query string and therefore never lands in an
     /// access log.
     ///
@@ -68,8 +70,16 @@ impl WebHub {
         Reflect::set(&auth, &JsValue::from_str("proto"), &JsValue::from_str(crate::proto::PROTO)).map_err(js)?;
         let options = Object::new();
         Reflect::set(&options, &JsValue::from_str("auth"), &auth).map_err(js)?;
+        // socket.io-client reads a URL path as a namespace, so the relay's base path goes in
+        // `path` and only the origin (and any query) in the URL.
+        let endpoint = Endpoint::of(url);
+        Reflect::set(&options, &JsValue::from_str("path"), &JsValue::from_str(&endpoint.path)).map_err(js)?;
+        let server = match &endpoint.query {
+            Some(query) => format!("{}?{query}", endpoint.origin),
+            None => endpoint.origin.clone(),
+        };
 
-        let socket = io.call2(global.as_ref(), &JsValue::from_str(url), &options).map_err(js)?;
+        let socket = io.call2(global.as_ref(), &JsValue::from_str(&server), &options).map_err(js)?;
         let on = function(&socket, "on").ok_or_else(|| Error::Hub("socket.io gave back something that is not a socket".to_owned()))?;
 
         let inbox = Rc::new(RefCell::new(VecDeque::new()));

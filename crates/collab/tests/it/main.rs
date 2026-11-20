@@ -667,8 +667,11 @@ fn live_checkpoint_and_snapshot_join() {
     relay.push(op(2, "alice", Some(l2), p2.clone()));
     alice_hub.0.borrow_mut().inbox.extend(relay.clone());
     let work = alice.pump();
-    assert!(work.iter().any(|w| matches!(w, Work::Checkpointed { seq: 2 })), "{work:?}");
+    assert!(!work.iter().any(|w| matches!(w, Work::Checkpointed { .. })), "not before the relay's ack: {work:?}");
     assert!(matches!(alice_hub.0.borrow_mut().sent.pop(), Some(ClientMsg::Saved { seq: 1, .. })));
+    alice_hub.0.borrow_mut().inbox.push(saved_ack(1));
+    let work = alice.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Checkpointed { seq: 2 })), "{work:?}");
 
     // A race: bob's edit is ordered between the snapshot and its confirmation.
     alice.checkpoint().unwrap();
@@ -864,13 +867,15 @@ fn saving_still_works_after_a_refused_checkpoint() {
     hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
     live.pump();
 
-    for lost in [
-        ServerMsg::Error { doc: "d".to_owned(), detail: "that change is too large".to_owned() },
-        ServerMsg::Snapshot { doc: "d".to_owned(), seq: 0, document: Value::Null },
-        joined_at("alice", 1, 0, Some(0)),
-    ] {
+    for kind in 0..3 {
         live.checkpoint().unwrap();
+        let (local, _) = last_submit(&hub);
         hub.0.borrow_mut().sent.clear();
+        let lost = match kind {
+            0 => submit_refused(local, "relay could not order that edit"),
+            1 => ServerMsg::Snapshot { doc: "d".to_owned(), seq: 0, document: Value::Null },
+            _ => joined_at("alice", 1, 0, Some(0)),
+        };
         hub.0.borrow_mut().inbox.push(lost.clone());
         let work = live.pump();
         assert!(work.iter().any(|w| matches!(w, Work::CheckpointRaced)), "{lost:?}: {work:?}");
@@ -879,9 +884,11 @@ fn saving_still_works_after_a_refused_checkpoint() {
     live.checkpoint().unwrap();
     let (local, params) = last_submit(&hub);
     hub.0.borrow_mut().inbox.push(op(1, "alice", Some(local), params));
+    live.pump();
+    assert!(matches!(hub.0.borrow_mut().sent.pop(), Some(ClientMsg::Saved { seq: 0, .. })));
+    hub.0.borrow_mut().inbox.push(saved_ack(0));
     let work = live.pump();
     assert!(work.iter().any(|w| matches!(w, Work::Checkpointed { seq: 1 })), "{work:?}");
-    assert!(matches!(hub.0.borrow_mut().sent.pop(), Some(ClientMsg::Saved { seq: 0, .. })));
 }
 
 /// I5: two peers inserting the same id leave it in the body twice. Every replica shows it once,
@@ -958,8 +965,16 @@ fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
     }
 }
 
+fn submit_refused(local: u64, detail: &str) -> ServerMsg {
+    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: Some(local) }
+}
+
+fn saved_ack(seq: u64) -> ServerMsg {
+    ServerMsg::SavedAck { doc: "d".to_owned(), seq }
+}
+
 fn relay_error(detail: &str) -> ServerMsg {
-    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned() }
+    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned(), local: None }
 }
 
 /// 1b: a checkpoint needs a ready replica and waits for the join's catch-up, ordered or not,
@@ -1056,25 +1071,104 @@ fn a_live_op_before_the_fallback_text_ops_keeps_the_restart() {
 }
 
 /// 3: a refusal a retry cannot change is reported apart from a race, so a retrying app stops.
+/// Only a refusal tied to the checkpoint counts: by the snapshot submit's counter, or by the
+/// save report's sequence.
 #[test]
-fn a_permanent_refusal_is_not_reported_as_a_race() {
+fn a_correlated_refusal_maps_to_refused_or_raced() {
     let hub = FakeHub::default();
     let mut live = Live::new(hub.clone(), "d");
     live.seed(&sample()).unwrap();
     hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
     live.pump();
+    let mut seq = 0;
     for (detail, permanent) in [
         ("that change is 99999999 bytes, more than this relay will carry", true),
         ("read-only access to this file", true),
         ("relay could not order that edit", false),
     ] {
-        live.checkpoint().unwrap();
-        hub.0.borrow_mut().inbox.push(relay_error(detail));
-        let work = live.pump();
-        let refused = work.iter().any(|w| matches!(w, Work::CheckpointRefused { reason } if reason == detail));
-        let raced = work.iter().any(|w| matches!(w, Work::CheckpointRaced));
-        assert_eq!((refused, raced), (permanent, !permanent), "{detail}: {work:?}");
+        for at_save in [false, true] {
+            live.checkpoint().unwrap();
+            let (local, params) = last_submit(&hub);
+            let refusal = if at_save {
+                seq += 1;
+                hub.0.borrow_mut().inbox.push(op(seq, "alice", Some(local), params));
+                live.pump();
+                ServerMsg::SavedRefused { doc: "d".to_owned(), seq: seq - 1, reason: detail.to_owned() }
+            } else {
+                submit_refused(local, detail)
+            };
+            hub.0.borrow_mut().inbox.push(refusal);
+            let work = live.pump();
+            let refused = work.iter().any(|w| matches!(w, Work::CheckpointRefused { reason } if reason == detail));
+            let raced = work.iter().any(|w| matches!(w, Work::CheckpointRaced));
+            assert_eq!((refused, raced), (permanent, !permanent), "{detail}, at save {at_save}: {work:?}");
+        }
     }
+}
+
+/// Round 2b: `Checkpointed` means the relay moved its baseline, so it waits for `saved_ack`
+/// for this save's own sequence.
+#[test]
+fn checkpointed_comes_only_after_the_ack() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 3, Some(3)));
+    live.pump();
+    live.checkpoint().unwrap();
+    let (local, params) = last_submit(&hub);
+    hub.0.borrow_mut().inbox.push(op(4, "alice", Some(local), params));
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::Checkpointed { .. })), "{work:?}");
+    assert!(matches!(hub.0.borrow_mut().sent.pop(), Some(ClientMsg::Saved { seq: 3, .. })));
+    assert!(live.checkpoint().is_err(), "still in flight until the relay answers");
+    hub.0.borrow_mut().inbox.push(saved_ack(2));
+    let work = live.pump();
+    assert!(work.is_empty(), "an ack for another save is not this one's: {work:?}");
+    hub.0.borrow_mut().inbox.push(saved_ack(3));
+    let work = live.pump();
+    assert!(matches!(work.as_slice(), [Work::Checkpointed { seq: 4 }]), "{work:?}");
+}
+
+/// Round 2b: relay errors that do not name the checkpoint leave it pending, even when their
+/// wording is permanent.
+#[test]
+fn an_unrelated_relay_error_leaves_the_checkpoint_pending() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.checkpoint().unwrap();
+    let (local, params) = last_submit(&hub);
+    hub.0.borrow_mut().inbox.extend([
+        relay_error("read-only access to this file"),
+        submit_refused(local + 7, "that change is 5 bytes, more than this relay will carry"),
+        ServerMsg::SavedRefused { doc: "d".to_owned(), seq: 41, reason: "read-only access to this file".to_owned() },
+    ]);
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::CheckpointRaced | Work::CheckpointRefused { .. })), "{work:?}");
+    hub.0.borrow_mut().inbox.extend([op(1, "alice", Some(local), params), saved_ack(0)]);
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Checkpointed { seq: 1 })), "{work:?}");
+}
+
+/// Round 2b: a relay too old to acknowledge a save never answers, so the checkpoint times out
+/// as raced instead of blocking the next one for good.
+#[test]
+fn a_checkpoint_with_no_answer_times_out_as_raced() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.checkpoint().unwrap();
+    assert!(live.pump().is_empty(), "the default timeout has not passed");
+    live.set_checkpoint_timeout(std::time::Duration::ZERO);
+    let work = live.pump();
+    assert!(matches!(work.as_slice(), [Work::CheckpointRaced]), "{work:?}");
+    live.checkpoint().unwrap();
+    assert_eq!(craft_collab::CHECKPOINT_TIMEOUT, std::time::Duration::from_secs(10));
 }
 
 /// 5: the relay can broadcast a live op to a socket before telling it that it joined. The op

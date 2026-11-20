@@ -34,6 +34,8 @@
 //! The order of 2 and 3 does not matter, which is the point of holding. An app that seeds
 //! on first paint and a relay that replays immediately both work.
 
+use std::time::Duration;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
@@ -114,8 +116,9 @@ pub enum Work {
     /// Raised when the app seeded the file before the catch-up showed that the room had
     /// checkpointed since that file was written.
     Reset,
-    /// This replica's checkpoint was ordered at `seq` and reported as saved through `seq - 1`.
-    /// Write the file now, from the same state the snapshot was taken of.
+    /// This replica's checkpoint was ordered at `seq`, and the relay acknowledged the save
+    /// report through `seq - 1`: the room's join baseline is that snapshot now. Write the file
+    /// now, from the same state the snapshot was taken of.
     Checkpointed { seq: u64 },
     /// The checkpoint was dropped for a reason that can pass, so retrying makes sense. Call
     /// [`Live::checkpoint`] again. Raised when:
@@ -125,13 +128,20 @@ pub enum Work {
     /// * the link rejoined, the relay replaced the document, or the replica was reset onto the
     ///   room's own snapshot, so the submit may never be ordered or was taken of a state the
     ///   room does not share;
-    /// * the relay reported an error it may recover from (it could not order the edit);
-    /// * the save report never left this client.
+    /// * the relay refused the snapshot submit or the save report for a reason that may pass
+    ///   (it could not order the edit, or no retained snapshot follows the reported sequence);
+    /// * the save report never left this client;
+    /// * no answer came within the checkpoint timeout (10 s unless
+    ///   [`Live::set_checkpoint_timeout`] says otherwise). A relay too old to acknowledge a
+    ///   save never answers, so against one every checkpoint ends here.
     CheckpointRaced,
     /// The relay refused the checkpoint for a reason a retry does not change: this peer may
     /// only read, or the snapshot is larger than the relay carries. `reason` is the relay's
     /// own words, for the user. Do not retry until something changes (a smaller document, a
     /// ticket that may edit).
+    ///
+    /// Only a refusal the relay tied to this checkpoint (the snapshot submit's counter, or the
+    /// save report's sequence) counts. Other relay errors leave a checkpoint in flight alone.
     CheckpointRefused { reason: String },
 }
 
@@ -144,13 +154,47 @@ pub fn refusal_is_permanent(detail: &str) -> bool {
     detail.starts_with("read-only access") || detail.contains("more than this relay will carry")
 }
 
-/// A checkpoint snapshot this replica sent and the relay has not ordered yet.
+/// How long a checkpoint may wait for its ordering and the save acknowledgement.
+pub const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A checkpoint snapshot this replica sent and the relay has not acknowledged yet.
 struct PendingCheckpoint {
     /// The session's counter for the snapshot submit.
     local: u64,
     /// A remote update landed while it was in flight. Those are ordered before it and may be
     /// missing from it, so it must not be reported as saved.
     raced: bool,
+    /// Once ordered: the snapshot's sequence, with the save report through the one before it
+    /// sent and waiting for the relay's answer.
+    ordered: Option<u64>,
+    /// When it was sent, on [`now_ms`]. `None` where there is no clock.
+    sent_at: Option<f64>,
+}
+
+impl PendingCheckpoint {
+    /// The sequence its save report names, once sent.
+    fn saved_through(&self) -> Option<u64> {
+        self.ordered.map(|seq| seq.saturating_sub(1))
+    }
+}
+
+/// Milliseconds on a clock that only moves forward.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> Option<f64> {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    Some(START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Milliseconds on the page's clock.
+#[cfg(all(target_arch = "wasm32", feature = "web-hub"))]
+fn now_ms() -> Option<f64> {
+    Some(js_sys::Date::now())
+}
+
+/// A wasm build without the page has no clock, so a checkpoint there never times out.
+#[cfg(all(target_arch = "wasm32", not(feature = "web-hub")))]
+fn now_ms() -> Option<f64> {
+    None
 }
 
 /// Where this link's first join said its ordered catch-up sits.
@@ -223,6 +267,8 @@ pub struct Live<H> {
     broken: bool,
     /// A checkpoint in flight.
     checkpoint: Option<PendingCheckpoint>,
+    /// How long [`Live::checkpoint`] waits for an answer.
+    checkpoint_timeout: Duration,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -254,6 +300,7 @@ impl<H: Hub> Live<H> {
             edited: false,
             broken: false,
             checkpoint: None,
+            checkpoint_timeout: CHECKPOINT_TIMEOUT,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -356,7 +403,8 @@ impl<H: Hub> Live<H> {
     /// The order a saver keeps: call this, wait for [`Work::Checkpointed`], and only then
     /// write the file, from the state the snapshot was taken of. A file written before the
     /// checkpoint is accepted can get ahead of the room's join baseline, and a joiner that
-    /// loads it would apply the same edits twice.
+    /// loads it would apply the same edits twice. [`Work::Checkpointed`] is raised only once
+    /// the relay acknowledged the save report (`saved_ack`), so it means exactly that.
     ///
     /// Refused until [`ready_to_type`](Live::ready_to_type) holds and while the join's
     /// catch-up can still replace this replica with the room's snapshot.
@@ -376,8 +424,14 @@ impl<H: Hub> Live<H> {
         let ClientMsg::Submit { local, .. } = &msg else {
             return Err(Error::malformed("client", "a checkpoint must be a submit"));
         };
-        self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false });
+        self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms() });
         self.hub.send(msg)
+    }
+
+    /// How long a checkpoint waits for its ordering and the relay's acknowledgement before it
+    /// is reported as [`Work::CheckpointRaced`]. [`CHECKPOINT_TIMEOUT`] by default.
+    pub fn set_checkpoint_timeout(&mut self, timeout: Duration) {
+        self.checkpoint_timeout = timeout;
     }
 
     /// Undo this replica's last local edit and send it. `false` when there is nothing to undo.
@@ -441,6 +495,7 @@ impl<H: Hub> Live<H> {
         }
 
         let mut work = Vec::new();
+        self.time_out_checkpoint(&mut work);
         for msg in self.hub.poll() {
             if let ServerMsg::Joined { seq, replay_until, fallback, .. } = &msg {
                 self.joined(*seq, *replay_until, *fallback, &mut work);
@@ -507,14 +562,26 @@ impl<H: Hub> Live<H> {
         }
     }
 
-    /// Drop a checkpoint the relay refused. Permanent refusals are told apart from the rest,
-    /// so an app that retries on [`Work::CheckpointRaced`] does not loop on them.
+    /// Drop the checkpoint in flight on a refusal the relay tied to it. Permanent refusals are
+    /// told apart from the rest, so an app that retries on [`Work::CheckpointRaced`] does not
+    /// loop on them.
     fn refuse_checkpoint(&mut self, work: &mut Vec<Work>, detail: &str) {
-        if !refusal_is_permanent(detail) {
-            self.lose_checkpoint(work, "the relay reported an error");
-        } else if self.checkpoint.take().is_some() {
-            log::info!("collab: the relay refused a checkpoint: {detail}");
-            work.push(Work::CheckpointRefused { reason: detail.to_owned() });
+        if refusal_is_permanent(detail) {
+            if self.checkpoint.take().is_some() {
+                log::info!("collab: the relay refused a checkpoint: {detail}");
+                work.push(Work::CheckpointRefused { reason: detail.to_owned() });
+            }
+        } else {
+            self.lose_checkpoint(work, "the relay refused it for now");
+        }
+    }
+
+    /// Give up on a checkpoint that got no answer in time.
+    fn time_out_checkpoint(&mut self, work: &mut Vec<Work>) {
+        let Some(sent_at) = self.checkpoint.as_ref().and_then(|p| p.sent_at) else { return };
+        let Some(now) = now_ms() else { return };
+        if now - sent_at >= self.checkpoint_timeout.as_secs_f64() * 1000.0 {
+            self.lose_checkpoint(work, "no answer came in time");
         }
     }
 
@@ -677,10 +744,26 @@ impl<H: Hub> Live<H> {
         }
         let saved = self.wire.saved_through(seq.saturating_sub(1));
         match self.hub.send(saved) {
-            Ok(()) => work.push(Work::Checkpointed { seq }),
+            // Not done yet: only the relay's acknowledgement moves the baseline.
+            Ok(()) => self.checkpoint = Some(PendingCheckpoint { local, raced: false, ordered: Some(seq), sent_at: now_ms() }),
             Err(e) => {
                 log::warn!("collab: checkpoint {seq} was ordered but the save report never left: {e}");
                 work.push(Work::CheckpointRaced);
+            }
+        }
+    }
+
+    /// The relay answered a save report. Only the answer for the one in flight counts.
+    fn save_answered(&mut self, seq: u64, refusal: Option<&str>, work: &mut Vec<Work>) {
+        if self.checkpoint.as_ref().and_then(PendingCheckpoint::saved_through) != Some(seq) {
+            return;
+        }
+        match refusal {
+            Some(reason) => self.refuse_checkpoint(work, reason),
+            None => {
+                if let Some(ordered) = self.checkpoint.take().and_then(|p| p.ordered) {
+                    work.push(Work::Checkpointed { seq: ordered });
+                }
             }
         }
     }
@@ -759,13 +842,18 @@ impl<H: Hub> Live<H> {
                 self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).map(|p| (p.peer.to_string(), p.display)).collect();
             }
             Effect::Notice { detail } => {
-                // A relay error. It carries no counter, so a checkpoint in flight may be the
-                // submit it refused. Dropping it costs a retry when the error can pass; when
-                // it cannot, the app is told not to retry.
-                self.refuse_checkpoint(work, &detail);
                 log::info!("collab: {detail}");
                 self.notices.push(detail);
             }
+            Effect::SubmitRefused { local, detail } => {
+                // The relay refused one of this client's submits by its counter. It is the
+                // checkpoint's own only while that has not been ordered.
+                if self.checkpoint.as_ref().is_some_and(|p| p.local == local && p.ordered.is_none()) {
+                    self.refuse_checkpoint(work, &detail);
+                }
+            }
+            Effect::SavedAck { seq } => self.save_answered(seq, None, work),
+            Effect::SavedRefused { seq, reason } => self.save_answered(seq, Some(&reason), work),
             Effect::Send { msg } => {
                 if let Err(e) = self.hub.send(msg) {
                     log::warn!("collab: a resync request never left: {e}");

@@ -37,12 +37,62 @@ pub trait Hub {
     fn connected(&self) -> bool;
 }
 
+/// Where a relay URL points a Socket.IO client: the server, and the transport path on it.
+///
+/// A relay mounted under a base path (`COLLABCRAFT_BASE=/craft`) serves Socket.IO at
+/// `/craft/socket.io/`. Apps are given the relay URL as the user sees it, `https://host/craft`,
+/// and a Socket.IO client would read that path as a namespace or as the transport path itself,
+/// so the two are split here once for both hubs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    /// Scheme and authority, `https://host:port`.
+    pub origin: String,
+    /// The transport path, always ending in `/socket.io/`.
+    pub path: String,
+    /// The query string without its `?`, when the URL had one.
+    pub query: Option<String>,
+}
+
+impl Endpoint {
+    /// Split a relay URL. A path already naming `socket.io` is kept as it is; a fragment is
+    /// dropped.
+    #[must_use]
+    pub fn of(url: &str) -> Endpoint {
+        let url = url.split('#').next().unwrap_or(url);
+        let (rest, query) = match url.split_once('?') {
+            Some((rest, query)) => (rest, Some(query.to_owned())),
+            None => (url, None),
+        };
+        let authority_at = rest.find("://").map_or(0, |at| at + 3);
+        let (scheme, after) = rest.split_at(authority_at);
+        let (authority, path) = match after.find('/') {
+            Some(at) => after.split_at(at),
+            None => (after, ""),
+        };
+        let mut path = path.trim_end_matches('/').to_owned();
+        if !path.ends_with("/socket.io") {
+            path.push_str("/socket.io");
+        }
+        path.push('/');
+        Endpoint { origin: format!("{scheme}{authority}"), path, query }
+    }
+
+    /// The one URL a client that takes the transport path inside the URL connects to.
+    #[must_use]
+    pub fn url(&self) -> String {
+        match &self.query {
+            Some(query) => format!("{}{}?{query}", self.origin, self.path),
+            None => format!("{}{}", self.origin, self.path),
+        }
+    }
+}
+
 /// Every event the relay can send.
 ///
 /// Listed explicitly because a Socket.IO client registers one callback per event name, so a hub
 /// has to know the whole set before anything arrives. An event missing from here is an event
 /// nobody is listening for, which looks like a relay that connects and then says nothing.
-pub const EVENTS: [&str; 12] = [
+pub const EVENTS: [&str; 14] = [
     "joined",
     "op",
     "lock_granted",
@@ -55,6 +105,8 @@ pub const EVENTS: [&str; 12] = [
     "frame",
     "ephemeral",
     "error",
+    "saved_ack",
+    "saved_refused",
 ];
 
 /// Encode a client message as the JSON a Socket.IO event carries.

@@ -359,7 +359,7 @@ fn presence_updates_the_roster() {
 #[test]
 fn an_error_is_advisory_and_does_not_disturb_ordering() {
     let mut s = session();
-    let out = s.handle(ServerMsg::Error { doc: DOC.to_owned(), detail: "scope busy".to_owned() });
+    let out = s.handle(ServerMsg::Error { doc: DOC.to_owned(), detail: "scope busy".to_owned(), local: None });
     assert_eq!(out, vec![Effect::Notice { detail: "scope busy".to_owned() }]);
     assert_eq!(s.applied(), 0);
     assert_eq!(s.handle(op(1, "bob", None, "A1")).len(), 1, "ordering continues after a notice");
@@ -401,7 +401,7 @@ fn server_messages_round_trip() {
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::Presence { doc: DOC.to_owned(), roster: Vec::new() },
         ServerMsg::Snapshot { doc: DOC.to_owned(), seq: 9, document: json!({}) },
-        ServerMsg::Error { doc: DOC.to_owned(), detail: "x".to_owned() },
+        ServerMsg::Error { doc: DOC.to_owned(), detail: "x".to_owned(), local: None },
     ];
     for m in msgs {
         let text = serde_json::to_string(&m).expect("encodes");
@@ -502,7 +502,9 @@ fn every_event_name_carries_exactly_one_server_message() {
         ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true, snap: false },
         ServerMsg::Frame { doc: DOC.to_owned(), origin: "bob".to_owned(), payload: "c2lnbmVk".to_owned() },
         ServerMsg::Ephemeral { doc: DOC.to_owned(), origin: "bob".to_owned(), kind: "camera".to_owned(), payload: json!({"eye": [0, 0, 1]}) },
-        ServerMsg::Error { doc: DOC.to_owned(), detail: "refused".to_owned() },
+        ServerMsg::Error { doc: DOC.to_owned(), detail: "refused".to_owned(), local: Some(3) },
+        ServerMsg::SavedAck { doc: DOC.to_owned(), seq: 4 },
+        ServerMsg::SavedRefused { doc: DOC.to_owned(), seq: 4, reason: "no checkpoint follows".to_owned() },
     ];
     let mut seen = Vec::new();
     for msg in msgs {
@@ -533,4 +535,26 @@ fn a_payload_of_the_wrong_shape_for_its_event_is_dropped() {
 #[test]
 fn an_event_name_the_protocol_does_not_have_is_dropped() {
     assert_eq!(receive("nope", json!({"doc": DOC})), None);
+}
+
+/// Round 2b: a relay URL with a base path becomes the Socket.IO path a hub connects to.
+#[test]
+fn a_relay_url_names_its_socket_io_path() {
+    use crate::Endpoint;
+    for (url, origin, path) in [
+        ("https://office.example/craft", "https://office.example", "/craft/socket.io/"),
+        ("https://office.example/craft/", "https://office.example", "/craft/socket.io/"),
+        ("wss://office.example:9444/a/b", "wss://office.example:9444", "/a/b/socket.io/"),
+        ("http://127.0.0.1:9444", "http://127.0.0.1:9444", "/socket.io/"),
+        ("http://127.0.0.1:9444/", "http://127.0.0.1:9444", "/socket.io/"),
+        ("http://host/craft/socket.io/", "http://host", "/craft/socket.io/"),
+        ("http://host/craft#frag", "http://host", "/craft/socket.io/"),
+    ] {
+        let e = Endpoint::of(url);
+        assert_eq!((e.origin.as_str(), e.path.as_str(), e.query.as_deref()), (origin, path, None), "{url}");
+    }
+    // The native hub connects to the one URL with the path inside it.
+    assert_eq!(Endpoint::of("https://office.example/craft").url(), "https://office.example/craft/socket.io/");
+    assert_eq!(Endpoint::of("http://host/craft?x=1").url(), "http://host/craft/socket.io/?x=1");
+    assert_eq!(Endpoint::of("http://host").url(), "http://host/socket.io/");
 }
