@@ -92,8 +92,22 @@ const DEFAULT_BIND: &str = "0.0.0.0:9444";
 /// which refuses real documents, so this is the ceiling the API routes use.
 const MAX_SAVE_BYTES: usize = 256 * 1024 * 1024;
 
+/// The protocol version a peer must name in the handshake.
+const PROTO: &str = "craft-live/1";
+
+/// Default per-scope retained-text cap, overridden by `COLLABCRAFT_TEXT_BYTES`.
+const DEFAULT_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// How often the transport pings. Idle proxies in front of the relay drop a quiet connection
+/// at 100 s, so this stays well under that.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// Shared relay state.
 struct Relay {
+    /// Per-scope cap on retained CRDT text for every room this relay creates.
+    text_cap: usize,
+    /// The ticket `uid` of the one peer allowed to emit `saved`.
+    service_uid: String,
     secret: Vec<u8>,
     bus: Mutex<Bus>,
     /// file id -> room. One lock, because ordering needs a single decision
@@ -117,6 +131,59 @@ struct Handshake {
     /// re-sends it ops it already has.
     #[serde(default)]
     applied: Option<u64>,
+    /// The protocol version the peer speaks. Required: a missing or different value is
+    /// refused with `version mismatch`, so an old client fails loudly instead of misreading
+    /// the relay.
+    #[serde(default)]
+    proto: Option<String>,
+}
+
+/// Whether the handshake names the protocol this relay speaks.
+fn check_proto(handshake: &Handshake) -> Result<(), &'static str> {
+    match handshake.proto.as_deref() {
+        Some(PROTO) => Ok(()),
+        _ => Err("version mismatch"),
+    }
+}
+
+/// `COLLABCRAFT_BASE` as a mount path: empty, or `/something` with no trailing slash.
+fn normalise_base(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if !trimmed.starts_with('/') || trimmed.contains("//") || trimmed.contains(char::is_whitespace) || trimmed.contains(['?', '#', '%']) {
+        return Err(format!("COLLABCRAFT_BASE must look like /craft, got {raw:?}"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Whether this peer may emit the `saved` marker: the service peer, with edit right.
+fn saved_allowed(claims: &Claims, service_uid: &str) -> bool {
+    claims.may_edit() && claims.uid == service_uid
+}
+
+/// Upper bound for `COLLABCRAFT_TEXT_BYTES`.
+const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Parse `COLLABCRAFT_TEXT_BYTES`: empty means the default, 0 is refused, large values clamp.
+fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(DEFAULT_TEXT_BYTES);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => Err("COLLABCRAFT_TEXT_BYTES must be greater than 0"),
+        Ok(n) => Ok(n.min(MAX_TEXT_BYTES)),
+        Err(_) => Err("COLLABCRAFT_TEXT_BYTES must be a number of bytes"),
+    }
+}
+
+impl Relay {
+    /// The room for `key`, created with this relay's text cap if it does not exist yet.
+    fn room<'a>(&self, rooms: &'a mut HashMap<String, Room>, key: &str) -> &'a mut Room {
+        rooms.entry(key.to_owned()).or_insert_with(|| Room::with_text_cap(self.text_cap))
+    }
 }
 
 // ---- payloads, matching craft-collab's proto ------------------------------
@@ -223,14 +290,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(valkey_url = %redact_url(&valkey_url), "bus ready");
 
     let secret_bytes = secret.clone().into_bytes();
-    let relay = Arc::new(Relay { secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
+    let text_cap = parse_text_bytes(&std::env::var("COLLABCRAFT_TEXT_BYTES").unwrap_or_default())?;
+    let service_uid = std::env::var("COLLABCRAFT_SERVICE_UID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "craft_office".to_owned());
+    let base = normalise_base(&std::env::var("COLLABCRAFT_BASE").unwrap_or_default())?;
+    let public_apps = std::env::var("COLLABCRAFT_PUBLIC_APPS").is_ok_and(|v| v.trim() == "1");
+    tracing::info!(text_cap, base = %base, public_apps, "relay options");
+    let relay = Arc::new(Relay { text_cap, service_uid, secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
     // For the health route, which outlives the move into the socket layer.
     let health_relay = relay.clone();
 
     // Cap the transport too. Room::submit refuses an oversized `params` after decoding, and a
     // cap there still means the bytes were read and parsed first. This refuses them at the
     // socket, which is the only place that costs nothing.
-    let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay).build_layer();
+    let (layer, io) = SocketIo::builder()
+        .req_path(format!("{base}/socket.io"))
+        .ping_interval(PING_INTERVAL)
+        .max_payload(MAX_FRAME_BYTES as u64)
+        .with_state(relay).build_layer();
     // ns returns () for the local adapter, so there is nothing to await here.
     io.ns("/", on_connect);
 
@@ -283,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oidc,
         http,
         esign,
+        public_apps,
     });
     // What the deployment is actually on, which is the stored value where
     // there is one. Logged at startup because a deployment reading its own log
@@ -398,6 +475,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(api::web)
         .with_state(app_state);
 
+    // Everything, health and static builds included, lives under the base path when one is
+    // set, so a reverse proxy can forward `/craft` without rewriting anything.
+    let app = if base.is_empty() { app } else { axum::Router::new().nest(&base, app) };
     let app = app.layer(layer);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -414,6 +494,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Admit a peer, or disconnect it.
 async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(relay): State<Arc<Relay>>) {
+    if let Err(detail) = check_proto(&handshake) {
+        tracing::warn!("rejecting a connection: protocol version mismatch");
+        let _ = socket.emit("error", &ErrorMsg { doc: String::new(), detail: detail.to_owned() });
+        let _ = socket.disconnect();
+        return;
+    }
     let now = now_unix();
     let claims = match token::verify(&handshake.token, &relay.secret, now) {
         Ok(c) => c,
@@ -493,7 +579,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
 
     let joined = {
         let mut rooms = relay.rooms.lock().await;
-        let room = rooms.entry(room_key.clone()).or_default();
+        let room = relay.room(&mut rooms, &room_key);
         room.observe_seq(retained_seq);
         match room.join(Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit() }) {
             Ok(()) => {
@@ -628,7 +714,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
                     match current {
                         Ok(Some(still)) if still != claims.pid => {
                             let mut rooms = relay.rooms.lock().await;
-                            rooms.entry(claims.rm.clone()).or_default().record_holder(scope_name.clone(), still.clone());
+                            relay.room(&mut rooms, &claims.rm).record_holder(scope_name.clone(), still.clone());
                             Err(Refusal::Locked { holder: still })
                         }
                         Ok(current_holder) => {
@@ -638,7 +724,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
                             // again.
                             {
                                 let mut rooms = relay.rooms.lock().await;
-                                rooms.entry(claims.rm.clone()).or_default().forget_lock(scope_name);
+                                relay.room(&mut rooms, &claims.rm).forget_lock(scope_name);
                             }
                             if current_holder.is_none() {
                                 // The lease lapsed on its own and nobody holds the scope now.
@@ -691,7 +777,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
 
     let outcome = {
         let mut rooms = relay.rooms.lock().await;
-        let room = rooms.entry(claims.rm.clone()).or_default();
+        let room = relay.room(&mut rooms, &claims.rm);
         room.submit(
             seq,
             Submission {
@@ -773,7 +859,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         Ok(LockOutcome::Granted) => {
             {
                 let mut rooms = relay.rooms.lock().await;
-                rooms.entry(claims.rm.clone()).or_default().record_lock(&claims.pid, msg.scope.clone());
+                relay.room(&mut rooms, &claims.rm).record_lock(&claims.pid, msg.scope.clone());
             }
             let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope }));
             emit_live(
@@ -785,7 +871,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         Ok(LockOutcome::Held { holder }) => {
             {
                 let mut rooms = relay.rooms.lock().await;
-                rooms.entry(claims.rm.clone()).or_default().record_holder(msg.scope.clone(), holder.clone());
+                relay.room(&mut rooms, &claims.rm).record_holder(msg.scope.clone(), holder.clone());
             }
             let _ = socket.emit("lock_denied", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "holder": holder }));
         }
@@ -806,7 +892,7 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): S
     };
     let mirror_released = {
         let mut rooms = relay.rooms.lock().await;
-        rooms.entry(claims.rm.clone()).or_default().unlock(&claims.pid, &msg.scope)
+        relay.room(&mut rooms, &claims.rm).unlock(&claims.pid, &msg.scope)
     };
 
     // A real release on the bus is announced, as before. One where the lease had already
@@ -883,10 +969,30 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
 async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
     let room_name = claims.room();
+    // The saved marker names the join baseline for everybody, so only the service peer may
+    // set it. Nothing about the payload is logged.
+    if msg.kind == room::SAVED_KIND {
+        if !saved_allowed(&claims, &relay.service_uid) {
+            tracing::debug!(room = %claims.rm, "dropping a saved marker from a peer that is not the service");
+            return;
+        }
+        let accepted = {
+            let mut rooms = relay.rooms.lock().await;
+            relay.room(&mut rooms, &claims.rm).remember_saved(&claims.pid, msg.payload.clone())
+        };
+        if accepted {
+            emit_live(
+                socket.to(room_name.clone()),
+                "ephemeral",
+                &serde_json::json!({ "doc": room_name, "origin": claims.pid, "kind": msg.kind, "payload": msg.payload }),
+            );
+        }
+        return;
+    }
 
     let remembered = {
         let mut rooms = relay.rooms.lock().await;
-        rooms.entry(claims.rm.clone()).or_default().remember_ephemeral(&claims.pid, &msg.kind, msg.payload.clone())
+        relay.room(&mut rooms, &claims.rm).remember_ephemeral(&claims.pid, &msg.kind, msg.payload.clone())
     };
     if let Err(refusal) = remembered {
         let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail() });

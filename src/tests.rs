@@ -492,6 +492,7 @@ mod keyed_links {
             hosted: vec!["gridcraft".to_owned(), "wordcraft".to_owned()],
             keyed,
             esign: None,
+            public_apps: false,
         }
     }
 
@@ -1023,6 +1024,7 @@ mod web {
             hosted: hosted.iter().map(|a| (*a).to_owned()).collect(),
             keyed: Policy::decide(None, "https://craft.example.com", None, None),
             esign: None,
+            public_apps: false,
         }
     }
 
@@ -1510,6 +1512,29 @@ mod web {
 
     // ---- the gate, through the handler --------------------------------------
 
+    /// With `COLLABCRAFT_PUBLIC_APPS` on, a static build is served to a visitor with no
+    /// session, under the bare path and under `/apps/`. Off, the same request still goes to
+    /// sign-in. The gate is untouched for every other deployment.
+    #[tokio::test]
+    async fn public_apps_serve_without_session() {
+        let get = |path: &str| axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).expect("a request");
+
+        let mut open = service(Permissions::decide("gridcraft", &[]), env_provider("https://cloud.example.com"), &["gridcraft"]);
+        open.public_apps = true;
+        let open = Arc::new(open);
+        for path in ["/gridcraft/index.html", "/apps/gridcraft/index.html"] {
+            let r = crate::api::web(State(open.clone()), None, get(path)).await;
+            assert_ne!(r.status(), StatusCode::TEMPORARY_REDIRECT, "{path} must not ask a public visitor to sign in");
+            assert_ne!(r.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        let closed = Arc::new(service(Permissions::decide("gridcraft", &[]), env_provider("https://cloud.example.com"), &["gridcraft"]));
+        for path in ["/gridcraft/index.html", "/apps/gridcraft/index.html"] {
+            let r = crate::api::web(State(closed.clone()), None, get(path)).await;
+            assert_eq!(r.status(), StatusCode::TEMPORARY_REDIRECT, "{path} stays behind the session when apps are not public");
+        }
+    }
+
     #[tokio::test]
     async fn the_setup_page_refuses_somebody_outside_the_group() {
         let app = Arc::new(service(Permissions::decide("gridcraft", &[]), admin_settings(), &["gridcraft"]));
@@ -1639,4 +1664,113 @@ fn token_from_php_verifies() {
     assert_eq!(claims.pid, "bob~0a1b2c3d");
     assert!(claims.may_edit());
     assert!(matches!(token::verify(fixture, PHP_SECRET, claims.exp), Err(TokenError::Expired { .. })));
+}
+
+// ---- protocol version, text cap, saved marker -----------------------------
+
+mod relay_proto {
+    use serde_json::json;
+
+    use crate::room::{Room, Submission};
+    use crate::{Handshake, PROTO, check_proto};
+
+    fn handshake(v: serde_json::Value) -> Handshake {
+        serde_json::from_value(v).expect("a handshake")
+    }
+
+    #[test]
+    fn wrong_proto_is_refused() {
+        assert_eq!(PROTO, "craft-live/1");
+        assert!(check_proto(&handshake(json!({"token": "t", "proto": "craft-live/1"}))).is_ok());
+        for bad in [json!({"token": "t"}), json!({"token": "t", "proto": null}), json!({"token": "t", "proto": "craft-live/2"}), json!({"token": "t", "proto": ""})] {
+            assert_eq!(check_proto(&handshake(bad.clone())), Err("version mismatch"), "{bad}");
+        }
+    }
+
+    fn fill(cap: usize, total: usize) -> Room {
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        let chunk = "x".repeat(1024 * 1024);
+        for i in 0..total {
+            let sub = Submission {
+                peer_id: "alice".to_owned(),
+                may_edit: true,
+                command: "crdt.text".to_owned(),
+                params: json!({"scope": "doc", "ops": [{"blob": chunk}]}),
+                scope: None,
+                local: None,
+            };
+            r.submit(i as u64 + 1, sub).expect("accepted into the history");
+        }
+        r
+    }
+
+    #[test]
+    fn text_log_cap_follows_config() {
+        const MIB: usize = 1024 * 1024;
+        let small = fill(16 * MIB, 17);
+        assert!(!small.texts().get("doc").expect("scope").complete(), "17 MiB does not fit a 16 MiB cap");
+        let big = fill(32 * MIB, 17);
+        let log = big.texts().get("doc").expect("scope");
+        assert!(log.complete(), "17 MiB fits a 32 MiB cap");
+        assert_eq!(log.ops().len(), 17);
+    }
+
+    #[test]
+    fn saved_ephemeral_is_replayed_to_joiner() {
+        let mut r = Room::default();
+        r.remember_ephemeral("alice", "saved", json!({"seq": 7, "etag": "abc"})).expect("ok");
+        // The saver leaves; a later joiner still learns which file version is the baseline.
+        r.leave("alice");
+        let state = r.ephemeral();
+        assert!(state.iter().any(|(_, kind, v)| kind == "saved" && v == &json!({"seq": 7, "etag": "abc"})), "{state:?}");
+    }
+
+    #[test]
+    fn saved_marker_is_validated() {
+        let mut r = Room::default();
+        assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "a"})));
+        assert!(!r.remember_saved("svc", json!({"seq": 4, "etag": "b"})), "a lower seq is ignored");
+        assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "c"})));
+        for bad in [json!({"seq": "6", "etag": "x"}), json!({"seq": 6}), json!({"seq": 6, "etag": 1}), json!({"seq": -1, "etag": "x"}), json!("x"), json!({"seq": 9, "etag": "e".repeat(2000)})] {
+            assert!(!r.remember_saved("svc", bad.clone()), "{bad}");
+        }
+        let kept = r.ephemeral();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].2, json!({"seq": 5, "etag": "c"}));
+    }
+
+    fn claims_for(uid: &str, perm: u32) -> crate::token::Claims {
+        let payload = json!({ "rm": "r", "uid": uid, "dsp": uid, "perm": perm, "exp": super::NOW + 300, "pid": "p" });
+        crate::token::verify(&super::mint(payload, super::SECRET), super::SECRET, super::NOW).expect("verifies")
+    }
+
+    #[test]
+    fn only_the_service_peer_may_emit_saved() {
+        use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
+        use crate::saved_allowed;
+        assert!(saved_allowed(&claims_for("craft_office", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"));
+        assert!(!saved_allowed(&claims_for("craft_office", PERMISSION_READ), "craft_office"), "a read-only peer is refused");
+        assert!(!saved_allowed(&claims_for("alice", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"), "a non-service editor is refused");
+    }
+
+    #[test]
+    fn text_bytes_config_is_bounded() {
+        use crate::parse_text_bytes;
+        assert_eq!(parse_text_bytes(""), Ok(16 * 1024 * 1024));
+        assert!(parse_text_bytes("0").is_err());
+        assert!(parse_text_bytes("abc").is_err());
+        assert_eq!(parse_text_bytes("999999999999"), Ok(64 * 1024 * 1024));
+        assert_eq!(parse_text_bytes("1048576"), Ok(1048576));
+    }
+
+    #[test]
+    fn base_path_rejects_odd_characters() {
+        use crate::normalise_base;
+        assert_eq!(normalise_base("/craft/"), Ok("/craft".to_owned()));
+        assert_eq!(normalise_base(""), Ok(String::new()));
+        for bad in ["craft", "/a?b", "/a#b", "/a%2fb", "//x"] {
+            assert!(normalise_base(bad).is_err(), "{bad}");
+        }
+    }
 }

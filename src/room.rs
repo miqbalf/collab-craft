@@ -237,9 +237,37 @@ pub struct Room {
     text_bytes: usize,
     /// peer -> kind -> the newest value that peer sent.
     ephemeral: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// The newest `saved` marker from anyone, `(peer, value)`. Kept apart from
+    /// [`Room::ephemeral`] because it says which file version is the join baseline, and that
+    /// stays true after the peer that saved has left.
+    saved: Option<(String, serde_json::Value)>,
+    /// Per-scope retained-text cap. `None` means [`TEXT_BYTES`].
+    text_cap: Option<usize>,
 }
 
+/// The ephemeral kind that records a save: `{seq, etag}`.
+pub const SAVED_KIND: &str = "saved";
+
+/// Largest `saved` payload the relay keeps.
+pub const SAVED_MAX_BYTES: usize = 1024;
+
 impl Room {
+    /// A room whose retained CRDT text may reach `cap` bytes per scope.
+    ///
+    /// The room-wide budget is [`TOTAL_TEXT_BYTES`], or `cap` if that is larger, so a cap above
+    /// the default is not defeated by the total.
+    pub fn with_text_cap(cap: usize) -> Room {
+        Room { text_cap: Some(cap), ..Room::default() }
+    }
+
+    fn scope_cap(&self) -> usize {
+        self.text_cap.unwrap_or(TEXT_BYTES)
+    }
+
+    fn total_cap(&self) -> usize {
+        TOTAL_TEXT_BYTES.max(self.scope_cap())
+    }
+
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -304,9 +332,30 @@ impl Room {
             .iter()
             .flat_map(|(peer, kinds)| kinds.iter().map(move |(kind, value)| (peer.clone(), kind.clone(), value.clone())))
             .collect();
+        if let Some((peer, value)) = &self.saved {
+            out.push((peer.clone(), SAVED_KIND.to_owned(), value.clone()));
+        }
         // Sorted so a join payload does not depend on hash order, which makes it testable.
         out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         out
+    }
+
+    /// Record a `saved` marker. Returns whether it was accepted.
+    ///
+    /// The payload must be `{seq: u64, etag: string}` and at most [`SAVED_MAX_BYTES`]. A `seq`
+    /// lower than the stored one is ignored, so a late or replayed marker cannot move the
+    /// baseline back.
+    pub fn remember_saved(&mut self, peer_id: &str, value: serde_json::Value) -> bool {
+        let Some(seq) = value.get("seq").and_then(serde_json::Value::as_u64) else { return false };
+        if !value.get("etag").is_some_and(serde_json::Value::is_string) || value_bytes(&value) > SAVED_MAX_BYTES {
+            return false;
+        }
+        let stored = self.saved.as_ref().and_then(|(_, v)| v.get("seq")).and_then(serde_json::Value::as_u64);
+        if stored.is_some_and(|stored| seq < stored) {
+            return false;
+        }
+        self.saved = Some((peer_id.to_owned(), value));
+        true
     }
 
     /// Record one peer's newest value for one kind.
@@ -318,6 +367,10 @@ impl Room {
         let bytes = value_bytes(&value);
         if bytes > TEXT_BYTES {
             return Err(Refusal::TooLarge { bytes });
+        }
+        if kind == SAVED_KIND {
+            self.remember_saved(peer_id, value);
+            return Ok(());
         }
         let kinds = self.ephemeral.entry(peer_id.to_owned()).or_default();
         if !kinds.contains_key(kind) && kinds.len() >= MAX_EPHEMERAL_KINDS {
@@ -433,6 +486,7 @@ impl Room {
         if !self.texts.contains_key(scope) && self.texts.len() >= MAX_SCOPES {
             return;
         }
+        let (cap, total) = (self.scope_cap(), self.total_cap());
         let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog {
             ops: Vec::new(),
             seqs: Vec::new(),
@@ -445,7 +499,7 @@ impl Room {
         // the room as a whole may hold. `self.text_bytes` still counts this scope's current
         // bytes, which is why the comparison is against the total after adding `bytes` rather
         // than before.
-        if log.bytes + bytes > TEXT_BYTES || self.text_bytes + bytes > TOTAL_TEXT_BYTES {
+        if log.bytes + bytes > cap || self.text_bytes + bytes > total {
             // Dropping the oldest would leave a replay that cannot be applied, because later
             // operations anchor on characters the dropped ones created. Saying so is the only
             // honest answer.

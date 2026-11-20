@@ -875,7 +875,20 @@ fn percent_decode(raw: &str) -> String {
 ///
 /// Anything that is not an app directory is served unconditionally. Shared
 /// assets and the index have nothing to gate.
-pub async fn web(State(app): State<Arc<App>>, session: Option<Session>, req: axum::extract::Request) -> Response {
+pub async fn web(State(app): State<Arc<App>>, session: Option<Session>, mut req: axum::extract::Request) -> Response {
+    // `/apps/<app>/...` is the same build as `/<app>/...`, unless a build is itself named
+    // `apps`. The prefix is dropped from the request too, so the file service resolves it.
+    if !app.is_app("apps")
+        && let Some(rest) = req.uri().path().strip_prefix("/apps/")
+    {
+        let rewritten = match req.uri().query() {
+            Some(q) => format!("/{rest}?{q}"),
+            None => format!("/{rest}"),
+        };
+        if let Ok(uri) = rewritten.parse::<axum::http::Uri>() {
+            *req.uri_mut() = uri;
+        }
+    }
     let path = req.uri().path().trim_start_matches('/').to_owned();
     // Gate on the DECODED first segment. ServeDir percent-decodes a path before
     // it resolves a file, so `/%67ridcraft/index.html` reaches the disk as
@@ -884,7 +897,7 @@ pub async fn web(State(app): State<Arc<App>>, session: Option<Session>, req: axu
     // it exists to stop. Decoding here makes the check see what gets served.
     let first = percent_decode(&path).split('/').next().unwrap_or_default().to_owned();
 
-    if app.is_app(&first) {
+    if app.is_app(&first) && !app.public_apps {
         let Some(session) = session else {
             // Send them to sign in rather than refusing flatly: an anonymous
             // visitor has not been denied anything yet.
@@ -916,7 +929,9 @@ pub async fn web(State(app): State<Arc<App>>, session: Option<Session>, req: axu
             }
             response
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { code: "static", detail: e.to_string() })).into_response(),
+        // The static service's error type is `Infallible`; an empty match says so to the
+        // compiler instead of formatting a value that cannot exist.
+        Err(never) => match never {},
     }
 }
 

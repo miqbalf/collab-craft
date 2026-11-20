@@ -25,12 +25,18 @@ RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends git ca-certificates pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# Optional cap on parallel rustc jobs, for a shared build host.
+# An ARG reaches RUN as an environment variable, and an empty CARGO_BUILD_JOBS is not a number.
+# The build line unsets it when empty, so cargo keeps its own default (all cores).
+ARG CARGO_BUILD_JOBS=
+
 COPY . .
 
 # No Cargo.lock is committed, so --locked fails on a first build. The fallback
 # resolves and then builds. The first attempt stays for the case where a lock
 # file is present and should be honoured exactly.
-RUN cargo build --release --locked 2>/dev/null || cargo build --release
+RUN [ -n "$CARGO_BUILD_JOBS" ] || unset CARGO_BUILD_JOBS; \
+    cargo build --release --locked 2>/dev/null || cargo build --release
 
 FROM debian:13-slim
 # libssl3 for the runtime side of native-tls, ca-certificates so the identity
