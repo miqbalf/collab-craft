@@ -1692,6 +1692,59 @@ mod relay_proto {
         }
     }
 
+    fn submit(r: &mut Room, seq: u64, command: &str, params: serde_json::Value) -> Result<(), crate::room::Refusal> {
+        let sub = Submission { peer_id: "alice".to_owned(), may_edit: true, command: command.to_owned(), params, scope: None, local: Some(seq) };
+        r.submit(seq, sub).map(|_| ())
+    }
+
+    fn snapshot_of(bytes: usize) -> serde_json::Value {
+        json!({"scope": "doc", "snap": true, "ops": ["A".repeat(bytes)]})
+    }
+
+    /// Round 3: a snapshot of about 2 MiB, far past the old 1 MiB transport limit, is carried
+    /// and retained at the default cap, so its save is accepted.
+    #[test]
+    fn a_two_mib_snapshot_checkpoints_at_the_default_cap() {
+        let cap = crate::DEFAULT_TEXT_BYTES;
+        assert!(crate::transport_cap(cap) > cap, "the transport carries a snapshot as large as the cap");
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        submit(&mut r, 1, "crdt.text", json!({"scope": "doc", "ops": ["edit"]})).expect("an edit");
+        submit(&mut r, 2, "crdt.text", snapshot_of(2 << 20)).expect("a 2 MiB snapshot");
+        assert_eq!(r.checkpoint(1), Ok(()));
+        assert_eq!(r.saved_seq(), 1);
+    }
+
+    /// Round 3: a snapshot past the cap is ordered but not retained, and its save is refused
+    /// with a refusal the client reads as permanent, so the saver does not retry forever.
+    #[test]
+    fn a_snapshot_over_the_cap_is_refused_as_permanent() {
+        let mut r = Room::with_text_cap(1 << 20);
+        r.join(super::peer("alice", true)).expect("joins");
+        submit(&mut r, 1, "crdt.text", snapshot_of(3 << 19)).expect("ordered all the same");
+        let refusal = r.checkpoint(0).expect_err("never retained");
+        assert!(matches!(refusal, crate::room::Refusal::TooLargeToRetain { .. }), "{refusal:?}");
+        assert!(craft_collab::refusal_is_permanent(&refusal.detail()), "{}", refusal.detail());
+        assert!(r.texts().get("doc").is_none_or(|log| log.complete()), "nothing else was lost");
+    }
+
+    /// Round 3: a scope that has filled towards its cap still takes a snapshot that fits on
+    /// its own, because the save after it is what shrinks the scope again.
+    #[test]
+    fn a_full_scope_still_takes_a_snapshot_and_shrinks_on_save() {
+        let cap = 1 << 20;
+        let mut r = Room::with_text_cap(cap);
+        r.join(super::peer("alice", true)).expect("joins");
+        let blob = "e".repeat(cap / 4);
+        for seq in 1..=3 {
+            submit(&mut r, seq, "crdt.text", json!({"scope": "doc", "ops": [blob]})).expect("an edit");
+        }
+        submit(&mut r, 4, "crdt.text", snapshot_of(cap / 2)).expect("a snapshot");
+        assert!(r.texts()["doc"].complete(), "the snapshot did not overflow the scope");
+        assert_eq!(r.checkpoint(3), Ok(()));
+        assert_eq!(r.texts()["doc"].ops().len(), 1, "only the snapshot is kept");
+    }
+
     /// The client hubs name the version this relay checks for.
     #[test]
     fn the_client_speaks_this_relays_protocol() {
@@ -1705,6 +1758,7 @@ mod relay_proto {
         for permanent in [Refusal::ReadOnly, Refusal::TooLarge { bytes: 3 << 20 }] {
             assert!(craft_collab::refusal_is_permanent(&permanent.detail()), "{}", permanent.detail());
         }
+        assert!(craft_collab::refusal_is_permanent(&Refusal::TooLargeToRetain { bytes: 17 << 20 }.detail()));
         for passing in [Refusal::Locked { holder: "bob".to_owned() }, Refusal::NotACheckpoint { seq: 4 }] {
             assert!(!craft_collab::refusal_is_permanent(&passing.detail()), "{}", passing.detail());
         }

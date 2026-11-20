@@ -559,6 +559,7 @@ fn joined(peer: &str, space: u32) -> ServerMsg {
         locks: Vec::new(),
         replay_until: None,
         fallback: false,
+        text_cap: None,
     }
 }
 
@@ -748,7 +749,17 @@ fn a_snapshot_after_the_first_op_is_an_ordinary_update() {
 // ---- fix round 1 -------------------------------------------------------------------------
 
 fn joined_at(peer: &str, space: u32, seq: u64, replay_until: Option<u64>) -> ServerMsg {
-    ServerMsg::Joined { doc: "d".to_owned(), peer: peer.to_owned(), seq, space, roster: Vec::new(), locks: Vec::new(), replay_until, fallback: false }
+    ServerMsg::Joined {
+        doc: "d".to_owned(),
+        peer: peer.to_owned(),
+        seq,
+        space,
+        roster: Vec::new(),
+        locks: Vec::new(),
+        replay_until,
+        fallback: false,
+        text_cap: None,
+    }
 }
 
 fn wire(up: &[u8]) -> Value {
@@ -962,6 +973,7 @@ fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
         locks: Vec::new(),
         replay_until: Some(seq),
         fallback: true,
+        text_cap: None,
     }
 }
 
@@ -1191,4 +1203,115 @@ fn an_op_that_reaches_the_socket_before_joined_lands_once() {
     s.handle(op(3, "peer", Some(1), json!({})));
     s.handle(op(5, "peer", Some(2), json!({})));
     assert_eq!(applies(&s.handle(joined_at("me", 4, 4, Some(4)))), vec![5]);
+}
+
+// ---- fix round 3 -------------------------------------------------------------------------
+
+/// Round 3, 2: an older relay (no `replay_until`) that falls back to text ops does not say so.
+/// The text ops end its catch-up: a checkpoint is allowed after them, and a peer's snapshot
+/// next is an ordinary update even for a replica that typed.
+#[test]
+fn an_old_relay_fallback_ends_its_catch_up_with_the_text_ops() {
+    let mut room = replica(&sample(), 7);
+    let u = room.insert_text(1, 0, "r", &Map::new()).unwrap();
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.extend([joined_at("c", 3, 5, None), text_ops(json!([wire(&u)]), false)]);
+    live.pump();
+    live.checkpoint().unwrap();
+    live.edit(|d| d.insert_text(4, 0, "mine ", &Map::new())).unwrap();
+    let mut peer = replica(&sample(), 2);
+    peer.apply(&u).unwrap();
+    peer.insert_text(1, 0, "p", &Map::new()).unwrap();
+    let snap = serde_json::to_value(TextPayload::snapshot(&peer.state())).unwrap();
+    hub.0.borrow_mut().inbox.push(op(6, "peer", Some(1), snap));
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::Reset | Work::TextIncomplete { .. })), "{work:?}");
+    assert!(live.ready_to_type());
+    assert_eq!(live.doc().unwrap().block(1).unwrap().text, "prTitle");
+    assert_eq!(live.doc().unwrap().block(4).unwrap().text, "mine last paragraph");
+}
+
+/// Round 3, 3: a relay that says how large a snapshot it retains lets the saver refuse a
+/// larger one itself, permanently, instead of sending what the transport would drop.
+#[test]
+fn a_snapshot_over_the_advertised_cap_is_refused_before_sending() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    let mut join = joined_at("alice", 1, 0, Some(0));
+    if let ServerMsg::Joined { text_cap, .. } = &mut join {
+        *text_cap = Some(64);
+    }
+    hub.0.borrow_mut().inbox.push(join);
+    live.pump();
+    let refused = live.checkpoint();
+    assert!(matches!(&refused, Err(craft_collab::Error::Refused(reason)) if craft_collab::refusal_is_permanent(reason)), "{refused:?}");
+    assert!(hub.0.borrow().sent.is_empty(), "nothing was sent");
+    assert!(live.pump().is_empty(), "and nothing is pending");
+}
+
+/// Round 3, 4: the checkpoint hands back the state it snapshotted, and a document restored
+/// from it is what the saver writes even when it typed since.
+#[test]
+fn checkpoint_returns_the_state_it_sent() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.edit(|d| d.insert_text(1, 0, "saved ", &Map::new())).unwrap();
+    let state = live.checkpoint().unwrap();
+    let (_, params) = last_submit(&hub);
+    assert_eq!(bytes_of(&params), vec![state.clone()], "the bytes returned are the ones sent");
+    live.edit(|d| d.insert_text(1, 0, "later ", &Map::new())).unwrap();
+    let file = LiveDoc::from_state(&state).unwrap();
+    assert_eq!(file.block(1).unwrap().text, "saved Title");
+    assert_eq!(live.doc().unwrap().block(1).unwrap().text, "later saved Title");
+}
+
+/// Round 3, 5: the timeout is checked after the pump's messages, so an answer that arrived
+/// is never beaten by the timer.
+#[test]
+fn an_answer_in_the_same_pump_beats_the_timeout() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.checkpoint().unwrap();
+    let (local, params) = last_submit(&hub);
+    live.set_checkpoint_timeout(std::time::Duration::ZERO);
+    hub.0.borrow_mut().inbox.extend([op(1, "alice", Some(local), params), saved_ack(0)]);
+    let work = live.pump();
+    assert!(matches!(work.as_slice(), [Work::Checkpointed { seq: 1 }]), "{work:?}");
+}
+
+/// Round 3, 7: on the marked fallback a live op can arrive before the file is loaded and
+/// before the text ops. Seeding applies it to the file replica the text ops then replace, so
+/// it must survive the restart too.
+#[test]
+fn a_held_op_survives_a_restart_after_seeding() {
+    let mut worker = replica(&sample(), 9);
+    let mut peer = replica(&sample(), 2);
+    let u1 = peer.insert_text(2, 0, "¡", &Map::new()).unwrap();
+    worker.apply(&u1).unwrap();
+    let saved_file = file_of(&worker);
+    let snap = worker.state();
+    let live_edit = serde_json::to_value(TextPayload::new(&peer.insert_text(4, 0, ">", &Map::new()).unwrap())).unwrap();
+    for up in bytes_of(&live_edit) {
+        worker.apply(&up).unwrap();
+    }
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), op(6, "peer", Some(2), live_edit)]);
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::SeedWanted { .. })), "{work:?}");
+    live.seed(&saved_file).unwrap();
+    hub.0.borrow_mut().inbox.push(text_ops(json!([wire(&snap)]), true));
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+    assert_eq!(live.doc().unwrap().block(4).unwrap().text, ">last paragraph");
+    assert_same(&worker, live.doc().unwrap(), &whole(&worker));
 }

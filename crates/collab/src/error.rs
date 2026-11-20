@@ -11,6 +11,11 @@ pub enum Error {
     /// A payload did not parse as a protocol message.
     #[error("malformed {direction} message: {detail}")]
     Malformed { direction: &'static str, detail: String },
+
+    /// Refused for a reason a retry does not change, in the relay's own words. The same
+    /// meaning as [`crate::Work::CheckpointRefused`], decided here before anything was sent.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl Error {

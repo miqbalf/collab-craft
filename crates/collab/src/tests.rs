@@ -17,6 +17,7 @@ fn joined(seq: u64) -> ServerMsg {
         locks: Vec::new(),
         replay_until: None,
         fallback: false,
+        text_cap: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn a_join_sorts_existing_locks_into_mine_and_theirs() {
         locks: vec![LockState { scope: "A1".to_owned(), holder: "me".to_owned() }, LockState { scope: "B2".to_owned(), holder: "bob".to_owned() }],
         replay_until: None,
         fallback: false,
+        text_cap: None,
     });
     assert!(s.holds("A1"), "a lock already held by us must be recognised as ours");
     assert!(!s.holds("B2"));
@@ -148,6 +150,7 @@ fn the_granted_id_space_arrives_as_an_effect() {
         locks: Vec::new(),
         replay_until: None,
         fallback: false,
+        text_cap: None,
     });
     assert_eq!(old_relay.space(), None);
     assert!(!effects.iter().any(|e| matches!(e, Effect::Space { .. })));

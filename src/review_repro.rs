@@ -50,6 +50,7 @@ fn joined(doc: &str, me: &str, seq: u64) -> craft_collab::ServerMsg {
         locks: vec![],
         replay_until: None,
         fallback: false,
+        text_cap: None,
     }
 }
 
@@ -255,7 +256,7 @@ mod e2e {
     use tokio::sync::Mutex;
 
     use super::SECRET;
-    use crate::{MAX_FRAME_BYTES, Relay, bus::Bus, on_connect, token};
+    use crate::{Relay, bus::Bus, on_connect, token};
 
     struct Harness {
         relay: Arc<Relay>,
@@ -273,8 +274,9 @@ mod e2e {
             secret: SECRET.to_vec(),
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
+            gates: Default::default(),
         });
-        let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
+        let (layer, io) = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -83,6 +83,31 @@ use room::{Op, Peer, Refusal, Room, Submission, is_crdt_command};
 ///
 /// Frames are passed through unread, so nothing downstream can judge the size. The relay has to.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// What a Socket.IO packet carries besides its payload: the event name, the document, the
+/// submit's own fields.
+const FRAME_HEADROOM: usize = 64 * 1024;
+
+/// The largest Socket.IO payload the transport accepts, on every transport.
+///
+/// A checkpoint snapshot is one submit carrying a whole document, retained for joiners up to
+/// the per-scope text cap, so the transport has to carry one that large or saving a large
+/// document would fail at the socket, where the client cannot tell why. Frames keep their own
+/// smaller bound (`MAX_FRAME_BYTES`) and other commands the room's (`room::HISTORY_BYTES`),
+/// both checked after decoding.
+fn transport_cap(text_cap: usize) -> usize {
+    text_cap.max(MAX_FRAME_BYTES).saturating_add(FRAME_HEADROOM)
+}
+
+/// Apply [`transport_cap`] to every transport limit Socket.IO has.
+///
+/// `max_payload` bounds only an HTTP long-polling body. A WebSocket message has its own two
+/// limits, which default to 16 MiB a frame and 64 MiB a message, so a polling client was held
+/// to 1 MiB while a WebSocket one was not. All three now say the same thing.
+fn sized(builder: socketioxide::SocketIoBuilder, text_cap: usize) -> socketioxide::SocketIoBuilder {
+    let cap = transport_cap(text_cap);
+    builder.max_payload(cap as u64).ws_max_message_size(cap).ws_max_frame_size(cap)
+}
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -112,8 +137,11 @@ struct Relay {
     bus: Mutex<Bus>,
     /// file id -> room. One lock, because ordering needs a single decision
     /// point and a per-room lock would not make the hot path meaningfully
-    /// cheaper at this scale.
+    /// cheaper at this scale. Held only for room bookkeeping, never while a payload is
+    /// serialized onto a socket.
     rooms: Mutex<HashMap<String, Room>>,
+    /// file id -> that room's broadcast gate. See [`Relay::gate`].
+    gates: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// What a peer sends in the Socket.IO handshake.
@@ -180,6 +208,26 @@ fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
 }
 
 impl Relay {
+    /// The gate that orders a room's broadcasts against its joins.
+    ///
+    /// A submit holds it from recording its op to broadcasting it, and a join from reading
+    /// its replay to joining the broadcast room. So an op is either in a joiner's replay or
+    /// broadcast after the joiner is in the room and has been sent `joined`, and the long
+    /// part, serialising a large replay onto the socket, blocks only that room rather than
+    /// the global [`Relay::rooms`] lock.
+    fn gate(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.gates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(gates.entry(key.to_owned()).or_default())
+    }
+
+    /// Drop a room's gate once nobody holds or waits on it.
+    fn forget_gate(&self, key: &str) {
+        let mut gates = self.gates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1) {
+            gates.remove(key);
+        }
+    }
+
     /// The room for `key`, created with this relay's text cap if it does not exist yet.
     fn room<'a>(&self, rooms: &'a mut HashMap<String, Room>, key: &str) -> &'a mut Room {
         rooms.entry(key.to_owned()).or_insert_with(|| Room::with_text_cap(self.text_cap))
@@ -248,6 +296,9 @@ struct JoinedMsg<'a> {
     /// The catch-up is the `text_ops` that follow, not an ordered replay.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     fallback: bool,
+    /// The largest checkpoint snapshot, in wire bytes, this relay retains for a joiner, so a
+    /// saver can refuse a larger one itself rather than have the transport drop it.
+    text_cap: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,19 +352,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = normalise_base(&std::env::var("COLLABCRAFT_BASE").unwrap_or_default())?;
     let public_apps = std::env::var("COLLABCRAFT_PUBLIC_APPS").is_ok_and(|v| v.trim() == "1");
     tracing::info!(text_cap, base = %base, public_apps, "relay options");
-    let relay = Arc::new(Relay { text_cap, service_uid, secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
+    let relay = Arc::new(Relay {
+        text_cap,
+        service_uid,
+        secret: secret_bytes.clone(),
+        bus: Mutex::new(bus),
+        rooms: Mutex::new(HashMap::new()),
+        gates: std::sync::Mutex::new(HashMap::new()),
+    });
     // For the health route, which outlives the move into the socket layer.
     let health_relay = relay.clone();
 
     // Cap the transport too. Room::submit refuses an oversized `params` after decoding, and a
     // cap there still means the bytes were read and parsed first. This refuses them at the
-    // socket, which is the only place that costs nothing.
-    let (layer, io) = SocketIo::builder()
-        .req_path(format!("{base}/socket.io"))
-        .ping_interval(PING_INTERVAL)
-        .max_payload(MAX_FRAME_BYTES as u64)
-        .with_state(relay)
-        .build_layer();
+    // socket, which is the only place that costs nothing. Sized for the largest snapshot the
+    // rooms retain; see `transport_cap`.
+    let (layer, io) =
+        sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).ping_interval(PING_INTERVAL).with_state(relay).build_layer();
     // ns returns () for the local adapter, so there is nothing to await here.
     io.ns("/", on_connect);
 
@@ -586,10 +641,13 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         bus.current_seq(&room_key).await.unwrap_or(0)
     };
 
-    // Held until the replay is sent. An op is recorded in the room under this lock and
-    // broadcast after it, so every op is either in this replay (and maybe broadcast again,
-    // which the client drops by its sequence) or ordered after it and broadcast to a socket
-    // that has already joined and been sent `joined`. None is lost, none lands twice.
+    // The room's gate is held until the socket has joined the broadcast room, after the
+    // replay. A submit holds it from recording its op to broadcasting it, so every op is
+    // either in this replay (and maybe broadcast again, which the client drops by its
+    // sequence) or broadcast after this socket joined and was sent `joined`. None is lost,
+    // none lands twice. The global rooms lock is released before anything is serialised.
+    let gate = relay.gate(&room_key);
+    let ordered = gate.lock().await;
     let mut rooms = relay.rooms.lock().await;
     let joined = {
         let room = relay.room(&mut rooms, &room_key);
@@ -632,8 +690,9 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         }
     };
 
+    drop(rooms);
     let Some((seq, replay, texts, roster, ephemeral)) = joined else {
-        drop(rooms);
+        drop(ordered);
         tracing::warn!(room = %room_key, "refusing a peer: the document is full");
         let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: Refusal::Full.detail(), local: None });
         let _ = socket.disconnect();
@@ -659,6 +718,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             locks: locks.iter().map(|(s, h)| LockEntry { scope: s.clone(), holder: h.clone() }).collect(),
             replay_until: replay.last().map_or(seq, |op| op.seq),
             fallback: !texts.is_empty(),
+            text_cap: relay.text_cap,
         },
     );
 
@@ -678,7 +738,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             socket.emit("text_ops", &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": ops, "complete": complete, "snap": snap }));
     }
     socket.join(room_name.clone());
-    drop(rooms);
+    drop(ordered);
 
     // And on where everybody is, so somebody arriving late does not have to wait for each
     // person to move before their marker appears.
@@ -794,6 +854,9 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         }
     };
 
+    // Held until the op is broadcast. See `Relay::gate`.
+    let gate = relay.gate(&claims.rm);
+    let _ordered = gate.lock().await;
     let outcome = {
         let mut rooms = relay.rooms.lock().await;
         let room = relay.room(&mut rooms, &claims.rm);
@@ -1084,6 +1147,7 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
             // Valkey, so a later peer continues from where this one left off
             // rather than starting again at 1.
             rooms.remove(&claims.rm);
+            relay.forget_gate(&claims.rm);
         }
         (dropped, roster, empty)
     };

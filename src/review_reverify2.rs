@@ -38,6 +38,7 @@ mod unit {
             locks: vec![],
             replay_until: None,
             fallback: false,
+            text_cap: None,
         });
         let mut fx = Vec::new();
         for seq in 4..=100u64 {
@@ -99,7 +100,7 @@ mod e2e {
     use socketioxide::SocketIo;
     use tokio::sync::Mutex;
 
-    use crate::{MAX_FRAME_BYTES, Relay, bus::Bus, on_connect, token};
+    use crate::{Relay, bus::Bus, on_connect, token};
 
     const SECRET: &[u8] = b"a-shared-secret-at-least-32-chars-long";
 
@@ -114,6 +115,11 @@ mod e2e {
 
     /// The relay with Socket.IO mounted under `base`, as `COLLABCRAFT_BASE` mounts it.
     async fn start_under(base: &str) -> Option<Harness> {
+        start_with(base, crate::room::TEXT_BYTES).await
+    }
+
+    /// The relay as `main` builds it for a per-scope text cap of `text_cap`.
+    async fn start_with(base: &str, text_cap: usize) -> Option<Harness> {
         // Unlike review_reverify.rs's harness, nothing in this file reaches Valkey directly
         // (no lease-expiry fault injection here), so the URL is read only to gate on its
         // presence and is not kept.
@@ -121,14 +127,14 @@ mod e2e {
         let mut bus = Bus::connect(&valkey).await.expect("valkey");
         bus.check_writable().await.expect("writable");
         let relay = Arc::new(Relay {
-            text_cap: crate::room::TEXT_BYTES,
+            text_cap,
             service_uid: "craft_office".to_owned(),
             secret: SECRET.to_vec(),
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
+            gates: Default::default(),
         });
-        let (layer, io) =
-            SocketIo::builder().req_path(format!("{base}/socket.io")).max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
+        let (layer, io) = crate::sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -418,5 +424,34 @@ mod e2e {
         a.insert(5, "!");
         assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
         assert_eq!(h.relay.rooms.lock().await.get(&room).map(|r| r.saved_seq()), Some(1));
+    }
+
+    /// Round 3: a snapshot of about 2 MiB goes through the transport and is acknowledged at
+    /// the default text cap, with every transport limit sized from that cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_two_mib_snapshot_checkpoints_at_the_default_cap() {
+        let Some(h) = start_with("", crate::DEFAULT_TEXT_BYTES).await else { return };
+        let room = unique_room("big-snap");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let file = "ab".repeat(800 * 1024);
+        let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), &file).await;
+        a.insert(0, "!");
+        assert!(a.save().await, "a large checkpoint was not acknowledged: {:?}", a.work);
+        assert_eq!(h.relay.rooms.lock().await.get(&room).map(|r| r.saved_seq()), Some(1));
+    }
+
+    /// Round 3: a snapshot past the relay's text cap is refused for good before it is sent,
+    /// so a saver does not loop on retries the transport would drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_a_snapshot_over_the_cap_is_refused_not_retried() {
+        let Some(h) = start_with("", 1 << 20).await else { return };
+        let room = unique_room("over-cap");
+        let t = token::sign_at(SECRET, &room, "alice", "alice", true, "alice", now()).unwrap();
+        let file = "ab".repeat(600 * 1024);
+        let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), &file).await;
+        let refused = a.live.checkpoint();
+        assert!(matches!(&refused, Err(craft_collab::Error::Refused(reason)) if craft_collab::refusal_is_permanent(reason)), "{refused:?}");
     }
 }

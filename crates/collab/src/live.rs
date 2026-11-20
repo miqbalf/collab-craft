@@ -147,11 +147,11 @@ pub enum Work {
 
 /// Whether a relay error says something a retry cannot change.
 ///
-/// The relay's errors carry no code, so this reads its wording: a read-only ticket, and a
-/// message past what the relay carries.
+/// The relay's errors carry no code, so this reads its wording: a read-only ticket, a message
+/// past what the relay carries, and a checkpoint past what it retains for joiners.
 #[must_use]
 pub fn refusal_is_permanent(detail: &str) -> bool {
-    detail.starts_with("read-only access") || detail.contains("more than this relay will carry")
+    detail.starts_with("read-only access") || detail.contains("more than this relay will carry") || detail.contains("too large to retain")
 }
 
 /// How long a checkpoint may wait for its ordering and the save acknowledgement.
@@ -269,6 +269,8 @@ pub struct Live<H> {
     checkpoint: Option<PendingCheckpoint>,
     /// How long [`Live::checkpoint`] waits for an answer.
     checkpoint_timeout: Duration,
+    /// The largest snapshot, in wire bytes, the relay retains (`Joined.text_cap`).
+    text_cap: Option<u64>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -301,6 +303,7 @@ impl<H: Hub> Live<H> {
             broken: false,
             checkpoint: None,
             checkpoint_timeout: CHECKPOINT_TIMEOUT,
+            text_cap: None,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -347,7 +350,13 @@ impl<H: Hub> Live<H> {
             return Err(e);
         }
         let mut changes = Vec::new();
-        for update in std::mem::take(&mut self.held) {
+        let held = std::mem::take(&mut self.held);
+        if self.from_file && self.text_catchup && self.marked {
+            // The text ops may still restart this file-seeded replica onto the room's
+            // snapshot, and these would be lost with it.
+            self.since_join.extend(held.iter().cloned());
+        }
+        for update in held {
             match doc.apply(&update) {
                 Ok(found) => merge_changes(&mut changes, found),
                 Err(e) => {
@@ -407,8 +416,15 @@ impl<H: Hub> Live<H> {
     /// the relay acknowledged the save report (`saved_ack`), so it means exactly that.
     ///
     /// Refused until [`ready_to_type`](Live::ready_to_type) holds and while the join's
-    /// catch-up can still replace this replica with the room's snapshot.
-    pub fn checkpoint(&mut self) -> Result<()> {
+    /// catch-up can still replace this replica with the room's snapshot. A snapshot larger
+    /// than the relay retains (`Joined.text_cap`) is refused here with [`Error::Refused`],
+    /// which, like [`Work::CheckpointRefused`], a retry does not change.
+    ///
+    /// Returns the snapshot: the full document state (yrs update v1) that was checkpointed.
+    /// The saver writes the file from exactly these bytes, by restoring a document from them
+    /// ([`LiveDoc::from_state`]) once [`Work::Checkpointed`] arrives, never from the live
+    /// replica, which may have taken edits since.
+    pub fn checkpoint(&mut self) -> Result<Vec<u8>> {
         if self.checkpoint.is_some() {
             return Err(Error::malformed("client", "a checkpoint is already in flight"));
         }
@@ -419,17 +435,30 @@ impl<H: Hub> Live<H> {
             return Err(Error::malformed("client", "the join's catch-up has not arrived yet"));
         }
         let state = self.sound_doc()?.state();
-        let params = serde_json::to_value(TextPayload::snapshot(&state)).map_err(|e| Error::malformed("client", e.to_string()))?;
+        let payload = TextPayload::snapshot(&state);
+        // The relay counts a retained op as its JSON: the base64 string and its quotes.
+        let bytes = payload.ops.iter().map(|op| op.len() as u64 + 2).sum::<u64>();
+        if let Some(cap) = self.text_cap
+            && bytes > cap
+        {
+            return Err(Error::Refused(format!("that checkpoint is {bytes} bytes, too large to retain for joining editors")));
+        }
+        let params = serde_json::to_value(payload).map_err(|e| Error::malformed("client", e.to_string()))?;
         let msg = self.wire.submit_crdt(CRDT_TEXT, params);
         let ClientMsg::Submit { local, .. } = &msg else {
             return Err(Error::malformed("client", "a checkpoint must be a submit"));
         };
         self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms() });
-        self.hub.send(msg)
+        self.hub.send(msg)?;
+        Ok(state)
     }
 
     /// How long a checkpoint waits for its ordering and the relay's acknowledgement before it
     /// is reported as [`Work::CheckpointRaced`]. [`CHECKPOINT_TIMEOUT`] by default.
+    ///
+    /// Measured from the submit, and checked at the end of each [`pump`](Live::pump), after
+    /// that pump's messages: an answer that arrived in time is never beaten by the timer, and
+    /// a checkpoint is reported as timed out on the first pump at or past the deadline.
     pub fn set_checkpoint_timeout(&mut self, timeout: Duration) {
         self.checkpoint_timeout = timeout;
     }
@@ -495,9 +524,9 @@ impl<H: Hub> Live<H> {
         }
 
         let mut work = Vec::new();
-        self.time_out_checkpoint(&mut work);
         for msg in self.hub.poll() {
-            if let ServerMsg::Joined { seq, replay_until, fallback, .. } = &msg {
+            if let ServerMsg::Joined { seq, replay_until, fallback, text_cap, .. } = &msg {
+                self.text_cap = *text_cap;
                 self.joined(*seq, *replay_until, *fallback, &mut work);
                 let named = msg.doc().to_owned();
                 if named != self.wire.doc() {
@@ -510,6 +539,7 @@ impl<H: Hub> Live<H> {
                 self.act(effect, &mut work);
             }
         }
+        self.time_out_checkpoint(&mut work);
         work
     }
 
@@ -736,7 +766,7 @@ impl<H: Hub> Live<H> {
         if self.checkpoint.as_ref().is_none_or(|p| p.local != local) {
             return;
         }
-        let raced = self.checkpoint.take().is_some_and(|p| p.raced);
+        let (raced, sent_at) = self.checkpoint.take().map_or((false, None), |p| (p.raced, p.sent_at));
         if raced {
             log::info!("collab: a remote edit landed before checkpoint {seq}; it was not reported as saved");
             work.push(Work::CheckpointRaced);
@@ -745,7 +775,8 @@ impl<H: Hub> Live<H> {
         let saved = self.wire.saved_through(seq.saturating_sub(1));
         match self.hub.send(saved) {
             // Not done yet: only the relay's acknowledgement moves the baseline.
-            Ok(()) => self.checkpoint = Some(PendingCheckpoint { local, raced: false, ordered: Some(seq), sent_at: now_ms() }),
+            // The timeout keeps running from the submit.
+            Ok(()) => self.checkpoint = Some(PendingCheckpoint { local, raced: false, ordered: Some(seq), sent_at }),
             Err(e) => {
                 log::warn!("collab: checkpoint {seq} was ordered but the save report never left: {e}");
                 work.push(Work::CheckpointRaced);
@@ -798,6 +829,13 @@ impl<H: Hub> Live<H> {
                 // The fallback catch-up: it replaces the ordered replay, so it is the catch-up.
                 let restart = std::mem::take(&mut self.text_catchup);
                 self.settled = true;
+                if !self.marked {
+                    // An older relay sends text ops instead of a replay, and does not say so.
+                    // They are the catch-up, so the ordered one it seemed to promise is over:
+                    // left armed, it would block checkpoints and take a peer's next snapshot
+                    // for a restart.
+                    self.catchup = None;
+                }
                 if !complete {
                     log::warn!("collab: the relay could not keep every change to {scope}");
                     self.notices.push(format!("{scope} has changes this session cannot rebuild; reopen the file"));
@@ -933,6 +971,7 @@ mod tests {
             locks: Vec::new(),
             replay_until: None,
             fallback: false,
+            text_cap: None,
         });
         live.pump();
         live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();

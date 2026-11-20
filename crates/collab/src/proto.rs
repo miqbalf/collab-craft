@@ -140,6 +140,10 @@ pub enum ServerMsg {
         /// same relays that send `replay_until`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fallback: bool,
+        /// The largest checkpoint snapshot, in wire bytes, the relay retains for joiners.
+        /// Absent from an older relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_cap: Option<u64>,
     },
     /// CRDT operations a joining peer missed, outside the sequence.
     ///

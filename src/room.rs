@@ -23,6 +23,18 @@ pub const HISTORY: usize = 2048;
 /// [`HISTORY`] bounds the op count and says nothing about size. A client can put as much JSON
 /// in one `params` as the transport will carry, so counting ops alone let one authenticated
 /// editor hold an arbitrary multiple of the intended memory per room.
+///
+/// # Memory per room, and how it relates to the text cap
+///
+/// A room holds two pools: this op history, and the retained CRDT text a joiner is replayed
+/// ([`TEXT_BYTES`] per scope by default, `COLLABCRAFT_TEXT_BYTES` in a deployment, and
+/// [`TOTAL_TEXT_BYTES`] or that cap across scopes). A checkpoint snapshot is one op carrying a
+/// whole document, so it may be as large as the text cap, which can exceed this budget: a
+/// CRDT op up to the text cap is accepted and the history then evicts down to it. The same
+/// snapshot sits in both pools, and a snapshot is retained even over a full scope (the save
+/// that follows it drops everything before it). So the worst case for one room is about
+/// `max(HISTORY_BYTES, cap) + max(TOTAL_TEXT_BYTES, cap) + cap`: 48 MiB at the 16 MiB
+/// default cap, 192 MiB at the 64 MiB maximum.
 pub const HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Peers one document may hold at once.
@@ -111,6 +123,9 @@ pub enum Refusal {
     TooLarge { bytes: usize },
     /// A save report that does not sit right before a retained checkpoint snapshot.
     NotACheckpoint { seq: u64 },
+    /// A save report whose checkpoint snapshot was ordered but is larger than the text cap,
+    /// so it was never retained for joiners. Permanent for that document size.
+    TooLargeToRetain { bytes: usize },
 }
 
 impl Refusal {
@@ -122,6 +137,9 @@ impl Refusal {
             Refusal::TooLarge { bytes } => format!("that change is {bytes} bytes, more than this relay will carry"),
             Refusal::NotACheckpoint { seq } => {
                 format!("a save through {seq} is kept only when a checkpoint snapshot follows it; nothing was dropped")
+            }
+            Refusal::TooLargeToRetain { bytes } => {
+                format!("that checkpoint is {bytes} bytes, too large to retain for joining editors; nothing was dropped")
             }
         }
     }
@@ -243,6 +261,9 @@ pub struct Room {
     saved: Option<(String, serde_json::Value)>,
     /// Per-scope retained-text cap. `None` means [`TEXT_BYTES`].
     text_cap: Option<usize>,
+    /// The newest checkpoint snapshot that was ordered but not retained because it is larger
+    /// than the cap, `(seq, bytes)`, so the save report for it is refused as permanent.
+    oversized_snapshot: Option<(u64, usize)>,
 }
 
 /// The ephemeral kind that records a save: `{seq, etag}`.
@@ -427,7 +448,9 @@ impl Room {
             return Err(Refusal::ReadOnly);
         }
         let bytes = value_bytes(&s.params);
-        if bytes > HISTORY_BYTES {
+        // A CRDT op may be a checkpoint snapshot, which the rooms retain up to the text cap.
+        let limit = if is_crdt_command(&s.command) { HISTORY_BYTES.max(self.scope_cap()) } else { HISTORY_BYTES };
+        if bytes > limit {
             return Err(Refusal::TooLarge { bytes });
         }
         let scope = if is_crdt_command(&s.command) { None } else { s.scope };
@@ -487,6 +510,14 @@ impl Room {
             return;
         }
         let (cap, total) = (self.scope_cap(), self.total_cap());
+        // A snapshot submit carries one full state; its flag marks that op, not the batch.
+        let snap = op.params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        if snap && bytes > cap {
+            // Not retained, and nothing else is lost: the snapshot holds only what the ops
+            // before it already carry. The save report for it is refused as permanent.
+            self.oversized_snapshot = Some((op.seq, bytes));
+            return;
+        }
         let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog {
             ops: Vec::new(),
             seqs: Vec::new(),
@@ -499,6 +530,10 @@ impl Room {
         // the room as a whole may hold. `self.text_bytes` still counts this scope's current
         // bytes, which is why the comparison is against the total after adding `bytes` rather
         // than before.
+        // A snapshot that fits the cap on its own is retained even over a full scope, by up to
+        // one cap: the save that follows it drops everything before it, which is how a scope
+        // shrinks again. Snapshots that are never saved still meet the doubled bound.
+        let (cap, total) = if snap { (cap.saturating_mul(2), total.saturating_add(cap)) } else { (cap, total) };
         if log.bytes + bytes > cap || self.text_bytes + bytes > total {
             // Dropping the oldest would leave a replay that cannot be applied, because later
             // operations anchor on characters the dropped ones created. Saying so is the only
@@ -515,8 +550,6 @@ impl Room {
         // Every op in one submit shares that submit's sequence, which is what a
         // save checkpoint later compares against.
         log.seqs.extend(std::iter::repeat_n(op.seq, ops.len()));
-        // A snapshot submit carries one full state; its flag marks that op, not the batch.
-        let snap = op.params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
         log.snaps.extend((0..ops.len()).map(|i| snap && i == 0));
         log.bytes += bytes;
         self.text_bytes += bytes;
@@ -535,7 +568,10 @@ impl Room {
     pub fn checkpoint(&mut self, seq: u64) -> Result<(), Refusal> {
         let snapshot_next = seq.checked_add(1).is_some_and(|next| self.texts.values().any(|log| log.snapshot_at(next)));
         if !snapshot_next {
-            return Err(Refusal::NotACheckpoint { seq });
+            return Err(match self.oversized_snapshot {
+                Some((at, bytes)) if seq.checked_add(1) == Some(at) => Refusal::TooLargeToRetain { bytes },
+                _ => Refusal::NotACheckpoint { seq },
+            });
         }
         self.saved_seq = self.saved_seq.max(seq);
         for log in self.texts.values_mut() {

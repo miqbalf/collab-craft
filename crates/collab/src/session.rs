@@ -264,6 +264,7 @@ impl Session {
                 while let Some(next) = self.pending.remove(&(self.applied + 1)) {
                     self.consume(next, &mut out);
                 }
+                self.drop_seen();
                 out
             }
 
@@ -362,7 +363,15 @@ impl Session {
         while let Some(next) = self.pending.remove(&(self.applied + 1)) {
             self.consume(next, &mut out);
         }
+        self.drop_seen();
         out
+    }
+
+    /// Forget held ops at or below what has been applied. They can never be consumed, and left
+    /// in place they would count towards the resync threshold for nothing.
+    fn drop_seen(&mut self) {
+        let applied = self.applied;
+        self.pending.retain(|&held, _| held > applied);
     }
 
     /// Apply or confirm one in-order op.
