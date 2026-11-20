@@ -1580,3 +1580,22 @@ mod provider_kinds {
         assert!(crate::route::split("cx:short:file").is_none());
     }
 }
+
+/// A token minted by the Nextcloud app's PHP signer (fixture generated once
+/// with `examples/sign.rs`, and reproduced byte for byte by the app's own
+/// test) verifies here, so the two implementations cannot drift apart.
+#[test]
+fn token_from_php_verifies() {
+    const PHP_SECRET: &[u8] = b"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    let fixture = include_str!("../tests/fixtures/ticket.txt").trim();
+    // sign_at signs at now + LIFETIME_SECS; the fixture was minted at 1_700_000_000.
+    let claims = token::verify(fixture, PHP_SECRET, 1_700_000_100).expect("fixture verifies");
+    assert_eq!(claims.rm, "abc123:42");
+    assert_eq!(claims.uid, "bob");
+    assert_eq!(claims.dsp, "Bob");
+    assert_eq!(claims.perm, PERMISSION_READ | PERMISSION_UPDATE);
+    assert_eq!(claims.exp, 1_700_000_000 + token::LIFETIME_SECS);
+    assert_eq!(claims.pid, "bob~0a1b2c3d");
+    assert!(claims.may_edit());
+    assert!(matches!(token::verify(fixture, PHP_SECRET, claims.exp), Err(TokenError::Expired { .. })));
+}
