@@ -422,6 +422,9 @@ mod e2e {
         let t = token::sign_at(SECRET, &room, "craft_office", "alice", true, "alice", now()).unwrap();
         let mut a = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
         a.insert(5, "!");
+        // Ordered before the checkpoint: two submits in flight from one socket are handled
+        // concurrently by the relay and may be ordered either way.
+        a.until(Duration::from_millis(500), |_, _| false).await;
         assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
         assert_eq!(h.relay.rooms.lock().await.get(&room).map(|r| r.saved_seq()), Some(1));
     }

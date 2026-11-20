@@ -143,6 +143,9 @@ async fn e2e_a_dropped_link_reconnects_and_the_outage_edit_lands_once() {
     let mut a = LivePeer::open(&p.url, &ticket(&room, "alice", now()), &doc, "hello").await;
     let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
     let before = seq_of(&h, &room).await;
+    // Nothing but the relay may be reached on a reconnect (an older build sent its internal
+    // attempt, ticket included, to 127.0.0.1:1). The port needs root to bind; skipped without.
+    let decoy = tokio::net::TcpListener::bind("127.0.0.1:1").await.ok();
 
     p.cut.notify_one();
     assert!(link_is(&mut a, false).await, "alice never saw the link drop");
@@ -152,6 +155,10 @@ async fn e2e_a_dropped_link_reconnects_and_the_outage_edit_lands_once() {
     assert!(a.until(Duration::from_secs(5), |live, _| shows(live, "hello!")).await, "alice has {:?}", a.text());
     a.until(Duration::from_millis(500), |_, _| false).await;
     assert_eq!(seq_of(&h, &room).await - before, 1, "the outage edit was ordered exactly once");
+    if let Some(decoy) = decoy {
+        let reached = tokio::time::timeout(Duration::from_millis(100), decoy.accept()).await;
+        assert!(reached.is_err(), "a reconnect reached somewhere other than the relay");
+    }
 }
 
 /// A socket the relay closes is reconnected to, and edits on both sides converge.

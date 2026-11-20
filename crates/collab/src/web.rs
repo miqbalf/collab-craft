@@ -25,7 +25,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::error::{Error, Result};
-use crate::hub::{Backoff, EVENTS, Endpoint, Hub, emit, receive};
+use crate::hub::{Backoff, EVENTS, Endpoint, Hub, WhileDown, emit, receive, while_down};
 
 /// Reconnect state the socket's handlers share with the hub.
 #[derive(Default)]
@@ -33,8 +33,10 @@ struct Link {
     backoff: Backoff,
     /// The relay refused the connection itself; nothing reconnects until a new token.
     refused: bool,
-    /// A reconnect is scheduled on a timer.
-    scheduled: bool,
+    /// The pending reconnect timer, from `setTimeout`.
+    timer: Option<JsValue>,
+    /// The hub was dropped: nothing may connect on its behalf.
+    dropped: bool,
 }
 use crate::proto::{ClientMsg, ServerMsg};
 
@@ -139,21 +141,18 @@ impl WebHub {
             }
             let wait = {
                 let mut link = state.borrow_mut();
-                if link.refused || link.scheduled {
+                if link.refused || link.dropped || link.timer.is_some() {
                     return;
                 }
-                link.scheduled = true;
                 link.backoff.next()
             };
-            let (socket, state) = (reopen.clone(), Rc::clone(&state));
+            let (socket, fired) = (reopen.clone(), Rc::clone(&state));
             let later = Closure::once_into_js(move || {
-                state.borrow_mut().scheduled = false;
-                if !state.borrow().refused {
-                    connect_now(&socket);
-                }
+                fired.borrow_mut().timer = None;
+                connect_now(&socket, &fired.borrow());
             });
-            if let Some(timer) = function(js_sys::global().as_ref(), "setTimeout") {
-                let _ = timer.call2(js_sys::global().as_ref(), &later, &JsValue::from_f64(wait.as_millis() as f64));
+            if let Some(set_timeout) = function(js_sys::global().as_ref(), "setTimeout") {
+                state.borrow_mut().timer = set_timeout.call2(js_sys::global().as_ref(), &later, &JsValue::from_f64(wait.as_millis() as f64)).ok();
             }
         });
         on.call2(&socket, &JsValue::from_str("disconnect"), reopened.as_ref()).map_err(js)?;
@@ -165,6 +164,15 @@ impl WebHub {
 
 impl Hub for WebHub {
     fn send(&mut self, msg: ClientMsg) -> Result<()> {
+        // socket.io-client buffers what is sent while disconnected and flushes it on the
+        // reconnect. Edit submits are dropped instead, as the native hub drops them: a
+        // [`crate::Live`] sends them again after the rejoin, merged, and the buffered copy
+        // would go out a second time. So are save reports, which must not reach the relay
+        // after the rejoin reported their checkpoint raced.
+        if !self.connected() && matches!(while_down(&msg), WhileDown::Drop) {
+            log::debug!("relay link down; dropping a message the rejoin covers");
+            return Ok(());
+        }
         let (event, body) = emit(&msg);
         let payload = to_js(&body)?;
         let emitting = function(&self.socket, "emit").ok_or_else(|| Error::Hub("the relay connection is gone".to_owned()))?;
@@ -195,7 +203,7 @@ impl Hub for WebHub {
             restart
         };
         if restart {
-            connect_now(&self.socket);
+            connect_now(&self.socket, &self.link.borrow());
         }
     }
 }
@@ -203,6 +211,14 @@ impl Hub for WebHub {
 impl Drop for WebHub {
     /// Close the socket rather than leaving it open for the life of the page.
     fn drop(&mut self) {
+        let timer = {
+            let mut link = self.link.borrow_mut();
+            link.dropped = true;
+            link.timer.take()
+        };
+        if let (Some(timer), Some(clear)) = (timer, function(js_sys::global().as_ref(), "clearTimeout")) {
+            let _ = clear.call1(js_sys::global().as_ref(), &timer);
+        }
         if let Some(disconnect) = function(&self.socket, "disconnect") {
             let _ = disconnect.call0(&self.socket);
         }
@@ -239,8 +255,12 @@ fn to_js(value: &serde_json::Value) -> Result<JsValue> {
     JSON::parse(&text).map_err(js)
 }
 
-/// Ask socket.io-client to connect the socket again.
-fn connect_now(socket: &JsValue) {
+/// Ask socket.io-client to connect the socket again, unless the hub is gone or its ticket was
+/// refused.
+fn connect_now(socket: &JsValue, link: &Link) {
+    if link.dropped || link.refused {
+        return;
+    }
     if let Some(connect) = function(socket, "connect") {
         let _ = connect.call0(socket);
     }

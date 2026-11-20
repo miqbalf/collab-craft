@@ -731,14 +731,30 @@ impl<H: Hub> Live<H> {
             return;
         }
         log::info!("collab: sending {} unconfirmed edits again after the rejoin", updates.len());
-        match yrs::merge_updates_v1(updates.values()) {
-            Ok(merged) => {
-                if let Err(e) = self.send_update(&merged) {
-                    log::warn!("collab: the unconfirmed edits could not be sent again: {e}");
-                }
+        for chunk in self.chunked(updates.into_values()) {
+            if self.broken {
+                break;
             }
-            Err(e) => self.break_replica(&format!("unconfirmed edits did not merge: {e}")),
+            if let Err(e) = self.send_update(&chunk) {
+                log::warn!("collab: unconfirmed edits could not be sent again: {e}");
+            }
         }
+    }
+
+    /// Merge `updates` in order into as few updates as fit the relay's cap, each measured as
+    /// [`Live::over_cap`] measures a submit. An update that does not fit merged with anything
+    /// goes as it was: it was sent once, so it fits alone.
+    fn chunked(&self, updates: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+        let fits = |update: &[u8]| serde_json::to_value(TextPayload::new(update)).map(|params| self.over_cap(&params).is_none()).unwrap_or(false);
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for update in updates {
+            let grown = chunks.last().and_then(|last| yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok()).filter(|merged| fits(merged));
+            match (grown, chunks.last_mut()) {
+                (Some(merged), Some(last)) => *last = merged,
+                _ => chunks.push(update),
+            }
+        }
+        chunks
     }
 
     /// Merge a batch of wire updates, or hold them until the document is loaded.

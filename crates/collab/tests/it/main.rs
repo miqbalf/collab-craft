@@ -1534,3 +1534,43 @@ fn a_refused_connection_is_a_typed_event() {
     hub.0.borrow_mut().inbox.push(ServerMsg::Error { doc: String::new(), detail: "busy".to_owned(), local: None, code: None });
     assert!(live.pump().is_empty(), "an ordinary error is not one");
 }
+
+/// The merged resend stays under the relay's cap: edits that fit one by one but not merged go
+/// in more than one update, and the replica is not broken.
+#[test]
+fn a_resend_past_the_cap_goes_in_pieces() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(with_cap(joined_at("alice", 1, 0, Some(0)), 4096));
+    live.pump();
+    // A large paste, split so each piece fits the cap.
+    for piece in ["a", "b", "c"] {
+        live.edit(|d| d.insert_text(1, 0, &piece.repeat(2000), &Map::new())).unwrap();
+    }
+    hub.0.borrow_mut().sent.clear();
+    hub.0.borrow_mut().inbox.push(with_cap(joined_at("alice", 4, 0, Some(0)), 4096));
+    live.pump();
+    assert!(live.ready_to_type(), "the resend broke the replica");
+    let submits: Vec<Value> = hub
+        .0
+        .borrow()
+        .sent
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::Submit { params, .. } => Some(params.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(submits.len() >= 2, "{} submits", submits.len());
+    for params in &submits {
+        assert!(serde_json::to_vec(params).unwrap().len() <= 4096);
+    }
+    let mut other = replica(&sample(), 7);
+    for params in &submits {
+        for up in bytes_of(params) {
+            other.apply(&up).unwrap();
+        }
+    }
+    assert_eq!(other.block(1).unwrap().text, live.doc().unwrap().block(1).unwrap().text);
+}

@@ -207,3 +207,27 @@ pub fn receive(event: &str, mut value: serde_json::Value) -> Option<ServerMsg> {
         }
     }
 }
+
+/// What happens to a message sent while the link is down.
+#[cfg(any(feature = "native-hub", feature = "web-hub"))]
+pub(crate) enum WhileDown {
+    /// Dropped: something else covers it. Edit submits are sent again by
+    /// [`crate::Live`] after the rejoin, merged; a checkpoint snapshot and its save report
+    /// are reported as raced on the rejoin, and must not reach the relay after that, or the
+    /// baseline would move for a save the saver was told did not happen; presence is resent
+    /// by the app with its newest value.
+    Drop,
+    /// Sent once the link is back: queued by the native hub until the relay has joined the
+    /// connection again, buffered by socket.io-client in a browser (lock commands, other
+    /// submits, resync requests).
+    Queue,
+}
+
+#[cfg(any(feature = "native-hub", feature = "web-hub"))]
+pub(crate) fn while_down(msg: &ClientMsg) -> WhileDown {
+    match msg {
+        ClientMsg::Submit { command, .. } if crate::proto::is_crdt_command(command) => WhileDown::Drop,
+        ClientMsg::Saved { .. } | ClientMsg::Ephemeral { .. } | ClientMsg::Frame { .. } => WhileDown::Drop,
+        _ => WhileDown::Queue,
+    }
+}
