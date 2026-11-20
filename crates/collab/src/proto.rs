@@ -38,6 +38,10 @@ pub fn is_crdt_command(command: &str) -> bool {
 /// An edit to the shared document. Payload is [`crate::TextPayload`]: yrs updates, base64.
 pub const CRDT_TEXT: &str = "crdt.text";
 
+/// The protocol version a client names in its handshake (`proto`). The relay refuses any
+/// other value, so a mismatched client fails loudly instead of misreading the relay.
+pub const PROTO: &str = "craft-live/1";
+
 /// Insert or move a sibling by fractional key. Payload is a position change.
 pub const CRDT_POS: &str = "crdt.pos";
 
@@ -131,6 +135,11 @@ pub enum ServerMsg {
         /// socket delivers one of them before the replay. Absent from an older relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replay_until: Option<u64>,
+        /// The catch-up comes as [`ServerMsg::TextOps`] right after this message instead of as
+        /// ordered ops: the relay's history no longer reaches the join's baseline. Sent by the
+        /// same relays that send `replay_until`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fallback: bool,
     },
     /// CRDT operations a joining peer missed, outside the sequence.
     ///

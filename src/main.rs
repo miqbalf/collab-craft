@@ -245,6 +245,9 @@ struct JoinedMsg<'a> {
     /// The last sequence of the ordered replay that follows, so a client can tell it from
     /// live ops that overtake it.
     replay_until: u64,
+    /// The catch-up is the `text_ops` that follow, not an ordered replay.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    fallback: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,7 +309,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .req_path(format!("{base}/socket.io"))
         .ping_interval(PING_INTERVAL)
         .max_payload(MAX_FRAME_BYTES as u64)
-        .with_state(relay).build_layer();
+        .with_state(relay)
+        .build_layer();
     // ns returns () for the local adapter, so there is nothing to await here.
     io.ns("/", on_connect);
 
@@ -539,7 +543,9 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     socket.on("ephemeral", on_ephemeral);
     socket.on("saved", on_saved);
     socket.on_disconnect(on_disconnect);
-    socket.join(room_name.clone());
+    // The socket joins the broadcast room only below, under the rooms lock, once its replay
+    // is fixed. Joined earlier, a live op broadcast during the bus calls in between reached it
+    // before `joined`, and the session it reached had nowhere to put it.
 
     let locks = {
         let mut bus = relay.bus.lock().await;
@@ -577,8 +583,12 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         bus.current_seq(&room_key).await.unwrap_or(0)
     };
 
+    // Held until the replay is sent. An op is recorded in the room under this lock and
+    // broadcast after it, so every op is either in this replay (and maybe broadcast again,
+    // which the client drops by its sequence) or ordered after it and broadcast to a socket
+    // that has already joined and been sent `joined`. None is lost, none lands twice.
+    let mut rooms = relay.rooms.lock().await;
     let joined = {
-        let mut rooms = relay.rooms.lock().await;
         let room = relay.room(&mut rooms, &room_key);
         room.observe_seq(retained_seq);
         match room.join(Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit() }) {
@@ -620,6 +630,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     };
 
     let Some((seq, replay, texts, roster, ephemeral)) = joined else {
+        drop(rooms);
         tracing::warn!(room = %room_key, "refusing a peer: the document is full");
         let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: Refusal::Full.detail() });
         let _ = socket.disconnect();
@@ -644,6 +655,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             roster: &roster,
             locks: locks.iter().map(|(s, h)| LockEntry { scope: s.clone(), holder: h.clone() }).collect(),
             replay_until: replay.last().map_or(seq, |op| op.seq),
+            fallback: !texts.is_empty(),
         },
     );
 
@@ -662,6 +674,8 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         let _ =
             socket.emit("text_ops", &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": ops, "complete": complete, "snap": snap }));
     }
+    socket.join(room_name.clone());
+    drop(rooms);
 
     // And on where everybody is, so somebody arriving late does not have to wait for each
     // person to move before their marker appears.

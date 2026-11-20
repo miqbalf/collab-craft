@@ -6,7 +6,7 @@ mod e2e {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::test_text::{Replica, SCOPE};
+    use crate::test_text::{LivePeer, Replica, SCOPE};
     use craft_collab::native::NativeHub;
     use craft_collab::{ClientMsg, Effect, Hub, Session};
     use serde_json::json;
@@ -27,7 +27,13 @@ mod e2e {
         let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
         let mut bus = Bus::connect(&valkey).await.expect("valkey");
         bus.check_writable().await.expect("writable");
-        let relay = Arc::new(Relay { text_cap: crate::room::TEXT_BYTES, service_uid: "craft_office".to_owned(), secret: SECRET.to_vec(), bus: Mutex::new(bus), rooms: Mutex::new(Default::default()) });
+        let relay = Arc::new(Relay {
+            text_cap: crate::room::TEXT_BYTES,
+            service_uid: "craft_office".to_owned(),
+            secret: SECRET.to_vec(),
+            bus: Mutex::new(bus),
+            rooms: Mutex::new(Default::default()),
+        });
         let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
@@ -139,77 +145,49 @@ mod e2e {
         (t, params)
     }
 
-    /// Issue 27 positive check through the real socket: confirm the edit, save, send
-    /// `session.saved()`, then a late joiner loading the saved file must see it once.
+    fn peer_token(room: &str, pid: &str) -> String {
+        token::sign_at(SECRET, room, pid, pid, true, pid, now()).unwrap()
+    }
+
+    /// Issue 27 positive check through the real socket, saved the way an app saves: alice's
+    /// edit is confirmed, she checkpoints, and only once that is accepted is the file written.
+    /// A late joiner loading that file must see the edit once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs REVIEW_VALKEY_URL"]
     async fn e2e_saved_after_confirm_late_joiner_sees_text_once() {
         let Some(h) = start().await else { return };
         let room = unique_room("saved-ok");
-        let mut a = Client::connect(&h, &room, "alice", true).await;
-        let (t, params) = alice_types_bang(&mut a).await;
-        let m = a.s.submit("crdt.text", params, None);
-        a.send(m);
-        assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await, "edit never confirmed: {:?}", a.fx);
-        let saved_file = t.render();
-        let m = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
-        a.send(m);
-        a.settle(Duration::from_millis(300)).await;
+        let doc = format!("doc:{room}");
+        let mut a = LivePeer::open(&h.url, &peer_token(&room, "alice"), &doc, "hello").await;
+        a.insert(5, "!");
+        a.until(Duration::from_millis(500), |_, _| false).await;
+        assert!(a.save().await, "the checkpoint was not accepted: {:?}", a.work);
+        let saved_file = a.text();
+        a.until(Duration::from_millis(300), |_, _| false).await;
 
-        let mut b = Client::connect(&h, &room, "bob", true).await;
-        b.settle(Duration::from_millis(500)).await;
-        let (replay, complete) = b.replay(SCOPE);
-        let mut bt = Replica::seeded(b.s.space().unwrap(), &saved_file);
-        bt.apply(&replay);
-        let seen = bt.render();
-        assert_eq!(seen, saved_file, "saved {saved_file:?}; bob replayed {} ops (complete={complete:?}) and sees {seen:?}", replay.len());
+        let b = LivePeer::join_late(&h.url, &peer_token(&room, "bob"), &doc, &saved_file).await;
+        assert_eq!(b.text(), saved_file, "saved {saved_file:?}; bob sees {:?} after {:?}", b.text(), b.work);
     }
 
     /// Issue 27, the save that includes a local edit the relay has not confirmed yet (autosave
-    /// while typing). The file holds "hello!", but `saved()` reports `applied`, which excludes
-    /// the in-flight op, so the op is still replayed to a joiner who loads that file.
-    ///
-    /// NOT FIXED this round: out of scope for the four defects this recheck covers (join
-    /// resume, Saved permission and its cap, the total-bytes budget, hygiene). `Session::saved`
-    /// now documents the precondition this test violates on purpose (call it only once the
-    /// edits the save reflects are confirmed, not merely rendered). A real fix would need the
-    /// relay to accept something other than a sequence number for "and also whatever my own
-    /// in-flight ops turn out to be", which is a protocol change, not a guard. Run explicitly
-    /// (`--exact`) to see it fail; the gate's e2e run skips it rather than failing on a known,
-    /// disclosed gap.
+    /// while typing). A plain save report could only name what was confirmed, so the edit was
+    /// replayed on top of a file that already held it. A checkpoint is ordered after that edit
+    /// and carries it, so the joiner starts from the snapshot and sees it once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs REVIEW_VALKEY_URL"]
     async fn e2e_saved_with_inflight_edit_late_joiner_sees_text_once() {
         let Some(h) = start().await else { return };
         let room = unique_room("saved-inflight");
-        let mut a = Client::connect(&h, &room, "alice", true).await;
-        let (t, params) = alice_types_bang(&mut a).await;
-        let m = a.s.submit("crdt.text", params, None);
-        a.send(m);
-        // The app saves what it shows, which already includes the "!", then reports the save.
-        let saved_file = t.render();
-        let saved_msg = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
-        let reported = match &saved_msg {
-            ClientMsg::Saved { seq, .. } => *seq,
-            _ => unreachable!(),
-        };
-        let inflight_at_save = a.s.inflight();
-        a.send(saved_msg);
-        assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await, "edit never confirmed: {:?}", a.fx);
-        let op_seq = confirmed(&a.fx, 1).unwrap();
+        let doc = format!("doc:{room}");
+        let mut a = LivePeer::open(&h.url, &peer_token(&room, "alice"), &doc, "hello").await;
+        // The edit is still in flight when the checkpoint goes out.
+        a.insert(5, "!");
+        assert!(a.save().await, "the checkpoint was not accepted: {:?}", a.work);
+        let saved_file = a.text();
+        a.until(Duration::from_millis(300), |_, _| false).await;
 
-        let mut b = Client::connect(&h, &room, "bob", true).await;
-        b.settle(Duration::from_millis(500)).await;
-        let (replay, _) = b.replay(SCOPE);
-        let mut bt = Replica::seeded(b.s.space().unwrap(), &saved_file);
-        bt.apply(&replay);
-        let seen = bt.render();
-        assert_eq!(
-            seen,
-            saved_file,
-            "file saved as {saved_file:?} with {inflight_at_save} edit in flight; Saved reported seq={reported}, the edit was ordered at seq={op_seq}; bob replayed {} ops and sees {seen:?}",
-            replay.len()
-        );
+        let b = LivePeer::join_late(&h.url, &peer_token(&room, "bob"), &doc, &saved_file).await;
+        assert_eq!(b.text(), saved_file, "saved {saved_file:?} with an edit in flight; bob sees {:?} after {:?}", b.text(), b.work);
     }
 
     /// `on_saved` takes no edit permission and does not bound `seq`. A read-only peer reports a

@@ -115,10 +115,33 @@ pub enum Work {
     /// checkpointed since that file was written.
     Reset,
     /// This replica's checkpoint was ordered at `seq` and reported as saved through `seq - 1`.
+    /// Write the file now, from the same state the snapshot was taken of.
     Checkpointed { seq: u64 },
-    /// A remote edit landed between this replica's snapshot and its ordering, so the snapshot
-    /// may miss it and was not reported as saved. Call [`Live::checkpoint`] again.
+    /// The checkpoint was dropped for a reason that can pass, so retrying makes sense. Call
+    /// [`Live::checkpoint`] again. Raised when:
+    ///
+    /// * a remote edit landed between this replica's snapshot and its ordering, so the snapshot
+    ///   may miss it;
+    /// * the link rejoined, the relay replaced the document, or the replica was reset onto the
+    ///   room's own snapshot, so the submit may never be ordered or was taken of a state the
+    ///   room does not share;
+    /// * the relay reported an error it may recover from (it could not order the edit);
+    /// * the save report never left this client.
     CheckpointRaced,
+    /// The relay refused the checkpoint for a reason a retry does not change: this peer may
+    /// only read, or the snapshot is larger than the relay carries. `reason` is the relay's
+    /// own words, for the user. Do not retry until something changes (a smaller document, a
+    /// ticket that may edit).
+    CheckpointRefused { reason: String },
+}
+
+/// Whether a relay error says something a retry cannot change.
+///
+/// The relay's errors carry no code, so this reads its wording: a read-only ticket, and a
+/// message past what the relay carries.
+#[must_use]
+pub fn refusal_is_permanent(detail: &str) -> bool {
+    detail.starts_with("read-only access") || detail.contains("more than this relay will carry")
 }
 
 /// A checkpoint snapshot this replica sent and the relay has not ordered yet.
@@ -140,17 +163,24 @@ struct Catchup {
 }
 
 impl Catchup {
+    /// Whether the join replays anything a restart could start from.
+    ///
+    /// A baseline of 0 never had a save, and a save is only accepted just before a snapshot,
+    /// so there is no snapshot to start from: the file is the room's own seed. A replay that
+    /// ends where it starts is empty.
+    fn replays_anything(self) -> bool {
+        self.joined > 0 && self.until.is_none_or(|until| until > self.joined)
+    }
+
+    /// Whether the op ordered at `seq` belongs to the replay. An older relay does not mark
+    /// the replay's end, so there the first op is taken to.
+    fn covers(self, seq: u64) -> bool {
+        self.until.is_none_or(|until| seq <= until)
+    }
+
     /// Whether the op ordered at `seq` is the first op of the catch-up replay.
     fn starts_at(self, seq: u64) -> bool {
-        let first = self.joined + 1;
-        seq == first
-            && match self.until {
-                Some(until) => seq <= until,
-                // An older relay does not mark the replay. Its baseline is the last save, and a
-                // save is only accepted just before a snapshot, so a baseline of 0 (never saved)
-                // has no snapshot to start from: the file is the room's own seed.
-                None => self.joined > 0,
-            }
+        self.joined > 0 && seq == self.joined + 1 && self.covers(seq)
     }
 }
 
@@ -166,8 +196,22 @@ pub struct Live<H> {
     space: Option<u32>,
     /// A snapshot to start from, waiting for [`Live::seed`].
     snapshot: Option<Vec<u8>>,
-    /// The first join's catch-up, until its first ordered op has been handled.
+    /// The first join's ordered catch-up, until its first op has been handled. `None` when
+    /// the join replays nothing.
     catchup: Option<Catchup>,
+    /// The first join's catch-up comes as [`ServerMsg::TextOps`], which has not arrived yet.
+    /// Kept apart from [`Live::catchup`] because a live op can reach the socket first, and
+    /// that op must not use up the restart the text ops are owed.
+    text_catchup: bool,
+    /// The relay marks its replay (`Joined.replay_until`), so [`Live::text_catchup`] is known
+    /// to be owed rather than assumed.
+    marked: bool,
+    /// Updates applied to a file-seeded replica while [`Live::text_catchup`] was pending.
+    /// A restart onto the room's snapshot replaces that replica, so they are applied again.
+    since_join: Vec<Vec<u8>>,
+    /// Some catch-up has been handled, or the link has gone live. A later join then shares
+    /// the room's history and never restarts.
+    settled: bool,
     /// Whether this link has joined before.
     joined_once: bool,
     /// The replica was seeded from the file, not restored from a snapshot.
@@ -201,6 +245,10 @@ impl<H: Hub> Live<H> {
             space: None,
             snapshot: None,
             catchup: None,
+            text_catchup: false,
+            marked: false,
+            since_join: Vec::new(),
+            settled: false,
             joined_once: false,
             from_file: false,
             edited: false,
@@ -271,6 +319,15 @@ impl<H: Hub> Live<H> {
         self.space.is_some() && self.doc.as_ref().is_some_and(|d| !d.damaged()) && !self.broken
     }
 
+    /// Whether the join's catch-up may still restart this replica onto the room's snapshot.
+    /// A checkpoint is refused meanwhile: it would snapshot a replica about to be replaced.
+    ///
+    /// An older relay does not say whether text ops follow its join, so there only the ordered
+    /// catch-up counts; a reset by its text ops still drops any checkpoint in flight.
+    fn catching_up(&self) -> bool {
+        self.catchup.is_some() || (self.text_catchup && self.marked)
+    }
+
     /// Whether the transport believes it is connected.
     pub fn connected(&self) -> bool {
         self.hub.connected()
@@ -292,12 +349,26 @@ impl<H: Hub> Live<H> {
     /// Send a checkpoint snapshot of the whole document.
     ///
     /// For the replica that saves the file. When the relay orders it, [`pump`](Live::pump)
-    /// reports [`Work::Checkpointed`] and tells the relay the save covers everything before it,
-    /// or [`Work::CheckpointRaced`] when a remote edit slipped in first or the submit was lost.
-    /// One at a time.
+    /// reports [`Work::Checkpointed`] and tells the relay the save covers everything before it.
+    /// [`Work::CheckpointRaced`] means try again; [`Work::CheckpointRefused`] means a retry
+    /// will not help. One at a time.
+    ///
+    /// The order a saver keeps: call this, wait for [`Work::Checkpointed`], and only then
+    /// write the file, from the state the snapshot was taken of. A file written before the
+    /// checkpoint is accepted can get ahead of the room's join baseline, and a joiner that
+    /// loads it would apply the same edits twice.
+    ///
+    /// Refused until [`ready_to_type`](Live::ready_to_type) holds and while the join's
+    /// catch-up can still replace this replica with the room's snapshot.
     pub fn checkpoint(&mut self) -> Result<()> {
         if self.checkpoint.is_some() {
             return Err(Error::malformed("client", "a checkpoint is already in flight"));
+        }
+        if !self.ready_to_type() {
+            return Err(Error::malformed("client", "the shared document is not ready to checkpoint"));
+        }
+        if self.catching_up() {
+            return Err(Error::malformed("client", "the join's catch-up has not arrived yet"));
         }
         let state = self.sound_doc()?.state();
         let params = serde_json::to_value(TextPayload::snapshot(&state)).map_err(|e| Error::malformed("client", e.to_string()))?;
@@ -371,8 +442,8 @@ impl<H: Hub> Live<H> {
 
         let mut work = Vec::new();
         for msg in self.hub.poll() {
-            if let ServerMsg::Joined { seq, replay_until, .. } = &msg {
-                self.joined(*seq, *replay_until, &mut work);
+            if let ServerMsg::Joined { seq, replay_until, fallback, .. } = &msg {
+                self.joined(*seq, *replay_until, *fallback, &mut work);
                 let named = msg.doc().to_owned();
                 if named != self.wire.doc() {
                     log::info!("collab: the relay named the room {named}");
@@ -409,12 +480,21 @@ impl<H: Hub> Live<H> {
     }
 
     /// A join, first or not. Only the first one's catch-up can restart the replica; a later one
-    /// re-arms it only if the first catch-up never arrived. A checkpoint in flight is treated
-    /// as lost, because the submit may not survive the reconnect.
-    fn joined(&mut self, seq: u64, replay_until: Option<u64>, work: &mut Vec<Work>) {
-        if !self.joined_once || self.catchup.is_some() {
-            self.catchup = Some(Catchup { joined: seq, until: replay_until });
+    /// re-arms it only if no catch-up was handled and nothing went live since. A checkpoint in
+    /// flight is treated as lost, because the submit may not survive the reconnect.
+    fn joined(&mut self, seq: u64, replay_until: Option<u64>, fallback: bool, work: &mut Vec<Work>) {
+        if !self.joined_once || !self.settled {
+            let catchup = Catchup { joined: seq, until: replay_until };
+            self.catchup = catchup.replays_anything().then_some(catchup);
+            // A relay that marks the replay also says whether text ops follow. An older one
+            // does not, and its text ops have always been the catch-up.
+            self.text_catchup = fallback || replay_until.is_none();
+        } else {
+            self.catchup = None;
+            self.text_catchup = false;
         }
+        self.marked = replay_until.is_some();
+        self.since_join.clear();
         self.joined_once = true;
         self.lose_checkpoint(work, "the link rejoined");
     }
@@ -424,6 +504,17 @@ impl<H: Hub> Live<H> {
         if self.checkpoint.take().is_some() {
             log::info!("collab: a checkpoint in flight was dropped: {why}");
             work.push(Work::CheckpointRaced);
+        }
+    }
+
+    /// Drop a checkpoint the relay refused. Permanent refusals are told apart from the rest,
+    /// so an app that retries on [`Work::CheckpointRaced`] does not loop on them.
+    fn refuse_checkpoint(&mut self, work: &mut Vec<Work>, detail: &str) {
+        if !refusal_is_permanent(detail) {
+            self.lose_checkpoint(work, "the relay reported an error");
+        } else if self.checkpoint.take().is_some() {
+            log::info!("collab: the relay refused a checkpoint: {detail}");
+            work.push(Work::CheckpointRefused { reason: detail.to_owned() });
         }
     }
 
@@ -469,6 +560,15 @@ impl<H: Hub> Live<H> {
                 Restart::Refused => return,
                 Restart::Ordinary(snapshot) => updates.insert(0, snapshot),
             }
+        }
+        if restart {
+            // Live ops that overtook the text ops landed on the replica the restart may just
+            // have replaced. Applying them again is harmless when it did not.
+            updates.append(&mut self.since_join);
+        } else if self.text_catchup && self.marked && self.from_file && self.doc.is_some() {
+            // Only for a relay that marks its fallback: there the text ops are the very next
+            // message, so this holds the few live ops that overtook them and nothing more.
+            self.since_join.extend(updates.iter().cloned());
         }
         let Some(doc) = self.doc.as_mut() else {
             self.held.extend(updates);
@@ -517,6 +617,7 @@ impl<H: Hub> Live<H> {
         if self.edited {
             // Typed against the file before the catch-up arrived. Those edits name items the
             // room does not have, so there is no honest merge.
+            self.lose_checkpoint(work, "the replica broke");
             self.break_replica("edits were made against a file the room had already checkpointed past");
             work.push(Work::TextIncomplete { scope: scope.to_owned() });
             return Restart::Refused;
@@ -525,6 +626,9 @@ impl<H: Hub> Live<H> {
             Some(space) => doc.set_client(space).map(|()| doc),
             None => Ok(doc),
         });
+        // Whatever happens next, a snapshot taken of the replica before this one is not the
+        // room's and must never be reported as saved.
+        self.lose_checkpoint(work, "the replica was reset onto the room's snapshot");
         match restored {
             Ok(doc) => {
                 self.doc = Some(doc);
@@ -542,9 +646,22 @@ impl<H: Hub> Live<H> {
     }
 
     /// Whether the ordered op at `seq` is the first of the first catch-up. Consumed by the first
-    /// ordered op of any kind, so a later checkpoint from a peer is never mistaken for one.
+    /// ordered op of any kind inside the replay, so a later checkpoint from a peer is never
+    /// mistaken for one. An op past the replay is live and leaves the catch-up alone.
     fn first_of_catchup(&mut self, seq: u64) -> bool {
-        self.catchup.take().is_some_and(|c| c.starts_at(seq))
+        match self.catchup {
+            Some(catchup) if catchup.covers(seq) => {
+                self.catchup = None;
+                self.text_catchup = false;
+                self.settled = true;
+                catchup.starts_at(seq)
+            }
+            Some(_) => false,
+            None => {
+                self.settled = true;
+                false
+            }
+        }
     }
 
     /// One of this replica's submits was ordered. Finishes a checkpoint when it was that one.
@@ -590,32 +707,34 @@ impl<H: Hub> Live<H> {
                     }
                 }
             }
-            Effect::Apply { command, params, .. } => {
-                self.catchup = None;
+            Effect::Apply { command, params, seq } => {
+                self.first_of_catchup(seq);
                 work.push(Work::Command { command, params });
             }
             Effect::TextOps { scope, ops, complete, snap } => {
                 // The fallback catch-up: it replaces the ordered replay, so it is the catch-up.
-                let restart = self.catchup.take().is_some();
+                let restart = std::mem::take(&mut self.text_catchup);
+                self.settled = true;
                 if !complete {
                     log::warn!("collab: the relay could not keep every change to {scope}");
                     self.notices.push(format!("{scope} has changes this session cannot rebuild; reopen the file"));
                     work.push(Work::TextIncomplete { scope });
-                    return;
-                }
-                match serde_json::from_value::<Vec<String>>(ops) {
-                    Ok(ops) => self.merge_updates(scope, &ops, snap, snap && restart, work),
-                    Err(e) => {
-                        log::warn!("collab: replayed operations for {scope} did not decode: {e}");
-                        self.notices.push(format!("{scope} could not be caught up; reopen the file"));
-                        work.push(Work::TextIncomplete { scope });
+                } else {
+                    match serde_json::from_value::<Vec<String>>(ops) {
+                        Ok(ops) => self.merge_updates(scope, &ops, snap, snap && restart, work),
+                        Err(e) => {
+                            log::warn!("collab: replayed operations for {scope} did not decode: {e}");
+                            self.notices.push(format!("{scope} could not be caught up; reopen the file"));
+                            work.push(Work::TextIncomplete { scope });
+                        }
                     }
                 }
+                self.since_join.clear();
             }
             Effect::Frame { origin, payload } => work.push(Work::Frame { origin, payload }),
             Effect::Ephemeral { origin, kind, payload } => work.push(Work::Ephemeral { origin, kind, payload }),
             Effect::Confirmed { local, seq } => {
-                self.catchup = None;
+                self.first_of_catchup(seq);
                 self.confirmed(local, seq, work);
             }
             Effect::Replace { document, seq } => {
@@ -641,8 +760,9 @@ impl<H: Hub> Live<H> {
             }
             Effect::Notice { detail } => {
                 // A relay error. It carries no counter, so a checkpoint in flight may be the
-                // submit it refused; dropping it as raced only costs a retry.
-                self.lose_checkpoint(work, "the relay reported an error");
+                // submit it refused. Dropping it costs a retry when the error can pass; when
+                // it cannot, the app is told not to retry.
+                self.refuse_checkpoint(work, &detail);
                 log::info!("collab: {detail}");
                 self.notices.push(detail);
             }
@@ -724,6 +844,7 @@ mod tests {
             roster: Vec::new(),
             locks: Vec::new(),
             replay_until: None,
+            fallback: false,
         });
         live.pump();
         live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();

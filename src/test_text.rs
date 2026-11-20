@@ -59,3 +59,84 @@ impl Replica {
 
 /// The scope every update travels under.
 pub const SCOPE: &str = DOC_SCOPE;
+
+/// The paragraph every test edits, as a seed block for a [`craft_collab::Live`].
+pub fn para(text: &str) -> Vec<SeedBlock> {
+    vec![SeedBlock { id: PARA, text: text.to_owned(), attrs: Map::new(), runs: Vec::new() }]
+}
+
+/// A [`craft_collab::Live`] over a real socket, for the end-to-end tests: the path an app
+/// takes, so a save goes through [`craft_collab::Live::checkpoint`] and nothing else.
+pub struct LivePeer {
+    pub live: craft_collab::Live<craft_collab::native::NativeHub>,
+    pub work: Vec<craft_collab::Work>,
+}
+
+impl LivePeer {
+    pub async fn connect(url: &str, token: &str, doc: &str) -> LivePeer {
+        let hub = craft_collab::native::NativeHub::connect(url, token, None).await.expect("connect");
+        LivePeer { live: craft_collab::Live::new(hub, doc), work: Vec::new() }
+    }
+
+    /// Connect, seed `file` and wait until the relay granted an id space.
+    pub async fn open(url: &str, token: &str, doc: &str, file: &str) -> LivePeer {
+        let mut peer = LivePeer::connect(url, token, doc).await;
+        peer.live.seed(&para(file)).expect("the file seeds");
+        assert!(peer.until(std::time::Duration::from_secs(5), |live, _| live.ready_to_type()).await, "never ready to type");
+        peer
+    }
+
+    /// Connect without the file, wait for the catch-up, then load `file` as an app does.
+    pub async fn join_late(url: &str, token: &str, doc: &str, file: &str) -> LivePeer {
+        let mut peer = LivePeer::connect(url, token, doc).await;
+        peer.until(std::time::Duration::from_millis(800), |_, _| false).await;
+        peer.live.seed(&para(file)).expect("the file seeds");
+        peer
+    }
+
+    /// Pump until `done` holds or `d` passes. Whether it held.
+    pub async fn until(
+        &mut self,
+        d: std::time::Duration,
+        done: impl Fn(&craft_collab::Live<craft_collab::native::NativeHub>, &[craft_collab::Work]) -> bool,
+    ) -> bool {
+        let end = tokio::time::Instant::now() + d;
+        loop {
+            let work = self.live.pump();
+            self.work.extend(work);
+            if done(&self.live, &self.work) {
+                return true;
+            }
+            if tokio::time::Instant::now() > end {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The paragraph as this peer shows it.
+    pub fn text(&self) -> String {
+        self.live.doc().and_then(|d| d.block(PARA)).map(|b| b.text).unwrap_or_default()
+    }
+
+    /// Type `text` at char `at`.
+    pub fn insert(&mut self, at: usize, text: &str) {
+        self.live.edit(|d| d.insert_text(PARA, at, text, &Map::new())).expect("an edit goes out");
+    }
+
+    /// Checkpoint and wait for the relay to order it. Whether it was accepted.
+    pub async fn save(&mut self) -> bool {
+        self.live.checkpoint().expect("a checkpoint goes out");
+        let from = self.work.len();
+        self.until(std::time::Duration::from_secs(5), |_, work| {
+            work[from..].iter().any(|w| {
+                matches!(
+                    w,
+                    craft_collab::Work::Checkpointed { .. } | craft_collab::Work::CheckpointRaced | craft_collab::Work::CheckpointRefused { .. }
+                )
+            })
+        })
+        .await;
+        self.work[from..].iter().any(|w| matches!(w, craft_collab::Work::Checkpointed { .. }))
+    }
+}

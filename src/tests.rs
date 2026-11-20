@@ -1682,9 +1682,33 @@ mod relay_proto {
     fn wrong_proto_is_refused() {
         assert_eq!(PROTO, "craft-live/1");
         assert!(check_proto(&handshake(json!({"token": "t", "proto": "craft-live/1"}))).is_ok());
-        for bad in [json!({"token": "t"}), json!({"token": "t", "proto": null}), json!({"token": "t", "proto": "craft-live/2"}), json!({"token": "t", "proto": ""})] {
+        for bad in [
+            json!({"token": "t"}),
+            json!({"token": "t", "proto": null}),
+            json!({"token": "t", "proto": "craft-live/2"}),
+            json!({"token": "t", "proto": ""}),
+        ] {
             assert_eq!(check_proto(&handshake(bad.clone())), Err("version mismatch"), "{bad}");
         }
+    }
+
+    /// The client hubs name the version this relay checks for.
+    #[test]
+    fn the_client_speaks_this_relays_protocol() {
+        assert_eq!(PROTO, craft_collab::PROTO);
+    }
+
+    /// A client tells a refusal it may retry from one it must not by the relay's wording.
+    #[test]
+    fn the_client_reads_which_refusals_are_permanent() {
+        use crate::room::Refusal;
+        for permanent in [Refusal::ReadOnly, Refusal::TooLarge { bytes: 3 << 20 }] {
+            assert!(craft_collab::refusal_is_permanent(&permanent.detail()), "{}", permanent.detail());
+        }
+        for passing in [Refusal::Locked { holder: "bob".to_owned() }, Refusal::NotACheckpoint { seq: 4 }] {
+            assert!(!craft_collab::refusal_is_permanent(&passing.detail()), "{}", passing.detail());
+        }
+        assert!(!craft_collab::refusal_is_permanent("relay could not order that edit"));
     }
 
     fn fill(cap: usize, total: usize) -> Room {
@@ -1732,7 +1756,14 @@ mod relay_proto {
         assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "a"})));
         assert!(!r.remember_saved("svc", json!({"seq": 4, "etag": "b"})), "a lower seq is ignored");
         assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "c"})));
-        for bad in [json!({"seq": "6", "etag": "x"}), json!({"seq": 6}), json!({"seq": 6, "etag": 1}), json!({"seq": -1, "etag": "x"}), json!("x"), json!({"seq": 9, "etag": "e".repeat(2000)})] {
+        for bad in [
+            json!({"seq": "6", "etag": "x"}),
+            json!({"seq": 6}),
+            json!({"seq": 6, "etag": 1}),
+            json!({"seq": -1, "etag": "x"}),
+            json!("x"),
+            json!({"seq": 9, "etag": "e".repeat(2000)}),
+        ] {
             assert!(!r.remember_saved("svc", bad.clone()), "{bad}");
         }
         let kept = r.ephemeral();
@@ -1747,8 +1778,8 @@ mod relay_proto {
 
     #[test]
     fn only_the_service_peer_may_emit_saved() {
-        use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
         use crate::saved_allowed;
+        use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
         assert!(saved_allowed(&claims_for("craft_office", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"));
         assert!(!saved_allowed(&claims_for("craft_office", PERMISSION_READ), "craft_office"), "a read-only peer is refused");
         assert!(!saved_allowed(&claims_for("alice", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"), "a non-service editor is refused");

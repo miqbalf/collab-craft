@@ -65,6 +65,7 @@ impl WebHub {
             None => JsValue::NULL,
         };
         Reflect::set(&auth, &JsValue::from_str("applied"), &applied_js).map_err(js)?;
+        Reflect::set(&auth, &JsValue::from_str("proto"), &JsValue::from_str(crate::proto::PROTO)).map_err(js)?;
         let options = Object::new();
         Reflect::set(&options, &JsValue::from_str("auth"), &auth).map_err(js)?;
 

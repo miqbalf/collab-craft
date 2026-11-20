@@ -37,6 +37,7 @@ mod unit {
             roster: vec![],
             locks: vec![],
             replay_until: None,
+            fallback: false,
         });
         let mut fx = Vec::new();
         for seq in 4..=100u64 {
@@ -91,7 +92,7 @@ mod e2e {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::test_text::{Replica, SCOPE};
+    use crate::test_text::{LivePeer, Replica, SCOPE};
     use craft_collab::native::NativeHub;
     use craft_collab::{ClientMsg, Effect, Hub, Session};
     use serde_json::json;
@@ -114,7 +115,13 @@ mod e2e {
         let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
         let mut bus = Bus::connect(&valkey).await.expect("valkey");
         bus.check_writable().await.expect("writable");
-        let relay = Arc::new(Relay { text_cap: crate::room::TEXT_BYTES, service_uid: "craft_office".to_owned(), secret: SECRET.to_vec(), bus: Mutex::new(bus), rooms: Mutex::new(Default::default()) });
+        let relay = Arc::new(Relay {
+            text_cap: crate::room::TEXT_BYTES,
+            service_uid: "craft_office".to_owned(),
+            secret: SECRET.to_vec(),
+            bus: Mutex::new(bus),
+            rooms: Mutex::new(Default::default()),
+        });
         let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
@@ -255,14 +262,17 @@ mod e2e {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let before = bob_session.applied();
         cell_edits(&mut a, &[1, 2]).await;
-        let m = ClientMsg::Saved { doc: a.s.doc().to_owned(), seq: a.s.applied() };
-        a.send(m);
-        a.settle(Duration::from_millis(200)).await;
+        // The save goes through a checkpoint, the only save the relay accepts. Carol is the
+        // saver: a separate replica of the document, as the service worker is.
+        let t = token::sign_at(SECRET, &room, "carol", "carol", true, "carol", now()).unwrap();
+        let mut saver = LivePeer::open(&h.url, &t, &format!("doc:{room}"), "hello").await;
+        assert!(saver.save().await, "the checkpoint was not accepted: {:?}", saver.work);
+        saver.until(Duration::from_millis(200), |_, _| false).await;
         cell_edits(&mut a, &[3]).await;
 
         let mut b = Client::connect_with(&h, &room, "bob", true, bob_session).await;
         b.settle(Duration::from_millis(800)).await;
-        let n = applies(&b.fx);
+        let n = b.fx.iter().filter(|e| matches!(e, Effect::Apply { command, .. } if command == "cell.set")).count();
         let replaced = b.fx.iter().any(|e| matches!(e, Effect::Replace { .. }));
         assert!(
             n == 3 || replaced,
@@ -349,5 +359,44 @@ mod e2e {
             room_seq + 3,
             b.s.applied()
         );
+    }
+
+    /// Fix round 2, item 5: a live op broadcast while a peer is joining reaches it exactly
+    /// once. Alice types without pause while joiners keep arriving; every joiner must end at
+    /// the room's last sequence with each op applied once and no resync needed to get there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs REVIEW_VALKEY_URL"]
+    async fn e2e_an_op_during_the_join_window_reaches_the_joiner_once() {
+        let Some(h) = start().await else { return };
+        let room = unique_room("join-window");
+        let mut a = Client::connect(&h, &room, "alice", true).await;
+        const EDITS: u64 = 200;
+        let typing = tokio::spawn(async move {
+            for v in 0..EDITS {
+                let m = a.s.submit("cell.set", json!({"cell": "A1", "v": v}), None);
+                a.send(m);
+                a.until(Duration::from_millis(2), |_, _| false).await;
+            }
+            a.until(Duration::from_secs(10), |s, _| s.inflight() == 0).await;
+            a
+        });
+        let mut joiners = Vec::new();
+        for i in 0..12 {
+            joiners.push(Client::connect(&h, &room, &format!("j{i}"), true).await);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let a = typing.await.unwrap();
+        let last = a.s.applied();
+        assert_eq!(last, EDITS, "alice's edits were all ordered");
+        for (i, j) in joiners.iter_mut().enumerate() {
+            j.until(Duration::from_secs(5), |s, _| s.applied() == last).await;
+            let mut seqs: Vec<u64> = j.fx.iter().filter_map(|e| if let Effect::Apply { seq, .. } = e { Some(*seq) } else { None }).collect();
+            let resynced = j.fx.iter().any(|e| matches!(e, Effect::Send { msg: ClientMsg::Resync { .. } }));
+            let n = seqs.len();
+            seqs.dedup();
+            assert_eq!(seqs.len(), n, "joiner {i} applied an op twice");
+            assert!(!resynced && j.s.applied() == last, "joiner {i} at {} of {last}, resync needed: {resynced}", j.s.applied());
+            assert_eq!(seqs, (1..=last).collect::<Vec<_>>(), "joiner {i} did not apply every op once");
+        }
     }
 }

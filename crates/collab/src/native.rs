@@ -53,7 +53,7 @@ impl NativeHub {
         let (outbox, mut out_rx) = unbounded_channel::<ClientMsg>();
         let connected = Arc::new(AtomicBool::new(false));
 
-        let mut builder = ClientBuilder::new(url).auth(serde_json::json!({ "token": token, "applied": applied }));
+        let mut builder = ClientBuilder::new(url).auth(serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO }));
 
         // "error" is in the list because the relay reports its own refusals
         // that way, and an app needs to show them rather than have them

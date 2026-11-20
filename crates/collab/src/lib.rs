@@ -65,8 +65,8 @@ mod tests;
 
 pub use error::{Error, Result};
 pub use hub::{EVENTS, Hub, decode, emit, encode, receive};
-pub use live::{DOC_SCOPE, Live, TextPayload, Work, update_from_wire, update_to_wire};
-pub use proto::{CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PeerId, Presence, Scope, ServerMsg, is_crdt_command};
+pub use live::{DOC_SCOPE, Live, TextPayload, Work, refusal_is_permanent, update_from_wire, update_to_wire};
+pub use proto::{CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PROTO, PeerId, Presence, Scope, ServerMsg, is_crdt_command};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};

@@ -550,7 +550,16 @@ impl Hub for FakeHub {
 }
 
 fn joined(peer: &str, space: u32) -> ServerMsg {
-    ServerMsg::Joined { doc: "d".to_owned(), peer: peer.to_owned(), seq: 0, space, roster: Vec::new(), locks: Vec::new(), replay_until: None }
+    ServerMsg::Joined {
+        doc: "d".to_owned(),
+        peer: peer.to_owned(),
+        seq: 0,
+        space,
+        roster: Vec::new(),
+        locks: Vec::new(),
+        replay_until: None,
+        fallback: false,
+    }
 }
 
 #[test]
@@ -736,7 +745,7 @@ fn a_snapshot_after_the_first_op_is_an_ordinary_update() {
 // ---- fix round 1 -------------------------------------------------------------------------
 
 fn joined_at(peer: &str, space: u32, seq: u64, replay_until: Option<u64>) -> ServerMsg {
-    ServerMsg::Joined { doc: "d".to_owned(), peer: peer.to_owned(), seq, space, roster: Vec::new(), locks: Vec::new(), replay_until }
+    ServerMsg::Joined { doc: "d".to_owned(), peer: peer.to_owned(), seq, space, roster: Vec::new(), locks: Vec::new(), replay_until, fallback: false }
 }
 
 fn wire(up: &[u8]) -> Value {
@@ -764,7 +773,7 @@ fn text_ops_keep_the_tail_after_a_snapshot() {
     // Before the file is loaded.
     let hub = FakeHub::default();
     let mut live = Live::new(hub.clone(), "d");
-    hub.0.borrow_mut().inbox.extend([joined_at("c", 3, 5, Some(5)), text_ops(ops.clone(), true)]);
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), text_ops(ops.clone(), true)]);
     let work = live.pump();
     assert!(work.iter().any(|w| matches!(w, Work::SeedWanted { .. })), "{work:?}");
     live.seed(&sample()).unwrap();
@@ -775,7 +784,7 @@ fn text_ops_keep_the_tail_after_a_snapshot() {
     let hub = FakeHub::default();
     let mut live = Live::new(hub.clone(), "d");
     live.seed(&sample()).unwrap();
-    hub.0.borrow_mut().inbox.extend([joined_at("c", 3, 5, Some(5)), text_ops(ops, true)]);
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), text_ops(ops, true)]);
     let work = live.pump();
     assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
     assert_eq!(live.doc().unwrap().block(1).unwrap().text, "21Title");
@@ -910,7 +919,7 @@ fn a_failed_snapshot_restore_never_falls_back_to_the_file() {
     let hub = FakeHub::default();
     let mut live = Live::new(hub.clone(), "d");
     let not_a_state = craft_collab::update_to_wire(&[0xff, 0x00, 0x13, 0x37]);
-    hub.0.borrow_mut().inbox.extend([joined_at("c", 3, 5, Some(5)), text_ops(json!([not_a_state]), true)]);
+    hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), text_ops(json!([not_a_state]), true)]);
     live.pump();
     assert!(live.seed(&sample()).is_err());
     assert!(live.seed(&sample()).is_err(), "a second try does not seed the file");
@@ -932,4 +941,160 @@ fn set_client_carries_pending_updates() {
     c.set_client(3).unwrap();
     c.apply(&first).unwrap();
     assert_eq!(c.block(1).unwrap().text, "12Title");
+}
+
+// ---- fix round 2 -------------------------------------------------------------------------
+
+fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
+    ServerMsg::Joined {
+        doc: "d".to_owned(),
+        peer: peer.to_owned(),
+        seq,
+        space,
+        roster: Vec::new(),
+        locks: Vec::new(),
+        replay_until: Some(seq),
+        fallback: true,
+    }
+}
+
+fn relay_error(detail: &str) -> ServerMsg {
+    ServerMsg::Error { doc: "d".to_owned(), detail: detail.to_owned() }
+}
+
+/// 1b: a checkpoint needs a ready replica and waits for the join's catch-up, ordered or not,
+/// because the catch-up may still replace the replica it would snapshot.
+#[test]
+fn a_checkpoint_waits_for_a_ready_replica_and_the_catch_up() {
+    let mut other = replica(&sample(), 7);
+    let p4 = serde_json::to_value(TextPayload::new(&other.insert_text(1, 0, "o", &Map::new()).unwrap())).unwrap();
+
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    assert!(live.checkpoint().is_err(), "no id space yet");
+
+    // An ordered replay of 4..=5: refused until its first op lands.
+    hub.0.borrow_mut().inbox.push(joined_at("c", 3, 3, Some(5)));
+    live.pump();
+    assert!(live.checkpoint().is_err(), "the replay has not arrived");
+    hub.0.borrow_mut().inbox.push(op(4, "other", Some(1), p4));
+    live.pump();
+    live.checkpoint().unwrap();
+
+    // The fallback: refused until the text ops land.
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(fallback_join("c", 3, 5));
+    live.pump();
+    assert!(live.checkpoint().is_err(), "the text ops have not arrived");
+    hub.0.borrow_mut().inbox.push(text_ops(json!([wire(&other.state())]), false));
+    live.pump();
+    live.checkpoint().unwrap();
+}
+
+/// 1a: a checkpoint in flight when the catch-up resets the replica onto the room's snapshot
+/// was taken of the file, not of the room. It is dropped as raced and never reported saved.
+#[test]
+fn a_reset_drops_the_checkpoint_in_flight() {
+    let mut room = replica(&sample(), 9);
+    room.insert_text(2, 0, "¡", &Map::new()).unwrap();
+
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    // An older relay, which does not say whether text ops follow.
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, None));
+    live.pump();
+    live.checkpoint().unwrap();
+    let (local, params) = last_submit(&hub);
+
+    hub.0.borrow_mut().inbox.push(text_ops(json!([wire(&room.state())]), true));
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+    assert!(work.iter().any(|w| matches!(w, Work::CheckpointRaced)), "{work:?}");
+
+    hub.0.borrow_mut().inbox.push(op(1, "alice", Some(local), params));
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::Checkpointed { .. })), "{work:?}");
+    assert!(!hub.0.borrow().sent.iter().any(|m| matches!(m, ClientMsg::Saved { .. })), "{:?}", hub.0.borrow().sent);
+    assert_same(&room, live.doc().unwrap(), &whole(&room));
+}
+
+/// 2: on the fallback path a live op can reach the socket before the text ops. It must not use
+/// up their restart, and it must survive the restart.
+#[test]
+fn a_live_op_before_the_fallback_text_ops_keeps_the_restart() {
+    let mut worker = replica(&sample(), 9);
+    let mut peer = replica(&sample(), 2);
+    let u1 = peer.insert_text(2, 0, "¡", &Map::new()).unwrap();
+    worker.apply(&u1).unwrap();
+    let saved_file = file_of(&worker);
+    let snap = worker.state();
+    let live_edit = serde_json::to_value(TextPayload::new(&peer.insert_text(4, 0, ">", &Map::new()).unwrap())).unwrap();
+    for up in bytes_of(&live_edit) {
+        worker.apply(&up).unwrap();
+    }
+    for early_seed in [true, false] {
+        let hub = FakeHub::default();
+        let mut live = Live::new(hub.clone(), "d");
+        if early_seed {
+            live.seed(&saved_file).unwrap();
+        }
+        hub.0.borrow_mut().inbox.extend([fallback_join("c", 3, 5), op(6, "peer", Some(2), live_edit.clone()), text_ops(json!([wire(&snap)]), true)]);
+        let work = live.pump();
+        if early_seed {
+            assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+        } else {
+            live.seed(&saved_file).unwrap();
+        }
+        assert_eq!(live.doc().unwrap().block(2).unwrap().text, "¡naïve 😀 text", "early seed {early_seed}");
+        assert_eq!(live.doc().unwrap().block(4).unwrap().text, ">last paragraph", "early seed {early_seed}");
+        assert_same(&worker, live.doc().unwrap(), &whole(&worker));
+    }
+}
+
+/// 3: a refusal a retry cannot change is reported apart from a race, so a retrying app stops.
+#[test]
+fn a_permanent_refusal_is_not_reported_as_a_race() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    for (detail, permanent) in [
+        ("that change is 99999999 bytes, more than this relay will carry", true),
+        ("read-only access to this file", true),
+        ("relay could not order that edit", false),
+    ] {
+        live.checkpoint().unwrap();
+        hub.0.borrow_mut().inbox.push(relay_error(detail));
+        let work = live.pump();
+        let refused = work.iter().any(|w| matches!(w, Work::CheckpointRefused { reason } if reason == detail));
+        let raced = work.iter().any(|w| matches!(w, Work::CheckpointRaced));
+        assert_eq!((refused, raced), (permanent, !permanent), "{detail}: {work:?}");
+    }
+}
+
+/// 5: the relay can broadcast a live op to a socket before telling it that it joined. The op
+/// is kept and handed over once, after the replay it follows.
+#[test]
+fn an_op_that_reaches_the_socket_before_joined_lands_once() {
+    let mut s = craft_collab::Session::new("d");
+    assert!(s.handle(op(3, "peer", Some(1), json!({}))).is_empty(), "nothing is applied before the join");
+    let applies = |fx: &[craft_collab::Effect]| {
+        fx.iter().filter_map(|e| if let craft_collab::Effect::Apply { seq, .. } = e { Some(*seq) } else { None }).collect::<Vec<_>>()
+    };
+    // The join is at 1 and replays 2; the early op 3 waits for it.
+    assert!(applies(&s.handle(joined_at("me", 4, 1, Some(2)))).is_empty());
+    assert_eq!(applies(&s.handle(op(2, "peer", Some(9), json!({})))), vec![2, 3]);
+    // The broadcast copy of 3 arriving again is dropped.
+    assert!(applies(&s.handle(op(3, "peer", Some(1), json!({})))).is_empty());
+
+    // A join past the early op drops it: it is the replay's, or already in the file.
+    let mut s = craft_collab::Session::new("d");
+    s.handle(op(3, "peer", Some(1), json!({})));
+    s.handle(op(5, "peer", Some(2), json!({})));
+    assert_eq!(applies(&s.handle(joined_at("me", 4, 4, Some(4)))), vec![5]);
 }

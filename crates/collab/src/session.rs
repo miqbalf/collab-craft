@@ -232,7 +232,11 @@ impl Session {
                 self.me = Some(peer);
                 self.applied = seq;
                 self.space = (space > 0).then_some(space);
-                self.pending.clear();
+                // Ops that reached the socket before this message are kept when they are past
+                // the join's sequence: the relay may broadcast a live op to a socket that has
+                // not been told it joined yet, and that op is in neither the replay nor any
+                // later message. Those at or below `seq` are the replay's to deliver.
+                self.pending.retain(|&held, _| held > seq);
                 self.roster = roster.clone();
                 self.remote_locks.clear();
                 self.held.clear();
@@ -249,6 +253,9 @@ impl Session {
                     out.push(Effect::Space { space });
                 } else {
                     log::warn!("doc {}: the relay granted no id space, so shared typing stays off", self.doc);
+                }
+                while let Some(next) = self.pending.remove(&(self.applied + 1)) {
+                    self.consume(next, &mut out);
                 }
                 out
             }
@@ -319,7 +326,9 @@ impl Session {
             return Vec::new();
         }
 
-        if seq > self.applied + 1 {
+        // Before the first join nothing is known about where the replay starts, so every op is
+        // held for the join to sort out.
+        if seq > self.applied + 1 || self.me.is_none() {
             // Out of order. Hold it and wait.
             self.pending.insert(seq, op);
             if self.pending.len() > MAX_PENDING {
