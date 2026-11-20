@@ -106,6 +106,8 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
 struct Relay {
     /// Per-scope cap on retained CRDT text for every room this relay creates.
     text_cap: usize,
+    /// The ticket `uid` of the one peer allowed to emit `saved`.
+    service_uid: String,
     secret: Vec<u8>,
     bus: Mutex<Bus>,
     /// file id -> room. One lock, because ordering needs a single decision
@@ -150,10 +152,31 @@ fn normalise_base(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    if !trimmed.starts_with('/') || trimmed.contains("//") || trimmed.contains(char::is_whitespace) {
+    if !trimmed.starts_with('/') || trimmed.contains("//") || trimmed.contains(char::is_whitespace) || trimmed.contains(['?', '#', '%']) {
         return Err(format!("COLLABCRAFT_BASE must look like /craft, got {raw:?}"));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Whether this peer may emit the `saved` marker: the service peer, with edit right.
+fn saved_allowed(claims: &Claims, service_uid: &str) -> bool {
+    claims.may_edit() && claims.uid == service_uid
+}
+
+/// Upper bound for `COLLABCRAFT_TEXT_BYTES`.
+const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Parse `COLLABCRAFT_TEXT_BYTES`: empty means the default, 0 is refused, large values clamp.
+fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(DEFAULT_TEXT_BYTES);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => Err("COLLABCRAFT_TEXT_BYTES must be greater than 0"),
+        Ok(n) => Ok(n.min(MAX_TEXT_BYTES)),
+        Err(_) => Err("COLLABCRAFT_TEXT_BYTES must be a number of bytes"),
+    }
 }
 
 impl Relay {
@@ -264,14 +287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(valkey_url = %redact_url(&valkey_url), "bus ready");
 
     let secret_bytes = secret.clone().into_bytes();
-    let text_cap = match std::env::var("COLLABCRAFT_TEXT_BYTES") {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse::<usize>().map_err(|_| "COLLABCRAFT_TEXT_BYTES must be a number of bytes")?,
-        _ => DEFAULT_TEXT_BYTES,
-    };
+    let text_cap = parse_text_bytes(&std::env::var("COLLABCRAFT_TEXT_BYTES").unwrap_or_default())?;
+    let service_uid = std::env::var("COLLABCRAFT_SERVICE_UID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "craft_office".to_owned());
     let base = normalise_base(&std::env::var("COLLABCRAFT_BASE").unwrap_or_default())?;
     let public_apps = std::env::var("COLLABCRAFT_PUBLIC_APPS").is_ok_and(|v| v.trim() == "1");
     tracing::info!(text_cap, base = %base, public_apps, "relay options");
-    let relay = Arc::new(Relay { text_cap, secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
+    let relay = Arc::new(Relay { text_cap, service_uid, secret: secret_bytes.clone(), bus: Mutex::new(bus), rooms: Mutex::new(HashMap::new()) });
     // For the health route, which outlives the move into the socket layer.
     let health_relay = relay.clone();
 
@@ -940,9 +961,24 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
 async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
     let room_name = claims.room();
-    // The saved marker names the join baseline for everybody, so it takes the same right a
-    // save does. Other kinds stay open to readers.
-    if msg.kind == room::SAVED_KIND && !claims.may_edit() {
+    // The saved marker names the join baseline for everybody, so only the service peer may
+    // set it. Nothing about the payload is logged.
+    if msg.kind == room::SAVED_KIND {
+        if !saved_allowed(&claims, &relay.service_uid) {
+            tracing::debug!(room = %claims.rm, "dropping a saved marker from a peer that is not the service");
+            return;
+        }
+        let accepted = {
+            let mut rooms = relay.rooms.lock().await;
+            relay.room(&mut rooms, &claims.rm).remember_saved(&claims.pid, msg.payload.clone())
+        };
+        if accepted {
+            emit_live(
+                socket.to(room_name.clone()),
+                "ephemeral",
+                &serde_json::json!({ "doc": room_name, "origin": claims.pid, "kind": msg.kind, "payload": msg.payload }),
+            );
+        }
         return;
     }
 

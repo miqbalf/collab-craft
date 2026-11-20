@@ -1678,4 +1678,52 @@ mod relay_proto {
         let state = r.ephemeral();
         assert!(state.iter().any(|(_, kind, v)| kind == "saved" && v == &json!({"seq": 7, "etag": "abc"})), "{state:?}");
     }
+
+    #[test]
+    fn saved_marker_is_validated() {
+        let mut r = Room::default();
+        assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "a"})));
+        assert!(!r.remember_saved("svc", json!({"seq": 4, "etag": "b"})), "a lower seq is ignored");
+        assert!(r.remember_saved("svc", json!({"seq": 5, "etag": "c"})));
+        for bad in [json!({"seq": "6", "etag": "x"}), json!({"seq": 6}), json!({"seq": 6, "etag": 1}), json!({"seq": -1, "etag": "x"}), json!("x"), json!({"seq": 9, "etag": "e".repeat(2000)})] {
+            assert!(!r.remember_saved("svc", bad.clone()), "{bad}");
+        }
+        let kept = r.ephemeral();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].2, json!({"seq": 5, "etag": "c"}));
+    }
+
+    fn claims_for(uid: &str, perm: u32) -> crate::token::Claims {
+        let payload = json!({ "rm": "r", "uid": uid, "dsp": uid, "perm": perm, "exp": super::NOW + 300, "pid": "p" });
+        crate::token::verify(&super::mint(payload, super::SECRET), super::SECRET, super::NOW).expect("verifies")
+    }
+
+    #[test]
+    fn only_the_service_peer_may_emit_saved() {
+        use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
+        use crate::saved_allowed;
+        assert!(saved_allowed(&claims_for("craft_office", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"));
+        assert!(!saved_allowed(&claims_for("craft_office", PERMISSION_READ), "craft_office"), "a read-only peer is refused");
+        assert!(!saved_allowed(&claims_for("alice", PERMISSION_READ | PERMISSION_UPDATE), "craft_office"), "a non-service editor is refused");
+    }
+
+    #[test]
+    fn text_bytes_config_is_bounded() {
+        use crate::parse_text_bytes;
+        assert_eq!(parse_text_bytes(""), Ok(16 * 1024 * 1024));
+        assert!(parse_text_bytes("0").is_err());
+        assert!(parse_text_bytes("abc").is_err());
+        assert_eq!(parse_text_bytes("999999999999"), Ok(64 * 1024 * 1024));
+        assert_eq!(parse_text_bytes("1048576"), Ok(1048576));
+    }
+
+    #[test]
+    fn base_path_rejects_odd_characters() {
+        use crate::normalise_base;
+        assert_eq!(normalise_base("/craft/"), Ok("/craft".to_owned()));
+        assert_eq!(normalise_base(""), Ok(String::new()));
+        for bad in ["craft", "/a?b", "/a#b", "/a%2fb", "//x"] {
+            assert!(normalise_base(bad).is_err(), "{bad}");
+        }
+    }
 }

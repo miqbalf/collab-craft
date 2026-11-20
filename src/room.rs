@@ -227,6 +227,9 @@ pub struct Room {
 /// The ephemeral kind that records a save: `{seq, etag}`.
 pub const SAVED_KIND: &str = "saved";
 
+/// Largest `saved` payload the relay keeps.
+pub const SAVED_MAX_BYTES: usize = 1024;
+
 impl Room {
     /// A room whose retained CRDT text may reach `cap` bytes per scope.
     ///
@@ -316,6 +319,24 @@ impl Room {
         out
     }
 
+    /// Record a `saved` marker. Returns whether it was accepted.
+    ///
+    /// The payload must be `{seq: u64, etag: string}` and at most [`SAVED_MAX_BYTES`]. A `seq`
+    /// lower than the stored one is ignored, so a late or replayed marker cannot move the
+    /// baseline back.
+    pub fn remember_saved(&mut self, peer_id: &str, value: serde_json::Value) -> bool {
+        let Some(seq) = value.get("seq").and_then(serde_json::Value::as_u64) else { return false };
+        if !value.get("etag").is_some_and(serde_json::Value::is_string) || value_bytes(&value) > SAVED_MAX_BYTES {
+            return false;
+        }
+        let stored = self.saved.as_ref().and_then(|(_, v)| v.get("seq")).and_then(serde_json::Value::as_u64);
+        if stored.is_some_and(|stored| seq < stored) {
+            return false;
+        }
+        self.saved = Some((peer_id.to_owned(), value));
+        true
+    }
+
     /// Record one peer's newest value for one kind.
     ///
     /// Latest wins, so the previous value is simply replaced. A peer past
@@ -327,7 +348,7 @@ impl Room {
             return Err(Refusal::TooLarge { bytes });
         }
         if kind == SAVED_KIND {
-            self.saved = Some((peer_id.to_owned(), value));
+            self.remember_saved(peer_id, value);
             return Ok(());
         }
         let kinds = self.ephemeral.entry(peer_id.to_owned()).or_default();

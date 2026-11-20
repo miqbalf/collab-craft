@@ -106,7 +106,7 @@ mod e2e {
         let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
         let mut bus = Bus::connect(&valkey).await.expect("valkey");
         bus.check_writable().await.expect("writable");
-        let relay = Arc::new(Relay { text_cap: crate::room::TEXT_BYTES, secret: SECRET.to_vec(), bus: Mutex::new(bus), rooms: Mutex::new(Default::default()) });
+        let relay = Arc::new(Relay { text_cap: crate::room::TEXT_BYTES, service_uid: "craft_office".to_owned(), secret: SECRET.to_vec(), bus: Mutex::new(bus), rooms: Mutex::new(Default::default()) });
         let (layer, io) = SocketIo::builder().max_payload(MAX_FRAME_BYTES as u64).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new().layer(layer);
