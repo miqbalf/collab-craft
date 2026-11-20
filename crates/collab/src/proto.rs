@@ -138,11 +138,16 @@ pub enum ServerMsg {
     /// `complete` is false when the relay had to drop operations for this scope. The text
     /// cannot be reconstructed then, and the peer has to be told rather than left to believe
     /// it is current.
+    ///
+    /// `snap` is true when the first of `ops` is a checkpoint snapshot (a full document
+    /// state). A joiner then starts from it and ignores the file. Absent from an older relay.
     TextOps {
         doc: DocId,
         scope: Scope,
         ops: Value,
         complete: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        snap: bool,
     },
     /// An opaque frame, passed through unread and unordered.
     ///

@@ -181,7 +181,7 @@ mod e2e {
             let mut ops = Vec::new();
             let mut complete = Vec::new();
             for e in &self.fx {
-                if let Effect::TextOps { scope: s, ops: o, complete: c } = e
+                if let Effect::TextOps { scope: s, ops: o, complete: c, .. } = e
                     && s == scope
                 {
                     let v: Vec<serde_json::Value> = serde_json::from_value(o.clone()).unwrap();

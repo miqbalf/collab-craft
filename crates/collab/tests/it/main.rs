@@ -249,45 +249,154 @@ fn undo_covers_structure_too() {
     assert_eq!(a.block(2), Some(sample()[1].clone()));
 }
 
-/// The relay keeps every `crdt.text` update since the file the room opened. A peer that seeds
-/// that same file later and applies the retained updates reaches the live replicas.
+/// The relay's retained `crdt.text` log, in order, as `(seq, params)`.
+#[derive(Default)]
+struct Relay {
+    seq: u64,
+    ops: Vec<(u64, Value)>,
+}
+
+impl Relay {
+    fn submit(&mut self, params: Value) -> u64 {
+        self.seq += 1;
+        self.ops.push((self.seq, params));
+        self.seq
+    }
+    fn edit(&mut self, up: Vec<u8>) -> Vec<u8> {
+        self.submit(serde_json::to_value(TextPayload::new(&up)).unwrap());
+        up
+    }
+    /// `Saved{seq}`: drop every op at or below it.
+    fn saved(&mut self, seq: u64) {
+        self.ops.retain(|(s, _)| *s > seq);
+    }
+}
+
+fn bytes_of(params: &Value) -> Vec<Vec<u8>> {
+    params["ops"].as_array().unwrap().iter().map(|op| update_from_wire(op.as_str().unwrap()).unwrap()).collect()
+}
+
+/// The document as the file would hold it: the blocks in order.
+fn file_of(d: &LiveDoc) -> Vec<SeedBlock> {
+    d.order().into_iter().map(|id| d.block(id).unwrap()).collect()
+}
+
+/// A and B edit, the worker checkpoints, the relay drops what the checkpoint covers, and C joins
+/// from what is left. Then all three edit inside the text the room was first seeded with, which
+/// is where a joiner built from the saved file would hold different item ids.
 #[test]
 fn late_joiner_after_checkpoint_converges() {
-    let checkpoint = sample();
-    let mut a = replica(&checkpoint, 1);
-    let mut b = replica(&checkpoint, 2);
-    let mut retained: Vec<Value> = Vec::new();
-    let mut keep = |up: Vec<u8>| -> Vec<u8> {
-        let params = serde_json::to_value(TextPayload::new(&up)).unwrap();
-        retained.extend(params["ops"].as_array().unwrap().iter().cloned());
-        up
-    };
+    let file = sample();
+    let mut a = replica(&file, 1);
+    let mut b = replica(&file, 2);
+    let mut worker = replica(&file, 9);
+    let mut relay = Relay::default();
 
-    let u1 = keep(a.insert_text(2, 0, "¡", &Map::new()).unwrap());
-    let u2 = keep(b.split(4, 4, 200).unwrap());
+    let u1 = relay.edit(a.insert_text(2, 0, "¡", &Map::new()).unwrap());
+    let u2 = relay.edit(b.split(4, 4, 200).unwrap());
     b.apply(&u1).unwrap();
     a.apply(&u2).unwrap();
-    let u3 = keep(a.format(200, 0, 3, &attrs(json!({"u": true}))).unwrap());
-    let u4 = keep(b.remove_block(3).unwrap());
+    let u3 = relay.edit(a.format(200, 0, 3, &attrs(json!({"u": true}))).unwrap());
+    let u4 = relay.edit(b.remove_block(3).unwrap());
     b.apply(&u3).unwrap();
     a.apply(&u4).unwrap();
-    let u5 = keep(b.merge(1, 2).unwrap());
+
+    // The worker has applied everything ordered so far, checkpoints at S and saves the file.
+    for (_, params) in &relay.ops.clone() {
+        for up in bytes_of(params) {
+            worker.apply(&up).unwrap();
+        }
+    }
+    let saved_file = file_of(&worker);
+    let s = relay.submit(serde_json::to_value(TextPayload::snapshot(&worker.state())).unwrap());
+    relay.saved(s - 1);
+    assert_eq!(relay.ops.first().map(|(seq, p)| (*seq, p["snap"].clone())), Some((s, Value::Bool(true))));
+
+    // Editing goes on after the checkpoint.
+    let u5 = relay.edit(b.merge(1, 2).unwrap());
     a.apply(&u5).unwrap();
 
-    let mut c = replica(&checkpoint, 3);
-    for op in &retained {
-        c.apply(&update_from_wire(op.as_str().unwrap()).unwrap()).unwrap();
+    // C joins: the first retained op is the snapshot, so it starts from that, never the file.
+    let (first, tail) = relay.ops.split_first().unwrap();
+    let mut c = LiveDoc::from_state(&bytes_of(&first.1)[0]).unwrap();
+    c.set_client(3);
+    for (_, params) in tail {
+        for up in bytes_of(params) {
+            c.apply(&up).unwrap();
+        }
     }
-    let ids = ids_of(&[&a, &b, &c]);
-    assert_same(&a, &b, &ids);
+    // The saved file is behind the checkpoint's items; a joiner never seeds it.
+    drop(saved_file);
+    let ids: BTreeSet<u64> = ids_of(&[&a, &b, &c]).into_iter().chain([1, 2, 3, 4, 200]).collect();
     assert_same(&a, &c, &ids);
 
-    // And the joiner writes in its own space without colliding with anybody.
-    let u6 = c.insert_text(1, 0, ">", &Map::new()).unwrap();
-    a.apply(&u6).unwrap();
-    b.apply(&u6).unwrap();
+    // Everyone edits inside the originally seeded text.
+    let ua = a.insert_text(4, 2, "A", &Map::new()).unwrap();
+    let ub = b.delete_text(1, 1, 2).unwrap();
+    let uc = c.insert_text(1, 3, "C", &Map::new()).unwrap();
+    let uc2 = c.format(4, 0, 4, &attrs(json!({"b": true}))).unwrap();
+    for (d, ups) in [(&mut a, vec![&ub, &uc, &uc2]), (&mut b, vec![&ua, &uc, &uc2]), (&mut c, vec![&ua, &ub])] {
+        for up in ups {
+            d.apply(up).unwrap();
+        }
+    }
+    assert_same(&a, &b, &ids);
     assert_same(&a, &c, &ids);
-    assert_same(&b, &c, &ids);
+    for d in [&a, &b, &c] {
+        let rebuilt = LiveDoc::from_state(&d.state()).unwrap();
+        assert_same(&a, &rebuilt, &ids);
+    }
+}
+
+/// A block removed before the checkpoint stays out of the order after a restore, and a late
+/// edit to it is still reported against its id.
+#[test]
+fn snapshot_restores_tombstones() {
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let removal = a.remove_block(3).unwrap();
+    // B has not seen the removal and types into the block.
+    let typing = b.insert_text(3, 0, "late", &Map::new()).unwrap();
+
+    let mut c = LiveDoc::from_state(&a.state()).unwrap();
+    c.set_client(3);
+    assert_eq!(c.order(), vec![1, 2, 4]);
+    assert_eq!(c.block(3), Some(plain(3, "")));
+    assert_eq!(c.apply(&typing).unwrap(), vec![BlockChange::Text { id: 3 }]);
+    assert_eq!(c.block(3).unwrap().text, "late");
+    b.apply(&removal).unwrap();
+    assert_same(&b, &c, &[1, 2, 3, 4].into_iter().collect());
+}
+
+#[test]
+fn from_state_refuses_garbage() {
+    assert!(matches!(LiveDoc::from_state(&[0xff, 0x01, 0x02]), Err(LiveError::Decode)));
+}
+
+/// Damaged updates never escape as a panic: each is applied or refused as `Decode`.
+#[test]
+fn damaged_updates_never_panic() {
+    let mut source = replica(&sample(), 1);
+    let mut updates = vec![source.state()];
+    updates.push(source.insert_text(2, 3, "xyz", &attrs(json!({"b": true}))).unwrap());
+    updates.push(source.split(2, 5, 300).unwrap());
+    updates.push(source.remove_block(4).unwrap());
+    let mut mix = Mix(7);
+    for round in 0..3000 {
+        let mut bytes = updates[round % updates.len()].clone();
+        for _ in 0..=mix.below(4) {
+            let i = mix.below(bytes.len());
+            bytes[i] = (mix.next() & 0xff) as u8;
+        }
+        if mix.below(5) == 0 {
+            bytes.truncate(mix.below(bytes.len() + 1));
+        }
+        let mut target = replica(&sample(), 2);
+        match target.apply(&bytes) {
+            Ok(_) | Err(LiveError::Decode) => {}
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
 }
 
 // ---- the convergence property ------------------------------------------------------------
@@ -470,6 +579,7 @@ fn live_sends_yrs_updates_as_crdt_text() {
         scope: DOC_SCOPE.to_owned(),
         ops: params["ops"].clone(),
         complete: true,
+        snap: false,
     });
     let work = bob.pump();
     assert!(matches!(work.as_slice(), [Work::SeedWanted { .. }]), "{work:?}");
@@ -504,4 +614,117 @@ fn live_sends_yrs_updates_as_crdt_text() {
 fn live_doc_is_send() {
     fn send<T: Send>() {}
     send::<LiveDoc>();
+}
+
+fn op(seq: u64, origin: &str, local: Option<u64>, params: Value) -> ServerMsg {
+    ServerMsg::Op { doc: "d".to_owned(), seq, origin: origin.to_owned(), local, command: craft_collab::CRDT_TEXT.to_owned(), params, scope: None }
+}
+
+fn last_submit(hub: &FakeHub) -> (u64, Value) {
+    match hub.0.borrow_mut().sent.pop() {
+        Some(ClientMsg::Submit { local, params, .. }) => (local, params),
+        other => panic!("not a submit: {other:?}"),
+    }
+}
+
+/// The saver's side: a snapshot submit, then `Saved{S-1}` once it is ordered cleanly, and no
+/// save report when a remote edit slipped in ahead of it. Then the joiner's side: a first join
+/// whose catch-up starts with the snapshot restores it and ignores the file.
+#[test]
+fn live_checkpoint_and_snapshot_join() {
+    let alice_hub = FakeHub::default();
+    let mut alice = Live::new(alice_hub.clone(), "d");
+    alice.seed(&sample());
+    alice_hub.0.borrow_mut().inbox.push(joined("alice", 1));
+    alice.pump();
+    let mut bob = replica(&sample(), 2);
+    let mut relay: Vec<ServerMsg> = Vec::new();
+
+    alice.edit(|d| d.insert_text(2, 0, "¡", &Map::new())).unwrap();
+    let (l1, p1) = last_submit(&alice_hub);
+    relay.push(op(1, "alice", Some(l1), p1.clone()));
+    for up in bytes_of(&p1) {
+        bob.apply(&up).unwrap();
+    }
+
+    alice.checkpoint().unwrap();
+    assert!(alice.checkpoint().is_err(), "one checkpoint at a time");
+    let (l2, p2) = last_submit(&alice_hub);
+    assert_eq!(p2["snap"], Value::Bool(true));
+    relay.push(op(2, "alice", Some(l2), p2.clone()));
+    alice_hub.0.borrow_mut().inbox.extend(relay.clone());
+    let work = alice.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Checkpointed { seq: 2 })), "{work:?}");
+    assert!(matches!(alice_hub.0.borrow_mut().sent.pop(), Some(ClientMsg::Saved { seq: 1, .. })));
+
+    // A race: bob's edit is ordered between the snapshot and its confirmation.
+    alice.checkpoint().unwrap();
+    let (l3, _) = last_submit(&alice_hub);
+    let pb = serde_json::to_value(TextPayload::new(&bob.insert_text(4, 0, "B", &Map::new()).unwrap())).unwrap();
+    relay.push(op(3, "bob", Some(1), pb.clone()));
+    // The relay orders it after bob's edit (its content does not matter to this test).
+    relay.push(op(4, "alice", Some(l3), json!({"scope": "doc", "snap": true, "ops": []})));
+    alice_hub.0.borrow_mut().inbox.extend(relay[2..].iter().cloned());
+    let work = alice.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::CheckpointRaced)), "{work:?}");
+    assert!(alice_hub.0.borrow().sent.is_empty(), "a raced checkpoint is not reported as saved");
+
+    // The relay kept ops after seq 1. Carol joins at the saved baseline.
+    let saved_file = file_of(alice.doc().unwrap());
+    let carol_hub = FakeHub::default();
+    let mut carol = Live::new(carol_hub.clone(), "d");
+    carol_hub.0.borrow_mut().inbox.push(joined("carol", 3));
+    if let ServerMsg::Joined { seq, .. } = &mut carol_hub.0.borrow_mut().inbox[0] {
+        *seq = 1;
+    }
+    carol_hub.0.borrow_mut().inbox.extend(relay[1..].iter().cloned());
+    let work = carol.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::SeedWanted { .. })), "{work:?}");
+    carol.seed(&saved_file);
+    let ids: BTreeSet<u64> = [1, 2, 3, 4].into_iter().collect();
+    assert_same(alice.doc().unwrap(), carol.doc().unwrap(), &ids);
+
+    // Dave seeded the (saved) file before his catch-up arrived: he is reset onto the snapshot.
+    let dave_hub = FakeHub::default();
+    let mut dave = Live::new(dave_hub.clone(), "d");
+    dave.seed(&saved_file);
+    dave_hub.0.borrow_mut().inbox.push(joined("dave", 4));
+    if let ServerMsg::Joined { seq, .. } = &mut dave_hub.0.borrow_mut().inbox[0] {
+        *seq = 1;
+    }
+    dave_hub.0.borrow_mut().inbox.extend(relay[1..].iter().cloned());
+    let work = dave.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+    assert_same(alice.doc().unwrap(), dave.doc().unwrap(), &ids);
+
+    // Carol types inside the originally seeded text; alice and dave take it.
+    carol.edit(|d| d.insert_text(1, 2, "C", &Map::new())).unwrap();
+    let (lc, pc) = last_submit(&carol_hub);
+    alice_hub.0.borrow_mut().inbox.push(op(5, "carol", Some(lc), pc.clone()));
+    dave_hub.0.borrow_mut().inbox.push(op(5, "carol", Some(lc), pc));
+    alice.pump();
+    dave.pump();
+    assert_eq!(alice.doc().unwrap().block(1).unwrap().text, "TiCtle");
+    assert_same(alice.doc().unwrap(), carol.doc().unwrap(), &ids);
+    assert_same(alice.doc().unwrap(), dave.doc().unwrap(), &ids);
+}
+
+/// A reconnect shares history, so a snapshot in its catch-up is just another update.
+#[test]
+fn a_snapshot_after_the_first_op_is_an_ordinary_update() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample());
+    hub.0.borrow_mut().inbox.push(joined("eve", 5));
+    live.pump();
+    let mut other = replica(&sample(), 6);
+    let p1 = serde_json::to_value(TextPayload::new(&other.insert_text(1, 0, "x", &Map::new()).unwrap())).unwrap();
+    let p2 = serde_json::to_value(TextPayload::snapshot(&other.state())).unwrap();
+    live.edit(|d| d.insert_text(4, 0, "mine ", &Map::new())).unwrap();
+    hub.0.borrow_mut().inbox.push(op(1, "other", Some(1), p1));
+    hub.0.borrow_mut().inbox.push(op(2, "other", Some(2), p2));
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::Reset | Work::TextIncomplete { .. })), "{work:?}");
+    assert_eq!(live.doc().unwrap().block(1).unwrap().text, "xTitle");
+    assert_eq!(live.doc().unwrap().block(4).unwrap().text, "mine last paragraph");
 }

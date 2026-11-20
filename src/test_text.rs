@@ -22,6 +22,20 @@ impl Replica {
         Replica(doc)
     }
 
+    /// Restore from a retained snapshot op (one base64 full state), as a joiner does, and mint
+    /// in `space`.
+    pub fn from_snapshot(space: u32, op: &Value) -> Replica {
+        let state = update_from_wire(op.as_str().expect("an op is a string")).expect("an op is base64");
+        let mut doc = LiveDoc::from_state(&state).expect("a snapshot restores");
+        doc.set_client(space);
+        Replica(doc)
+    }
+
+    /// The `crdt.text` params of a checkpoint snapshot of this replica, as the saver submits.
+    pub fn snapshot(&self) -> Value {
+        serde_json::to_value(TextPayload::snapshot(&self.0.state())).expect("payload encodes")
+    }
+
     /// Type `text` at char `at` and return the `crdt.text` params to submit.
     pub fn insert(&mut self, at: usize, text: &str) -> Value {
         let update = self.0.insert_text(PARA, at, text, &Map::new()).expect("seeded and in a space");

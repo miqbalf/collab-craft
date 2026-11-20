@@ -58,8 +58,9 @@ pub enum Effect {
     /// CRDT operations this peer missed before it joined, for one scope.
     ///
     /// Outside the sequence, so no ordering applies. `complete` false means the relay could
-    /// not keep them all and the text cannot be rebuilt from the file plus these.
-    TextOps { scope: Scope, ops: Value, complete: bool },
+    /// not keep them all and the text cannot be rebuilt from the file plus these. `snap` true
+    /// means the first op is a checkpoint snapshot.
+    TextOps { scope: Scope, ops: Value, complete: bool, snap: bool },
     /// An opaque frame from another peer, unread by the relay and by this session.
     Frame { origin: PeerId, payload: String },
     /// Latest-wins state about another peer.
@@ -309,7 +310,7 @@ impl Session {
                 vec![Effect::Roster { roster }]
             }
 
-            ServerMsg::TextOps { scope, ops, complete, .. } => vec![Effect::TextOps { scope, ops, complete }],
+            ServerMsg::TextOps { scope, ops, complete, snap, .. } => vec![Effect::TextOps { scope, ops, complete, snap }],
 
             ServerMsg::Frame { origin, payload, .. } => vec![Effect::Frame { origin, payload }],
 

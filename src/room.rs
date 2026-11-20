@@ -130,6 +130,8 @@ pub struct TextLog {
     /// The ordered sequence each op in [`TextLog::ops`] was assigned, so a save
     /// can drop the ones it has baked into the file. Same length as `ops`.
     seqs: Vec<u64>,
+    /// Which ops are checkpoint snapshots (`"snap": true` on their submit). Same length as `ops`.
+    snaps: Vec<bool>,
     bytes: usize,
     /// Whether everything since the file was opened is still here.
     complete: bool,
@@ -146,6 +148,12 @@ impl TextLog {
         self.complete
     }
 
+    /// Whether the first retained op is a checkpoint snapshot, so a joiner starts from it rather
+    /// than from the file. The payload stays opaque; this is only the submit's own flag.
+    pub fn starts_with_snapshot(&self) -> bool {
+        self.snaps.first().copied().unwrap_or(false)
+    }
+
     /// Drop the operations a save has baked into the file.
     ///
     /// Everything ordered at or before `seq` is now in the saved file, so
@@ -154,16 +162,19 @@ impl TextLog {
     fn drop_through(&mut self, seq: u64) {
         let mut kept_ops = Vec::new();
         let mut kept_seqs = Vec::new();
+        let mut kept_snaps = Vec::new();
         let mut bytes = 0;
-        for (op, op_seq) in self.ops.drain(..).zip(self.seqs.drain(..)) {
+        for ((op, op_seq), snap) in self.ops.drain(..).zip(self.seqs.drain(..)).zip(self.snaps.drain(..)) {
             if op_seq > seq {
                 bytes += value_bytes(&op);
                 kept_ops.push(op);
                 kept_seqs.push(op_seq);
+                kept_snaps.push(snap);
             }
         }
         self.ops = kept_ops;
         self.seqs = kept_seqs;
+        self.snaps = kept_snaps;
         self.bytes = bytes;
     }
 }
@@ -412,7 +423,13 @@ impl Room {
         if !self.texts.contains_key(scope) && self.texts.len() >= MAX_SCOPES {
             return;
         }
-        let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog { ops: Vec::new(), seqs: Vec::new(), bytes: 0, complete: true });
+        let log = self.texts.entry(scope.to_owned()).or_insert_with(|| TextLog {
+            ops: Vec::new(),
+            seqs: Vec::new(),
+            snaps: Vec::new(),
+            bytes: 0,
+            complete: true,
+        });
         // Both bounds, because either alone leaves the other kind of growth unbounded: one
         // scope filled past its own cap, or many scopes each under it but summing past what
         // the room as a whole may hold. `self.text_bytes` still counts this scope's current
@@ -426,6 +443,7 @@ impl Room {
             self.text_bytes = self.text_bytes.saturating_sub(log.bytes);
             log.ops.clear();
             log.seqs.clear();
+            log.snaps.clear();
             log.bytes = 0;
             return;
         }
@@ -433,6 +451,9 @@ impl Room {
         // Every op in one submit shares that submit's sequence, which is what a
         // save checkpoint later compares against.
         log.seqs.extend(std::iter::repeat_n(op.seq, ops.len()));
+        // A snapshot submit carries one full state; its flag marks that op, not the batch.
+        let snap = op.params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        log.snaps.extend((0..ops.len()).map(|i| snap && i == 0));
         log.bytes += bytes;
         self.text_bytes += bytes;
     }

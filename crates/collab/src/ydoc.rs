@@ -135,6 +135,8 @@ pub struct LiveDoc {
     client: Option<u32>,
     /// Text and attribute changes the observer saw, drained by [`LiveDoc::apply`].
     seen: Arc<Mutex<Vec<BlockChange>>>,
+    /// yrs panicked part way through an apply, so this replica may hold half an update.
+    damaged: bool,
 }
 
 impl LiveDoc {
@@ -173,17 +175,33 @@ impl LiveDoc {
         if self.client == Some(space) {
             return;
         }
-        let state = self.state();
         let doc = build_doc(u64::from(space));
-        let applied = Update::decode_v1(&state).ok().map(|update| {
-            let mut txn = doc.transact_mut_with(REMOTE);
-            txn.apply_update(update).is_ok()
-        });
-        if applied != Some(true) {
-            log::warn!("collab: this replica's own state did not carry across a client change");
+        if let Err(e) = integrate(&doc, &self.state()) {
+            log::warn!("collab: this replica's own state did not carry across a client change: {e}");
             return;
         }
+        let damaged = self.damaged;
         *self = assemble(doc, Some(space));
+        self.damaged = damaged;
+    }
+
+    /// A replica restored from a full state, such as a checkpoint snapshot.
+    ///
+    /// Like [`seeded`](Self::seeded) it has no client id yet, so local edits wait for
+    /// [`set_client`](Self::set_client). Tombstoned blocks come back as tombstones. A joiner that
+    /// starts from a snapshot must not also seed the file: the file's text, seeded as client 0,
+    /// would be different items from the ones the snapshot holds.
+    pub fn from_state(state: &[u8]) -> Result<LiveDoc, LiveError> {
+        let doc = build_doc(0);
+        integrate(&doc, state)?;
+        Ok(assemble(doc, None))
+    }
+
+    /// Whether yrs panicked during an earlier apply. Such a replica may hold half an update and
+    /// should be rebuilt (from a snapshot, or by reopening) rather than trusted.
+    #[must_use]
+    pub fn damaged(&self) -> bool {
+        self.damaged
     }
 
     /// Merge an update from another replica, and say what it changed.
@@ -191,12 +209,13 @@ impl LiveDoc {
     /// Updates may arrive in any order and more than once. One whose dependencies have not
     /// arrived yet is held by yrs and lands when they do.
     pub fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
-        let update = Update::decode_v1(update).map_err(|_| LiveError::Decode)?;
         let before = self.order();
         self.drain_seen();
-        {
-            let mut txn = self.doc.transact_mut_with(REMOTE);
-            txn.apply_update(update).map_err(|_| LiveError::Decode)?;
+        if let Err(e) = integrate(&self.doc, update) {
+            if e == Integrate::Panicked {
+                self.damaged = true;
+            }
+            return Err(LiveError::Decode);
         }
         let after = self.order();
         let seen = self.drain_seen();
@@ -449,6 +468,41 @@ impl Roots {
     }
 }
 
+/// Why [`integrate`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum Integrate {
+    #[error("the update did not decode or apply")]
+    Refused,
+    #[error("yrs panicked while applying the update")]
+    Panicked,
+}
+
+impl From<Integrate> for LiveError {
+    fn from(_: Integrate) -> LiveError {
+        LiveError::Decode
+    }
+}
+
+/// Decode and apply one update as a remote change.
+///
+/// yrs can panic on bytes that decode but do not describe a valid document, so the apply runs
+/// under `catch_unwind`: a hostile or damaged update must not take the app down. That only holds
+/// where panics unwind; a wasm build with `panic = "abort"` still aborts.
+fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let update = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
+        let mut txn = doc.transact_mut_with(REMOTE);
+        txn.apply_update(update).map_err(|_| Integrate::Refused)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!("collab: yrs panicked on an update; it was refused");
+            Err(Integrate::Panicked)
+        }
+    }
+}
+
 fn build_doc(client: u64) -> Doc {
     let mut options = Options::with_client_id(ClientID::new(client));
     options.offset_kind = OffsetKind::Bytes;
@@ -483,7 +537,7 @@ fn assemble(doc: Doc, client: Option<u32>) -> LiveDoc {
     undo.expand_scope(&doc, &body);
     undo.expand_scope(&doc, &blocks);
     undo.include_origin(Origin::from(LOCAL));
-    LiveDoc { undo, doc, body, blocks, client, seen }
+    LiveDoc { undo, doc, body, blocks, client, seen, damaged: false }
 }
 
 /// The block a nested event belongs to, from its path below `"blocks"`.

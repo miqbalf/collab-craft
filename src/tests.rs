@@ -269,6 +269,49 @@ fn a_save_checkpoint_stops_a_joiner_double_applying_the_saved_text() {
     assert_eq!(bob.render(), "hello!", "the file's text is not doubled");
 }
 
+/// The snapshot checkpoint, through the real `Room`. The worker submits a snapshot op, ordered
+/// at S, and reports `Saved{S-1}`. The room keeps the snapshot first, says so, and a joiner
+/// restored from it plus the tail keeps converging with edits anchored in the original text,
+/// which a joiner seeded from the saved file could not.
+#[test]
+fn a_snapshot_checkpoint_is_retained_first_and_a_joiner_converges_from_it() {
+    use crate::test_text::{Replica, SCOPE};
+    let mut alice = Replica::seeded(1, "hello world");
+    let mut worker = Replica::seeded(9, "hello world");
+    let mut r = room_with(&[("alice", true)]);
+
+    let e1 = alice.insert(5, ",");
+    r.submit(1, sub("alice", true, "crdt.text", e1.clone(), None)).expect("ok");
+    worker.apply(e1["ops"].as_array().expect("ops"));
+    let snap = worker.snapshot();
+    assert_eq!(snap["snap"], json!(true));
+    r.submit(2, sub("alice", true, "crdt.text", snap, None)).expect("ok");
+    r.checkpoint(1);
+    let e3 = alice.insert(12, "!");
+    r.submit(3, sub("alice", true, "crdt.text", e3, None)).expect("ok");
+
+    let log = r.texts().get(SCOPE).expect("retained");
+    assert!(log.complete());
+    assert!(log.starts_with_snapshot(), "the snapshot survives the save that covers what it holds");
+    assert_eq!(log.ops().len(), 2);
+
+    let mut carol = Replica::from_snapshot(3, &log.ops()[0]);
+    carol.apply(&log.ops()[1..]);
+    assert_eq!(carol.render(), alice.render());
+
+    // Both edit inside the text the room was seeded with.
+    let ec = carol.insert(2, "C");
+    let ea = alice.insert(0, "A");
+    alice.apply(ec["ops"].as_array().expect("ops"));
+    carol.apply(ea["ops"].as_array().expect("ops"));
+    assert_eq!(carol.render(), "AheCllo, world!");
+    assert_eq!(alice.render(), carol.render());
+
+    // A later save drops the snapshot too, and the log no longer starts with one.
+    r.checkpoint(2);
+    assert!(!r.texts().get(SCOPE).expect("retained").starts_with_snapshot());
+}
+
 /// Latest wins, and the newest value per kind is what a joining peer is handed.
 #[test]
 fn ephemeral_state_keeps_only_the_newest_value_per_kind() {

@@ -161,8 +161,8 @@ fn an_ephemeral_message_carries_its_kind() {
 fn replayed_text_operations_reach_the_app_outside_the_sequence() {
     let mut s = Session::new(DOC);
     s.handle(joined(99));
-    let effects = s.handle(ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true });
-    assert_eq!(effects, vec![Effect::TextOps { scope: "/body/0".to_owned(), ops: json!([]), complete: true }]);
+    let effects = s.handle(ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true, snap: false });
+    assert_eq!(effects, vec![Effect::TextOps { scope: "/body/0".to_owned(), ops: json!([]), complete: true, snap: false }]);
     assert_eq!(s.applied(), 99, "a replay never moves the sequence");
 }
 
@@ -487,7 +487,7 @@ fn every_event_name_carries_exactly_one_server_message() {
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::Presence { doc: DOC.to_owned(), roster: Vec::new() },
         ServerMsg::Snapshot { doc: DOC.to_owned(), seq: 9, document: json!({}) },
-        ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true },
+        ServerMsg::TextOps { doc: DOC.to_owned(), scope: "/body/0".to_owned(), ops: json!([]), complete: true, snap: false },
         ServerMsg::Frame { doc: DOC.to_owned(), origin: "bob".to_owned(), payload: "c2lnbmVk".to_owned() },
         ServerMsg::Ephemeral { doc: DOC.to_owned(), origin: "bob".to_owned(), kind: "camera".to_owned(), payload: json!({"eye": [0, 0, 1]}) },
         ServerMsg::Error { doc: DOC.to_owned(), detail: "refused".to_owned() },

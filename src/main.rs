@@ -517,8 +517,11 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
                 match room.since(baseline) {
                     Some(replay) => Some((baseline, replay, Vec::new(), room.peers().to_vec(), room.ephemeral())),
                     None => {
-                        let texts: Vec<(String, Vec<serde_json::Value>, bool)> =
-                            room.texts().iter().map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete())).collect();
+                        let texts: Vec<(String, Vec<serde_json::Value>, bool, bool)> = room
+                            .texts()
+                            .iter()
+                            .map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete(), log.starts_with_snapshot()))
+                            .collect();
                         Some((room.seq(), Vec::new(), texts, room.peers().to_vec(), room.ephemeral()))
                     }
                 }
@@ -565,8 +568,9 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // could not be built. The file the joiner opens is behind the edits made
     // since it was written, and the sequence is already past those edits, so
     // these carry no sequence.
-    for (scope, ops, complete) in texts {
-        let _ = socket.emit("text_ops", &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": ops, "complete": complete }));
+    for (scope, ops, complete, snap) in texts {
+        let _ =
+            socket.emit("text_ops", &serde_json::json!({ "doc": room_name.clone(), "scope": scope, "ops": ops, "complete": complete, "snap": snap }));
     }
 
     // And on where everybody is, so somebody arriving late does not have to wait for each
