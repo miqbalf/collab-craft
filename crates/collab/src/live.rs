@@ -1,47 +1,86 @@
-//! A connected relay session with CRDT text, for native and browser hubs.
+//! A connected relay session with a shared yrs document, for native and browser hubs.
 //!
-//! Apps still map their own document onto scopes (a paragraph path, a cell address, a
-//! text-frame id). This type owns the socket, the ordering session, and the text replicas,
-//! so WordCraft and GridCraft do not each carry a copy, and a wasm build uses the same
-//! code path as a desktop one.
+//! The app maps its own content onto the blocks of a [`LiveDoc`] (a paragraph, a text frame).
+//! This type owns the socket, the ordering session and the document replica, so WordCraft and
+//! DeckCraft do not each carry a copy, and a wasm build uses the same code path as a desktop one.
+//!
+//! # The wire
+//!
+//! Every edit is one yrs update (v1), sent as a [`CRDT_TEXT`] submit whose params are
+//! [`TextPayload`]: `{"scope": "doc", "ops": [<base64 update>]}`. The relay retains `ops` per
+//! scope for joiners and never reads them, so its replay keeps working unchanged.
 //!
 //! # The join sequence an app has to respect
 //!
-//! 1. The relay grants an id space in its join payload. [`Live`] records it. Nothing may be
-//!    typed before that, and [`insert_text`](Live::insert_text) refuses until it arrives.
-//! 2. The relay replays the CRDT operations this peer missed, per scope. They are held.
-//! 3. The app seeds each scope from the file through [`seed`](Live::seed). The held
-//!    operations land on top, and [`seed`] answers with the text to show.
+//! 1. The relay grants an id space in its join payload. [`Live`] makes it the replica's client
+//!    id. Nothing may be typed before that, and [`edit`](Live::edit) refuses until it arrives.
+//! 2. The relay replays the updates this peer missed. Until the file is loaded they are held.
+//! 3. The app seeds the document from the file through [`seed`](Live::seed). The held updates
+//!    land on top, and [`seed`] answers with what they changed.
 //!
 //! The order of 2 and 3 does not matter, which is the point of holding. An app that seeds
 //! on first paint and a relay that replays immediately both work.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::crdt::{TextError, TextPayload, Texts};
 use crate::error::{Error, Result};
 use crate::hub::Hub;
 use crate::proto::{CRDT_TEXT, ClientMsg, ServerMsg};
 use crate::session::{Effect, Session};
+use crate::ydoc::{BlockChange, LiveDoc, LiveError, SeedBlock};
+
+/// The one scope the document's updates travel under.
+pub const DOC_SCOPE: &str = "doc";
+
+/// What rides as `params` on a [`CRDT_TEXT`] command.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPayload {
+    /// Always [`DOC_SCOPE`]. Kept on the wire because the relay retains updates per scope.
+    pub scope: String,
+    /// yrs updates (v1), base64.
+    pub ops: Vec<String>,
+}
+
+impl TextPayload {
+    /// The payload for one update.
+    #[must_use]
+    pub fn new(update: &[u8]) -> TextPayload {
+        TextPayload { scope: DOC_SCOPE.to_owned(), ops: vec![update_to_wire(update)] }
+    }
+}
+
+/// One yrs update as the wire carries it.
+#[must_use]
+pub fn update_to_wire(update: &[u8]) -> String {
+    STANDARD.encode(update)
+}
+
+/// One yrs update back from the wire.
+pub fn update_from_wire(op: &str) -> std::result::Result<Vec<u8>, LiveError> {
+    STANDARD.decode(op).map_err(|_| LiveError::Decode)
+}
 
 /// Work the app must do after one [`Live::pump`].
 ///
-/// CRDT text is already merged here. [`Work::Text`] is the rendered string to write into
-/// the document. Other commands still go through the app's `apply_remote`.
+/// Document updates are already merged here. [`Work::Doc`] says which blocks to re-read
+/// through [`Live::doc`]. Other commands still go through the app's `apply_remote`.
 #[derive(Debug)]
 pub enum Work {
-    /// A lock-scoped command that is not CRDT text.
+    /// A lock-scoped command that is not a document update.
     Command { command: String, params: Value },
-    /// A text unit after remote ops were applied.
-    Text { scope: String, rendered: String },
-    /// Load this scope from the file, through [`Live::seed`].
+    /// Remote updates landed. Re-read these blocks.
+    Doc { changes: Vec<BlockChange> },
+    /// Load the document from the file, through [`Live::seed`].
     ///
-    /// Raised when operations arrive for a scope this replica has not loaded. The operations
-    /// are held until it does, so the app can answer at its own pace.
+    /// Raised when updates arrive before this replica has loaded it. They are held until it
+    /// does, so the app can answer at its own pace.
     SeedWanted { scope: String },
-    /// This scope cannot be rebuilt from the file plus what the relay kept.
+    /// The document cannot be rebuilt from the file plus what the relay kept.
     ///
-    /// The relay dropped operations, so the text has to come from somewhere else. The honest
+    /// The relay dropped updates, so the content has to come from somewhere else. The honest
     /// answers are to leave the collaboration or to reopen the file.
     TextIncomplete { scope: String },
     /// An opaque frame from another peer. The relay did not read it and neither did this crate.
@@ -54,7 +93,12 @@ pub enum Work {
 pub struct Live<H> {
     hub: H,
     wire: Session,
-    texts: Texts,
+    /// The replica, once the app has seeded it from the file.
+    doc: Option<LiveDoc>,
+    /// Updates that arrived before the file was loaded, in arrival order.
+    held: Vec<Vec<u8>>,
+    /// The id space the relay granted, once it has.
+    space: Option<u32>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -70,31 +114,51 @@ impl<H: Hub> Live<H> {
         Live {
             hub,
             wire: Session::new(doc.into()),
-            // No id space until the relay grants one. A default would be a space another peer
-            // is also minting in, and the two would drop each other's characters.
-            texts: Texts::new(),
+            doc: None,
+            held: Vec::new(),
+            // No id space until the relay grants one. A default would be a client id another
+            // peer is also minting with, and the two would corrupt each other's items.
+            space: None,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
         }
     }
 
-    /// The text replicas, for reading a rendered scope.
-    pub fn texts(&mut self) -> &mut Texts {
-        &mut self.texts
+    /// The replica, once seeded.
+    pub fn doc(&self) -> Option<&LiveDoc> {
+        self.doc.as_ref()
     }
 
-    /// Load one scope from the file and get the text to show.
+    /// Load the document from the file and get what the held updates changed on top of it.
     ///
-    /// The answer already includes any operations that arrived before this call, so a scope
-    /// seeded late still shows the room's current text.
-    pub fn seed(&mut self, scope: &str, text: &str) -> String {
-        self.texts.seed(scope, text)
+    /// A document already seeded is left alone and nothing is reported.
+    pub fn seed(&mut self, blocks: &[SeedBlock]) -> Vec<BlockChange> {
+        if self.doc.is_some() {
+            return Vec::new();
+        }
+        let mut doc = LiveDoc::seeded(blocks);
+        if let Some(space) = self.space {
+            doc.set_client(space);
+        }
+        let mut changes = Vec::new();
+        for update in std::mem::take(&mut self.held) {
+            match doc.apply(&update) {
+                Ok(found) => changes.extend(found.into_iter().filter(|c| !changes.contains(c)).collect::<Vec<_>>()),
+                Err(e) => {
+                    log::warn!("collab: a held update did not apply: {e}");
+                    self.notices.push("could not apply a change from another editor".to_owned());
+                }
+            }
+        }
+        self.doc = Some(doc);
+        changes
     }
 
-    /// Whether the relay has granted an id space yet. Typing is refused until it has.
+    /// Whether the relay has granted an id space and the file is loaded. Editing is refused
+    /// until both hold.
     pub fn ready_to_type(&self) -> bool {
-        self.texts.space().is_some()
+        self.space.is_some() && self.doc.is_some()
     }
 
     /// Whether the transport believes it is connected.
@@ -102,25 +166,35 @@ impl<H: Hub> Live<H> {
         self.hub.connected()
     }
 
-    /// Send a lock-free text insert.
-    pub fn insert_text(&mut self, scope: &str, char_pos: usize, text: &str) -> Result<()> {
-        let ops = self.texts.local_insert(scope, char_pos, text).map_err(refusal)?;
-        self.send_ops(scope, ops)
+    /// Make one local edit and send the update it produced. Lock-free.
+    ///
+    /// For example `live.edit(|d| d.insert_text(id, at, "x", &attrs))`.
+    pub fn edit<F>(&mut self, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut LiveDoc) -> std::result::Result<Vec<u8>, LiveError>,
+    {
+        let doc = self.doc.as_mut().ok_or_else(|| Error::malformed("client", "the document was never seeded"))?;
+        let update = edit(doc).map_err(refusal)?;
+        self.send_update(&update)
     }
 
-    /// Send a lock-free text delete.
-    pub fn delete_text(&mut self, scope: &str, char_pos: usize, len: usize) -> Result<()> {
-        let ops = self.texts.local_delete(scope, char_pos, len).map_err(refusal)?;
-        self.send_ops(scope, ops)
+    /// Undo this replica's last local edit and send it. `false` when there is nothing to undo.
+    pub fn undo(&mut self) -> Result<bool> {
+        match self.doc.as_mut().and_then(LiveDoc::undo) {
+            Some(update) => self.send_update(&update).map(|()| true),
+            None => Ok(false),
+        }
     }
 
-    /// Send a lock-free whole-string replacement (a cell, a formula bar).
-    pub fn replace_text(&mut self, scope: &str, text: &str) -> Result<()> {
-        let ops = self.texts.replace(scope, text).map_err(refusal)?;
-        self.send_ops(scope, ops)
+    /// Redo the last undone local edit and send it. `false` when there is nothing to redo.
+    pub fn redo(&mut self) -> Result<bool> {
+        match self.doc.as_mut().and_then(LiveDoc::redo) {
+            Some(update) => self.send_update(&update).map(|()| true),
+            None => Ok(false),
+        }
     }
 
-    /// Send a lock-scoped command. Typing should use [`insert_text`] or [`replace_text`].
+    /// Send a lock-scoped command. Document edits go through [`edit`](Live::edit).
     pub fn submit(&mut self, command: impl Into<String>, params: Value, scope: Option<String>) -> Result<()> {
         let msg = self.wire.submit(command, params, scope);
         self.hub.send(msg)
@@ -145,7 +219,7 @@ impl<H: Hub> Live<H> {
         self.hub.send(msg)
     }
 
-    /// One frame of inbound work. Outbound is the app's: it calls insert/replace/submit
+    /// One frame of inbound work. Outbound is the app's: it calls edit/submit
     /// first, then this.
     pub fn pump(&mut self) -> Vec<Work> {
         let now = self.hub.connected();
@@ -175,31 +249,65 @@ impl<H: Hub> Live<H> {
         work
     }
 
-    fn send_ops(&mut self, scope: &str, ops: Vec<craft_crdt::text::TextOp>) -> Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let params = serde_json::to_value(TextPayload { scope: scope.to_owned(), ops }).map_err(|e| Error::malformed("client", e.to_string()))?;
+    fn send_update(&mut self, update: &[u8]) -> Result<()> {
+        let params = serde_json::to_value(TextPayload::new(update)).map_err(|e| Error::malformed("client", e.to_string()))?;
         let msg: ClientMsg = self.wire.submit_crdt(CRDT_TEXT, params);
         self.hub.send(msg)
     }
 
-    /// Merge one batch of text operations, or note that the scope is not loaded.
-    fn merge_text(&mut self, scope: String, ops: &[craft_crdt::text::TextOp], work: &mut Vec<Work>) {
-        match self.texts.apply(&scope, ops) {
-            Some(rendered) => work.push(Work::Text { scope, rendered }),
-            None => work.push(Work::SeedWanted { scope }),
+    /// Merge a batch of wire updates, or hold them until the file is loaded.
+    fn merge_updates(&mut self, scope: String, ops: &[String], work: &mut Vec<Work>) {
+        if scope != DOC_SCOPE {
+            log::warn!("collab: ignoring updates for scope {scope:?}, not {DOC_SCOPE:?}");
+            return;
+        }
+        let mut updates = Vec::new();
+        for op in ops {
+            match update_from_wire(op) {
+                Ok(u) => updates.push(u),
+                Err(e) => {
+                    log::warn!("collab: an update did not decode: {e}");
+                    self.notices.push("could not apply a change from another editor".to_owned());
+                }
+            }
+        }
+        let Some(doc) = self.doc.as_mut() else {
+            self.held.extend(updates);
+            work.push(Work::SeedWanted { scope });
+            return;
+        };
+        let mut changes = Vec::new();
+        for update in updates {
+            match doc.apply(&update) {
+                Ok(found) => {
+                    for c in found {
+                        if !changes.contains(&c) {
+                            changes.push(c);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("collab: an update did not apply: {e}");
+                    self.notices.push("could not apply a change from another editor".to_owned());
+                }
+            }
+        }
+        if !changes.is_empty() {
+            work.push(Work::Doc { changes });
         }
     }
 
     fn act(&mut self, effect: Effect, work: &mut Vec<Work>) {
         match effect {
             Effect::Space { space } => {
-                self.texts.set_space(space);
+                self.space = Some(space);
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.set_client(space);
+                }
                 log::debug!("collab: the relay granted id space {space}");
             }
             Effect::Apply { command, params } if command == CRDT_TEXT => match serde_json::from_value::<TextPayload>(params) {
-                Ok(payload) => self.merge_text(payload.scope, &payload.ops, work),
+                Ok(payload) => self.merge_updates(payload.scope, &payload.ops, work),
                 Err(e) => {
                     log::warn!("collab: a crdt.text payload did not decode: {e}");
                     self.notices.push("could not apply a change from another editor".to_owned());
@@ -213,8 +321,8 @@ impl<H: Hub> Live<H> {
                     work.push(Work::TextIncomplete { scope });
                     return;
                 }
-                match serde_json::from_value::<Vec<craft_crdt::text::TextOp>>(ops) {
-                    Ok(ops) => self.merge_text(scope, &ops, work),
+                match serde_json::from_value::<Vec<String>>(ops) {
+                    Ok(ops) => self.merge_updates(scope, &ops, work),
                     Err(e) => {
                         log::warn!("collab: replayed operations for {scope} did not decode: {e}");
                         self.notices.push(format!("{scope} could not be caught up; reopen the file"));
@@ -258,7 +366,7 @@ impl<H: Hub> Live<H> {
     }
 }
 
-/// A refused text edit, as a transport-level error with the reason kept.
-fn refusal(e: TextError) -> Error {
+/// A refused edit, as a transport-level error with the reason kept.
+fn refusal(e: LiveError) -> Error {
     Error::malformed("client", e.to_string())
 }

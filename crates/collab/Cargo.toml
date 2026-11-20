@@ -20,7 +20,7 @@ native-hub = ["dep:rust_socketio", "dep:tokio"]
 web-hub = ["dep:js-sys", "dep:wasm-bindgen"]
 
 [dependencies]
-craft-crdt = { workspace = true }
+base64 = "0.23"
 js-sys = { workspace = true, optional = true }
 log = { workspace = true }
 rust_socketio = { version = "0.6", features = ["async"], optional = true }
@@ -29,8 +29,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync", "rt"], optional = true }
 wasm-bindgen = { workspace = true, optional = true }
+# The shared document. Yjs-compatible, so a browser peer can speak the same updates later.
+# `sync` keeps the document `Send`, as the text replica it replaces was, so an app can own
+# it on a worker thread.
+yrs = { version = "0.28", features = ["sync"] }
 
 [dev-dependencies]
+proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # The example drives a live relay, so it needs the native transport. Declaring

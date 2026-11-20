@@ -174,16 +174,15 @@ fn unit_stale_disconnect_keeps_replacement_peer() {
 /// file and receives the retained replay. He must see "hello!".
 #[test]
 fn unit_replay_after_save_does_not_duplicate() {
-    use craft_collab::Texts;
-    let mut alice = Texts::in_space(1);
-    alice.seed("/body/0", "hello");
-    let ops = alice.local_insert("/body/0", 5, "!").unwrap();
-    let saved = alice.render("/body/0").unwrap();
+    use crate::test_text::{Replica, SCOPE};
+    let mut alice = Replica::seeded(1, "hello");
+    let params = alice.insert(5, "!");
+    let saved = alice.render();
     assert_eq!(saved, "hello!");
 
     let mut r = Room::default();
     r.join(peer("alice")).unwrap();
-    r.submit(1, sub("alice", "crdt.text", json!({"scope": "/body/0", "ops": serde_json::to_value(&ops).unwrap()}), None, None)).unwrap();
+    r.submit(1, sub("alice", "crdt.text", params, None, None)).unwrap();
     // ADAPTATION: the scenario is "alice saves 'hello!' while still connected", which is what
     // makes bob's load of the saved file valid in the first place. That save is what main.rs's
     // on_saved reports to the room as a checkpoint; without calling it here, the submitted op
@@ -191,11 +190,10 @@ fn unit_replay_after_save_does_not_duplicate() {
     // exactly the double-apply this test exists to rule out, not something it should find.
     r.checkpoint(1);
 
-    let log = r.texts().get("/body/0").unwrap();
-    let replay: Vec<craft_crdt::text::TextOp> = serde_json::from_value(serde_json::Value::Array(log.ops().to_vec())).unwrap();
-    let mut bob = Texts::in_space(2);
-    bob.apply("/body/0", &replay);
-    let seen = bob.seed("/body/0", &saved); // bob loads the SAVED file
+    let log = r.texts().get(SCOPE).unwrap();
+    let mut bob = Replica::seeded(2, &saved); // bob loads the SAVED file
+    bob.apply(log.ops());
+    let seen = bob.render();
     assert_eq!(
         seen,
         saved,

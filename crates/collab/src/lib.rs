@@ -2,13 +2,13 @@
 //!
 //! The relay assigns a strictly increasing sequence to every edit, and each client applies edits
 //! in that order. Concurrent work in different regions proceeds freely. Concurrent work in the
-//! same region is serialised by a scope lock, unless the command is `crdt.*`. Those carry
-//! [`craft_crdt`](https://github.com/storytold/craft-libs) operations (RGA text, fractional
-//! keys) and skip the lock: two people can type in the same paragraph and both insertions
-//! survive. CAD booleans and renders still take a lock, because they do not commute.
+//! same region is serialised by a scope lock, unless the command is `crdt.*`. A `crdt.text`
+//! command carries [yrs](https://docs.rs/yrs) updates for one shared [`LiveDoc`] and skips the
+//! lock: two people can type in the same paragraph and both insertions survive. CAD booleans
+//! and renders still take a lock, because they do not commute.
 //!
 //! Sequence numbers are a delivery order for catch-up. Merge correctness for `crdt.*` comes
-//! from character identities and frac keys, not from seq.
+//! from the CRDT's item identities, not from seq.
 //!
 //! Four pieces:
 //!
@@ -16,7 +16,7 @@
 //! * [`Session`] orders, deduplicates and tracks locks. It performs no IO and returns [`Effect`]
 //!   values describing what the app should do.
 //! * [`Hub`] is the transport seam a caller implements, intended for Socket.IO at both ends.
-//! * [`crdt`] is the per-scope RGA text replica, and [`Live`] pumps a hub plus those replicas.
+//! * [`LiveDoc`] is the shared block document, and [`Live`] pumps a hub plus that replica.
 //!   That is the shared solution. It does not live in `craft-cloud` (files) and it does not
 //!   live in one app's desktop binary.
 //!
@@ -38,13 +38,13 @@
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod crdt;
 mod error;
 mod hub;
 mod live;
 pub mod proto;
 mod session;
 mod token;
+mod ydoc;
 
 /// A [`Hub`] over `rust_socketio`, for native apps.
 ///
@@ -63,10 +63,10 @@ pub mod web;
 #[cfg(test)]
 mod tests;
 
-pub use crdt::{TextError, TextPayload, Texts, char_pos};
 pub use error::{Error, Result};
 pub use hub::{EVENTS, Hub, decode, emit, encode, receive};
-pub use live::{Live, Work};
+pub use live::{DOC_SCOPE, Live, TextPayload, Work, update_from_wire, update_to_wire};
 pub use proto::{CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PeerId, Presence, Scope, ServerMsg, is_crdt_command};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
+pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};

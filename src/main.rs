@@ -48,6 +48,9 @@ mod token;
 mod transport;
 
 #[cfg(test)]
+mod test_text;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

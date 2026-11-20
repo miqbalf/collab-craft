@@ -23,8 +23,8 @@ pub type DocId = String;
 /// its own granularity: `"B2"` or `"B2:D9"` in GridCraft, `"/body/3"` in WordCraft, a layer id in
 /// PhotoCraft. Two scopes that should not collide must not compare equal.
 ///
-/// Commands named `crdt.*` must omit a scope. Their payload is a CRDT operation (RGA text,
-/// fractional position) and concurrent edits in the same region are meant to merge. The
+/// Commands named `crdt.*` must omit a scope. Their payload is a CRDT operation (a yrs
+/// update, a fractional position) and concurrent edits in the same region are meant to merge. The
 /// relay strips a scope if a buggy client sends one. GridCraft cells and SolidCraft
 /// feature ops keep using a scope.
 pub type Scope = String;
@@ -35,7 +35,7 @@ pub fn is_crdt_command(command: &str) -> bool {
     command.starts_with("crdt.")
 }
 
-/// Insert or delete characters in one text unit. Payload is `craft_crdt::TextOp`.
+/// An edit to the shared document. Payload is [`crate::TextPayload`]: yrs updates, base64.
 pub const CRDT_TEXT: &str = "crdt.text";
 
 /// Insert or move a sibling by fractional key. Payload is a position change.

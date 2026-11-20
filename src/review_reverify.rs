@@ -6,8 +6,9 @@ mod e2e {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::test_text::{Replica, SCOPE};
     use craft_collab::native::NativeHub;
-    use craft_collab::{ClientMsg, Effect, Hub, Session, Texts};
+    use craft_collab::{ClientMsg, Effect, Hub, Session};
     use serde_json::json;
     use socketioxide::SocketIo;
     use tokio::sync::Mutex;
@@ -97,14 +98,14 @@ mod e2e {
             self.until(d, |_, _| false).await;
         }
         /// Every replayed text op the relay sent this client for `scope`.
-        fn replay(&self, scope: &str) -> (Vec<craft_crdt::text::TextOp>, Vec<bool>) {
+        fn replay(&self, scope: &str) -> (Vec<serde_json::Value>, Vec<bool>) {
             let mut ops = Vec::new();
             let mut complete = Vec::new();
             for e in &self.fx {
                 if let Effect::TextOps { scope: s, ops: o, complete: c } = e
                     && s == scope
                 {
-                    let v: Vec<craft_crdt::text::TextOp> = serde_json::from_value(o.clone()).unwrap();
+                    let v: Vec<serde_json::Value> = serde_json::from_value(o.clone()).unwrap();
                     ops.extend(v);
                     complete.push(*c);
                 }
@@ -115,7 +116,7 @@ mod e2e {
                     && command == "crdt.text"
                     && params.get("scope").and_then(|s| s.as_str()) == Some(scope)
                 {
-                    let v: Vec<craft_crdt::text::TextOp> = serde_json::from_value(params["ops"].clone()).unwrap();
+                    let v: Vec<serde_json::Value> = serde_json::from_value(params["ops"].clone()).unwrap();
                     ops.extend(v);
                     complete.push(true);
                 }
@@ -131,12 +132,10 @@ mod e2e {
         })
     }
 
-    /// Alice types "!" into "hello". Returns her Texts and the ops she submitted.
-    async fn alice_types_bang(a: &mut Client) -> (Texts, serde_json::Value) {
-        let mut t = Texts::in_space(a.s.space().expect("space granted"));
-        t.seed("/body/0", "hello");
-        let ops = t.local_insert("/body/0", 5, "!").unwrap();
-        let params = json!({"scope": "/body/0", "ops": serde_json::to_value(&ops).unwrap()});
+    /// Alice types "!" into "hello". Returns her replica and the params she submitted.
+    async fn alice_types_bang(a: &mut Client) -> (Replica, serde_json::Value) {
+        let mut t = Replica::seeded(a.s.space().expect("space granted"), "hello");
+        let params = t.insert(5, "!");
         (t, params)
     }
 
@@ -152,17 +151,17 @@ mod e2e {
         let m = a.s.submit("crdt.text", params, None);
         a.send(m);
         assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await, "edit never confirmed: {:?}", a.fx);
-        let saved_file = t.render("/body/0").unwrap();
+        let saved_file = t.render();
         let m = a.s.saved();
         a.send(m);
         a.settle(Duration::from_millis(300)).await;
 
         let mut b = Client::connect(&h, &room, "bob", true).await;
         b.settle(Duration::from_millis(500)).await;
-        let (replay, complete) = b.replay("/body/0");
-        let mut bt = Texts::in_space(b.s.space().unwrap());
-        bt.apply("/body/0", &replay);
-        let seen = bt.seed("/body/0", &saved_file);
+        let (replay, complete) = b.replay(SCOPE);
+        let mut bt = Replica::seeded(b.s.space().unwrap(), &saved_file);
+        bt.apply(&replay);
+        let seen = bt.render();
         assert_eq!(seen, saved_file, "saved {saved_file:?}; bob replayed {} ops (complete={complete:?}) and sees {seen:?}", replay.len());
     }
 
@@ -188,7 +187,7 @@ mod e2e {
         let m = a.s.submit("crdt.text", params, None);
         a.send(m);
         // The app saves what it shows, which already includes the "!", then reports the save.
-        let saved_file = t.render("/body/0").unwrap();
+        let saved_file = t.render();
         let saved_msg = a.s.saved();
         let reported = match &saved_msg {
             ClientMsg::Saved { seq, .. } => *seq,
@@ -201,10 +200,10 @@ mod e2e {
 
         let mut b = Client::connect(&h, &room, "bob", true).await;
         b.settle(Duration::from_millis(500)).await;
-        let (replay, _) = b.replay("/body/0");
-        let mut bt = Texts::in_space(b.s.space().unwrap());
-        bt.apply("/body/0", &replay);
-        let seen = bt.seed("/body/0", &saved_file);
+        let (replay, _) = b.replay(SCOPE);
+        let mut bt = Replica::seeded(b.s.space().unwrap(), &saved_file);
+        bt.apply(&replay);
+        let seen = bt.render();
         assert_eq!(
             seen,
             saved_file,
@@ -226,7 +225,7 @@ mod e2e {
         let m = a.s.submit("crdt.text", params, None);
         a.send(m);
         assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await);
-        let alice_sees = t.render("/body/0").unwrap();
+        let alice_sees = t.render();
 
         let mut viewer = Client::connect(&h, &room, "viewer", false).await;
         let room_seq = h.relay.rooms.lock().await.get(&room).map(|r| r.seq()).unwrap();
@@ -236,10 +235,10 @@ mod e2e {
         // Nobody saved: the provider still holds "hello".
         let mut b = Client::connect(&h, &room, "bob", true).await;
         b.settle(Duration::from_millis(500)).await;
-        let (replay, _) = b.replay("/body/0");
-        let mut bt = Texts::in_space(b.s.space().unwrap());
-        bt.apply("/body/0", &replay);
-        let seen = bt.seed("/body/0", "hello");
+        let (replay, _) = b.replay(SCOPE);
+        let mut bt = Replica::seeded(b.s.space().unwrap(), "hello");
+        bt.apply(&replay);
+        let seen = bt.render();
         assert_eq!(
             seen,
             alice_sees,

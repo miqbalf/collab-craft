@@ -83,8 +83,9 @@ mod e2e {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::test_text::{Replica, SCOPE};
     use craft_collab::native::NativeHub;
-    use craft_collab::{ClientMsg, Effect, Hub, Session, Texts};
+    use craft_collab::{ClientMsg, Effect, Hub, Session};
     use serde_json::json;
     use socketioxide::SocketIo;
     use tokio::sync::Mutex;
@@ -176,14 +177,14 @@ mod e2e {
             self.until(d, |_, _| false).await;
         }
         /// Every replayed text op the relay sent this client for `scope`.
-        fn replay(&self, scope: &str) -> (Vec<craft_crdt::text::TextOp>, Vec<bool>) {
+        fn replay(&self, scope: &str) -> (Vec<serde_json::Value>, Vec<bool>) {
             let mut ops = Vec::new();
             let mut complete = Vec::new();
             for e in &self.fx {
                 if let Effect::TextOps { scope: s, ops: o, complete: c } = e
                     && s == scope
                 {
-                    let v: Vec<craft_crdt::text::TextOp> = serde_json::from_value(o.clone()).unwrap();
+                    let v: Vec<serde_json::Value> = serde_json::from_value(o.clone()).unwrap();
                     ops.extend(v);
                     complete.push(*c);
                 }
@@ -194,7 +195,7 @@ mod e2e {
                     && command == "crdt.text"
                     && params.get("scope").and_then(|s| s.as_str()) == Some(scope)
                 {
-                    let v: Vec<craft_crdt::text::TextOp> = serde_json::from_value(params["ops"].clone()).unwrap();
+                    let v: Vec<serde_json::Value> = serde_json::from_value(params["ops"].clone()).unwrap();
                     ops.extend(v);
                     complete.push(true);
                 }
@@ -210,12 +211,10 @@ mod e2e {
         })
     }
 
-    /// Alice types "!" into "hello". Returns her Texts and the ops she submitted.
-    async fn alice_types_bang(a: &mut Client) -> (Texts, serde_json::Value) {
-        let mut t = Texts::in_space(a.s.space().expect("space granted"));
-        t.seed("/body/0", "hello");
-        let ops = t.local_insert("/body/0", 5, "!").unwrap();
-        let params = json!({"scope": "/body/0", "ops": serde_json::to_value(&ops).unwrap()});
+    /// Alice types "!" into "hello". Returns her replica and the params she submitted.
+    async fn alice_types_bang(a: &mut Client) -> (Replica, serde_json::Value) {
+        let mut t = Replica::seeded(a.s.space().expect("space granted"), "hello");
+        let params = t.insert(5, "!");
         (t, params)
     }
 
@@ -288,7 +287,7 @@ mod e2e {
         );
     }
 
-    /// The same, with a text edit and real Texts: does the re-delivery change what bob sees?
+    /// The same, with a text edit and a real replica: does the re-delivery change what bob sees?
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs REVIEW_VALKEY_URL"]
     async fn e2e_reconnect_text_is_not_doubled() {
@@ -301,25 +300,19 @@ mod e2e {
         a.send(m);
         assert!(a.until(Duration::from_secs(5), |_, fx| confirmed(fx, 1).is_some()).await);
         assert!(b.until(Duration::from_secs(5), |s, _| s.applied() == 1).await);
-        let mut bt = Texts::in_space(b.s.space().unwrap());
-        bt.seed("/body/0", "hello");
-        let (r1, _) = b.replay("/body/0");
-        bt.apply("/body/0", &r1);
-        let online = bt.render("/body/0").unwrap();
+        let mut bt = Replica::seeded(b.s.space().unwrap(), "hello");
+        let (r1, _) = b.replay(SCOPE);
+        bt.apply(&r1);
+        let online = bt.render();
         let Client { hub, s: bob_session, .. } = b;
         drop(hub);
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut b = Client::connect_with(&h, &room, "bob", true, bob_session).await;
         b.settle(Duration::from_millis(800)).await;
-        let (r2, _) = b.replay("/body/0");
-        bt.apply("/body/0", &r2);
-        let after = bt.render("/body/0").unwrap();
-        assert_eq!(
-            after,
-            t.render("/body/0").unwrap(),
-            "bob saw {online:?} online; after reconnect he was re-sent {} text ops and sees {after:?}",
-            r2.len()
-        );
+        let (r2, _) = b.replay(SCOPE);
+        bt.apply(&r2);
+        let after = bt.render();
+        assert_eq!(after, t.render(), "bob saw {online:?} online; after reconnect he was re-sent {} text ops and sees {after:?}", r2.len());
     }
 
     /// A read-only viewer reports a save slightly ahead of the room. `saved_seq` is now the

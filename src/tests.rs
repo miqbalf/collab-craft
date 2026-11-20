@@ -215,35 +215,32 @@ fn a_scope_past_its_budget_is_reported_incomplete() {
 /// The replay a joining peer receives has to decode as the operation list a client expects.
 /// Keeping each submit's batch nested handed it an array of arrays, and the client answered by
 /// declaring the scope unrecoverable. This drives the whole round trip: two submits in, the
-/// join payload out, and a real `craft_collab::Texts` applying it.
+/// join payload out, and a real `craft_collab::LiveDoc` applying it.
 #[test]
 fn a_replay_rebuilds_the_text_on_a_joining_replica() {
-    use craft_collab::Texts;
+    use crate::test_text::{Replica, SCOPE};
 
     // Alice seeds "base" from the file and types " and more" in two bursts.
-    let mut alice = Texts::in_space(7);
-    alice.seed("/body/0", "base");
-    let first = alice.local_insert("/body/0", 4, " and").expect("seeded and in a space");
-    let second = alice.local_insert("/body/0", 8, " more").expect("seeded and in a space");
-    assert_eq!(alice.render("/body/0").as_deref(), Some("base and more"));
+    let mut alice = Replica::seeded(7, "base");
+    let first = alice.insert(4, " and");
+    let second = alice.insert(8, " more");
+    assert_eq!(alice.render(), "base and more");
 
     // Each burst reaches the relay as its own submit.
     let mut r = room_with(&[("alice", true)]);
-    for (seq, ops) in [(1u64, &first), (2, &second)] {
-        let params = json!({ "scope": "/body/0", "ops": serde_json::to_value(ops).expect("ops encode") });
+    for (seq, params) in [(1u64, first), (2, second)] {
         r.submit(seq, sub("alice", true, "crdt.text", params, None)).expect("ok");
     }
 
     // Bob joins. He gets the retained operations and the same file.
-    let log = r.texts().get("/body/0").expect("retained");
+    let log = r.texts().get(SCOPE).expect("retained");
     assert!(log.complete());
-    let replay: Vec<craft_crdt::text::TextOp> =
-        serde_json::from_value(serde_json::Value::Array(log.ops().to_vec())).expect("the replay decodes as an operation list");
+    assert_eq!(log.ops().len(), 2, "one flat entry per update, not one array per submit");
 
-    let mut bob = Texts::in_space(9);
-    assert_eq!(bob.apply("/body/0", &replay), None, "held until the file arrives");
-    assert_eq!(bob.seed("/body/0", "base"), "base and more");
-    assert_eq!(bob.render("/body/0"), alice.render("/body/0"));
+    let mut bob = Replica::seeded(9, "base");
+    bob.apply(log.ops());
+    assert_eq!(bob.render(), "base and more");
+    assert_eq!(bob.render(), alice.render());
 }
 
 /// Issue 27. Alice types "!" into "hello" and saves "hello!" while connected.
@@ -252,27 +249,24 @@ fn a_replay_rebuilds_the_text_on_a_joining_replica() {
 /// a second time and see "hello!!".
 #[test]
 fn a_save_checkpoint_stops_a_joiner_double_applying_the_saved_text() {
-    use craft_collab::Texts;
-    let mut alice = Texts::in_space(1);
-    alice.seed("/body/0", "hello");
-    let ops = alice.local_insert("/body/0", 5, "!").expect("seeded and in a space");
-    let saved = alice.render("/body/0").expect("rendered");
+    use crate::test_text::{Replica, SCOPE};
+    let mut alice = Replica::seeded(1, "hello");
+    let params = alice.insert(5, "!");
+    let saved = alice.render();
     assert_eq!(saved, "hello!");
 
     let mut r = room_with(&[("alice", true)]);
-    let params = json!({ "scope": "/body/0", "ops": serde_json::to_value(&ops).expect("ops encode") });
     r.submit(1, sub("alice", true, "crdt.text", params, None)).expect("ok");
 
     // Alice saves "hello!", which reflects the edit ordered at sequence 1.
     r.checkpoint(1);
 
     // Bob joins, loads the saved file, and is replayed nothing.
-    let log = r.texts().get("/body/0").expect("retained");
+    let log = r.texts().get(SCOPE).expect("retained");
     assert!(log.ops().is_empty(), "the saved edit is not replayed again");
-    let replay: Vec<craft_crdt::text::TextOp> = serde_json::from_value(serde_json::Value::Array(log.ops().to_vec())).expect("decodes");
-    let mut bob = Texts::in_space(2);
-    bob.apply("/body/0", &replay);
-    assert_eq!(bob.seed("/body/0", &saved), "hello!", "the file's text is not doubled");
+    let mut bob = Replica::seeded(2, &saved);
+    bob.apply(log.ops());
+    assert_eq!(bob.render(), "hello!", "the file's text is not doubled");
 }
 
 /// Latest wins, and the newest value per kind is what a joining peer is handed.
