@@ -411,6 +411,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -439,10 +448,12 @@ dependencies = [
  "craft-esign",
  "craft-nextcloud",
  "craft-webdav",
+ "futures-util",
  "getrandom 0.3.4",
  "hmac 0.13.0",
  "redis",
  "reqwest",
+ "rust_socketio",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -604,6 +615,36 @@ dependencies = [
  "craft-cloud",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-live"
+version = "0.1.0"
+dependencies = [
+ "craft-collab",
+ "log",
+ "serde_json",
+]
+
+[[package]]
+name = "craft-live-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "craft-collab",
+ "craft-live",
+ "getrandom 0.3.4",
+ "hmac 0.13.0",
+ "hyper",
+ "hyper-util",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
 ]
 
 [[package]]

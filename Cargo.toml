@@ -111,3 +111,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # against the client that has to decode it rather than against an assumption about the shape.
 [dev-dependencies]
 craft-collab = { workspace = true, features = ["native-hub"] }
+# The lock e2e tests read the wire itself, for a field the client library does not name yet.
+rust_socketio = { version = "0.6", features = ["async"] }
+futures-util = "0.3"

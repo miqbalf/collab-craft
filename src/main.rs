@@ -62,6 +62,8 @@ mod review_reverify;
 #[cfg(test)]
 mod e2e_fixwave;
 #[cfg(test)]
+mod e2e_locks;
+#[cfg(test)]
 mod e2e_reconnect;
 #[cfg(test)]
 mod e2e_schema;
@@ -1240,11 +1242,19 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
 
     match outcome {
         Ok(LockOutcome::Granted) => {
-            {
+            // The room's sequence at the moment of the grant, read in the same rooms lock that
+            // records the holder. The ordering gate is held across the read, so an op that was
+            // numbered before this grant is recorded, and counted, before the seq is read: the
+            // holder knows how far to apply before it edits on what the lock protects.
+            let seq = {
+                let gate = relay.gate(&claims.rm);
+                let _ordered = gate.lock().await;
                 let mut rooms = relay.rooms.lock().await;
-                relay.room(&mut rooms, &claims.rm).record_lock(&claims.pid, msg.scope.clone());
-            }
-            let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope }));
+                let room = relay.room(&mut rooms, &claims.rm);
+                room.record_lock(&claims.pid, msg.scope.clone());
+                room.seq()
+            };
+            let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq }));
             emit_live(
                 socket.to(room_name.clone()),
                 "presence_lock",
