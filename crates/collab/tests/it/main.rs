@@ -1628,11 +1628,15 @@ fn applied_counts_only_ops_in_order() {
     assert_eq!(bob.applied(), 2);
 }
 
-
 // ---- final fix wave ------------------------------------------------------------------------
 
 fn retry_refused(local: u64) -> ServerMsg {
-    ServerMsg::Error { doc: "d".to_owned(), detail: "relay could not order that edit".to_owned(), local: Some(local), code: Some(craft_collab::RETRY.to_owned()) }
+    ServerMsg::Error {
+        doc: "d".to_owned(),
+        detail: "relay could not order that edit".to_owned(),
+        local: Some(local),
+        code: Some(craft_collab::RETRY.to_owned()),
+    }
 }
 
 fn lost_join(peer: &str, space: u32, seq: u64) -> ServerMsg {

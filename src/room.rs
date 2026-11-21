@@ -237,7 +237,7 @@ impl TextLog {
 
     /// The ops from the newest retained snapshot ordered after `after` on, when there is one.
     /// A joiner can start from that snapshot whatever came before it.
-    pub fn from_snapshot_after(&self, after: u64) -> Option<&[serde_json::Value]> {
+    pub fn ops_from_snapshot_after(&self, after: u64) -> Option<&[serde_json::Value]> {
         let at = self.seqs.iter().zip(&self.snaps).rposition(|(seq, snap)| *snap && *seq > after)?;
         Some(&self.ops[at..])
     }
@@ -438,7 +438,7 @@ impl Room {
     /// identities. A checkpoint by a replica that held the document before clears it.
     pub fn history_lost(&self) -> bool {
         let inherited = self.inherited();
-        inherited > 0 && self.saved_seq < inherited && !self.texts.values().any(|log| log.from_snapshot_after(inherited).is_some())
+        inherited > 0 && self.saved_seq < inherited && !self.texts.values().any(|log| log.ops_from_snapshot_after(inherited).is_some())
     }
 
     /// The catch-up for a joiner whose baseline predates this room's own history: per scope,
@@ -446,7 +446,7 @@ impl Room {
     pub fn texts_from_snapshot(&self) -> Vec<(String, Vec<serde_json::Value>)> {
         let inherited = self.inherited();
         let mut out: Vec<(String, Vec<serde_json::Value>)> =
-            self.texts.iter().filter_map(|(scope, log)| log.from_snapshot_after(inherited).map(|ops| (scope.clone(), ops.to_vec()))).collect();
+            self.texts.iter().filter_map(|(scope, log)| log.ops_from_snapshot_after(inherited).map(|ops| (scope.clone(), ops.to_vec()))).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }

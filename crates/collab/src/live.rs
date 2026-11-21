@@ -663,10 +663,7 @@ impl<H: Hub> Live<H> {
             return Err(Error::malformed("client", "the shared document is broken; reopen the file"));
         }
         if self.awaiting_snapshot {
-            return Err(Error::malformed(
-                "client",
-                "the live session lost its history; editing waits for the document service's snapshot",
-            ));
+            return Err(Error::malformed("client", "the live session lost its history; editing waits for the document service's snapshot"));
         }
         let doc = self.doc.as_mut().ok_or_else(|| Error::malformed("client", "the document was never seeded"))?;
         if doc.damaged() {

@@ -349,6 +349,10 @@ Phase 1 of live co-editing ships with these. Each is a decision, not an oversigh
   90 s for the answer, so that a pong queued behind a large checkpoint on a slow uplink still
   arrives. A socket whose TCP connection died without a close is noticed by the relay only then.
 - **One user holds at most 16 connections to one document**, and a document at most 256.
+- **A joiner at baseline 0 keeps its file seed even if seq 1 is a snapshot.** A first
+  checkpoint on an untouched room is ordered at seq 1 and reported as `Saved{0}`, which leaves
+  the join baseline at 0, the same as "never saved". Services should checkpoint twice on an
+  untouched room, or accept a baseline of at least 1.
 
 ## Licence
 

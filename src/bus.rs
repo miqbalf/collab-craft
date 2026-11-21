@@ -139,7 +139,10 @@ impl Bus {
         #[cfg(test)]
         if self.fail_next_seq > 0 {
             self.fail_next_seq -= 1;
-            return Err(BusError::Redis(redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::TimedOut, "injected: the bus did not answer"))));
+            return Err(BusError::Redis(redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injected: the bus did not answer",
+            ))));
         }
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
 

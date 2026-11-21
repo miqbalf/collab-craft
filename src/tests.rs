@@ -2031,9 +2031,9 @@ mod fixwave {
     /// cut for it; at 4096 scopes one editor could make every join cut and retried for ever.
     #[test]
     fn a_join_catch_up_always_fits_the_socket_buffer() {
-        assert!(room::MAX_SCOPES <= 64, "the scope cap");
-        assert!(1 + room::MAX_SCOPES * room::MAX_PIECES_PER_SCOPE < crate::SOCKET_BUFFER, "every scope's pieces fit");
-        assert!(1 + room::HISTORY < crate::SOCKET_BUFFER, "the longest replay fits");
+        const { assert!(room::MAX_SCOPES <= 64, "the scope cap") };
+        const { assert!(1 + room::MAX_SCOPES * room::MAX_PIECES_PER_SCOPE < crate::SOCKET_BUFFER, "every scope's pieces fit") };
+        const { assert!(1 + room::HISTORY < crate::SOCKET_BUFFER, "the longest replay fits") };
         // Three caps of ops at most each, all near half a piece: the packing's worst case.
         let half = serde_json::Value::String("x".repeat(crate::TEXT_OPS_PIECE_BYTES / 2 + 1));
         let ops = vec![half; 6];
@@ -2149,12 +2149,15 @@ mod fixwave {
         assert_eq!(serde_json::to_value(&retry).unwrap()["code"], "retry");
         let plain = crate::ErrorMsg { doc: "d".to_owned(), detail: "x".to_owned(), local: None, code: None };
         assert!(serde_json::to_value(&plain).unwrap().get("code").is_none());
-        let decoded: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "local": 3, "code": "retry"}).to_string()).unwrap();
+        let decoded: craft_collab::ServerMsg =
+            craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "local": 3, "code": "retry"}).to_string()).unwrap();
         assert!(decoded.is_retry());
         assert_eq!(decoded.refuses_connection(), None);
-        let full: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": crate::CODE_FULL}).to_string()).unwrap();
+        let full: craft_collab::ServerMsg =
+            craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": crate::CODE_FULL}).to_string()).unwrap();
         assert_eq!(full.refuses_connection(), Some(craft_collab::REFUSED_FULL));
-        let reconnect: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": "retry"}).to_string()).unwrap();
+        let reconnect: craft_collab::ServerMsg =
+            craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": "retry"}).to_string()).unwrap();
         assert_eq!(reconnect.refuses_connection(), None, "a transient refusal of the connection is reconnected past");
     }
 }

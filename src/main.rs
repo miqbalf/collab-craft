@@ -60,9 +60,9 @@ mod review_repro;
 mod review_reverify;
 
 #[cfg(test)]
-mod e2e_reconnect;
-#[cfg(test)]
 mod e2e_fixwave;
+#[cfg(test)]
+mod e2e_reconnect;
 #[cfg(test)]
 mod review_reverify2;
 
@@ -494,8 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cap there still means the bytes were read and parsed first. This refuses them at the
     // socket, which is the only place that costs nothing. Sized for the largest snapshot the
     // rooms retain; see `transport_cap`.
-    let (layer, io) =
-        sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay).build_layer();
+    let (layer, io) = sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay).build_layer();
     // ns returns () for the local adapter, so there is nothing to await here.
     io.ns("/", on_connect);
 
@@ -754,7 +753,10 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
                 // either silent divergence or a window that cannot type, and neither is
                 // something a user could act on.
                 tracing::error!(error = %e, room = %room_key, "could not grant an id space");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) });
+                let _ = socket.emit(
+                    "error",
+                    &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) },
+                );
                 let _ = socket.disconnect();
                 return;
             }
@@ -774,7 +776,10 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             Ok(seq) => seq,
             Err(e) => {
                 tracing::error!(error = %e, room = %room_key, "could not read the document's sequence");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) });
+                let _ = socket.emit(
+                    "error",
+                    &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) },
+                );
                 let _ = socket.disconnect();
                 return;
             }
@@ -1070,7 +1075,8 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
+                let _ = socket
+                    .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
                 return;
             }
         }
@@ -1179,7 +1185,10 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         }
         Err(e) => {
             tracing::error!(error = %e, room = %claims.rm, "lock failed");
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned(), local: None, code: Some(CODE_RETRY) });
+            let _ = socket.emit(
+                "error",
+                &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned(), local: None, code: Some(CODE_RETRY) },
+            );
         }
     }
 }
@@ -1255,7 +1264,8 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
         return;
     }
     if msg.payload.len() > MAX_FRAME_BYTES {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail(), local: None, code: None });
+        let _ = socket
+            .emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail(), local: None, code: None });
         return;
     }
 

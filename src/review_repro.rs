@@ -277,7 +277,9 @@ mod e2e {
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
             gates: Default::default(),
-            room_grace: crate::ROOM_GRACE,
+            // These tests are about a room dropped once its last peer left, so the grace an
+            // emptied room is kept for is short here (the binary keeps it for `ROOM_GRACE`).
+            room_grace: Duration::from_millis(50),
         });
         let (layer, io) = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);

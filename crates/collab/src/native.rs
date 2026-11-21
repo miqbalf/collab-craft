@@ -77,8 +77,8 @@ enum Control {
     /// and what was queued while the link was down goes out, before anything sent after.
     Joined(u64, bool, Duration),
     /// A message arrived on the connection of this generation: the link is alive. `true` when
-    /// it is a catch-up piece with more to follow.
-    Heard(u64, bool),
+    /// it is a catch-up piece with more to follow, with about how many bytes it took.
+    Heard(u64, bool, usize),
     /// The relay acknowledged heartbeat `n` on the connection of this generation.
     Alive(u64, u64),
     /// The relay refused the connection of this generation itself (a bad or expired token,
@@ -257,6 +257,16 @@ struct Connection {
     /// acknowledgement of that heartbeat proves everything written before it arrived, so only
     /// this part of [`Connection::busy_until`] still stands then.
     since_beat: Duration,
+    /// The transfer time of the echoes still to come back: the relay sends every ordered submit
+    /// to the whole room, sender included, so a large one written comes back as large, and a
+    /// heartbeat acknowledgement after it waits behind it on the way down. Shrinks as messages
+    /// arrive.
+    echo_owed: Duration,
+}
+
+/// Whether the relay sends `msg` back to this connection once it is ordered.
+fn echoed(msg: &ClientMsg) -> bool {
+    matches!(msg, ClientMsg::Submit { .. })
 }
 
 impl Connection {
@@ -274,14 +284,18 @@ impl Connection {
             frame_time: transfer_time(MAX_FRAME_BYTES),
             busy_until: tokio::time::Instant::now(),
             since_beat: Duration::ZERO,
+            echo_owed: Duration::ZERO,
         }
     }
 
     /// `bytes` were handed to the transport: allow them their transfer time on a slow link.
-    fn wrote(&mut self, bytes: usize) {
+    fn wrote(&mut self, bytes: usize, echoed: bool) {
         let time = transfer_time(bytes);
         self.busy_until = self.busy_until.max(tokio::time::Instant::now()) + time;
         self.since_beat += time;
+        if echoed {
+            self.echo_owed += time;
+        }
     }
 
     /// A heartbeat went out at `at`: what is written from now on is written after it.
@@ -301,7 +315,7 @@ impl Connection {
         self.catching_up = false;
         if self.beat.is_some_and(|(b, _)| b == n) {
             self.beat = None;
-            self.busy_until = busy_after_ack(self.busy_until, at, self.since_beat);
+            self.busy_until = busy_after_ack(self.busy_until, at, self.since_beat + self.echo_owed);
         }
     }
 
@@ -316,9 +330,10 @@ impl Connection {
 }
 
 /// What is still in flight once a heartbeat was acknowledged at `at`: only what was written
-/// after that heartbeat, `since_beat` of transfer time from now, and never more than before.
-fn busy_after_ack(busy_until: tokio::time::Instant, at: tokio::time::Instant, since_beat: Duration) -> tokio::time::Instant {
-    busy_until.min(at + since_beat)
+/// after that heartbeat and the echoes of submits not yet back, `owed` of transfer time from
+/// now, and never more than before.
+fn busy_after_ack(busy_until: tokio::time::Instant, at: tokio::time::Instant, owed: Duration) -> tokio::time::Instant {
+    busy_until.min(at + owed)
 }
 
 /// When a heartbeat sent at `sent` is overdue, with the relay last heard at `heard`.
@@ -354,9 +369,9 @@ impl Link {
                     if !current {
                         return;
                     }
-                    for msg in decode_payload(event, payload) {
+                    for (msg, bytes) in decode_payload(event, payload) {
                         let more = matches!(msg, ServerMsg::TextOps { more: true, .. });
-                        let _ = control.send(Control::Heard(generation, more));
+                        let _ = control.send(Control::Heard(generation, more, bytes));
                         match &msg {
                             ServerMsg::Joined { heartbeat, text_cap, .. } => {
                                 // A frame holds one op at the cap with its wrapper.
@@ -479,7 +494,7 @@ impl Link {
                                 c.frame_time = frame_time;
                                 while let Some(msg) = queued.pop_front() {
                                     match emit_on(&c.client, &msg, &mut stopped).await {
-                                        Emitted::Sent(bytes) => c.wrote(bytes),
+                                        Emitted::Sent(bytes) => c.wrote(bytes, echoed(&msg)),
                                         Emitted::Dead => {
                                             self.dead(c);
                                             break;
@@ -494,10 +509,11 @@ impl Link {
                                 c.acked(n, tokio::time::Instant::now());
                             }
                         }
-                        Control::Heard(generation, more) => {
+                        Control::Heard(generation, more, bytes) => {
                             if let Some(c) = conn.as_mut().filter(|c| c.generation == generation) {
                                 c.heard = tokio::time::Instant::now();
                                 c.catching_up |= more;
+                                c.echo_owed = c.echo_owed.saturating_sub(transfer_time(bytes));
                             }
                         }
                         Control::Refused(generation) if self.shared.current(generation) => {
@@ -529,7 +545,7 @@ impl Link {
                     let Some(msg) = msg else { break };
                     match conn.as_mut().filter(|c| c.joined && self.shared.connected.load(Ordering::SeqCst)) {
                         Some(c) => match emit_on(&c.client, &msg, &mut stopped).await {
-                            Emitted::Sent(bytes) => c.wrote(bytes),
+                            Emitted::Sent(bytes) => c.wrote(bytes, echoed(&msg)),
                             Emitted::Dead => self.dead(c),
                             Emitted::Stopped => break 'run,
                         },
@@ -634,7 +650,7 @@ impl Hub for NativeHub {
 /// A payload can carry several values, and a malformed one is skipped with a
 /// log line. Dropping a message we cannot read beats tearing down a live
 /// session over it.
-fn decode_payload(event: &str, payload: Payload) -> Vec<ServerMsg> {
+fn decode_payload(event: &str, payload: Payload) -> Vec<(ServerMsg, usize)> {
     let values: Vec<serde_json::Value> = match payload {
         Payload::Text(values) => values,
         Payload::Binary(_) => {
@@ -655,7 +671,13 @@ fn decode_payload(event: &str, payload: Payload) -> Vec<ServerMsg> {
         },
     };
 
-    values.into_iter().filter_map(|v| receive(event, v)).collect()
+    values
+        .into_iter()
+        .filter_map(|v| {
+            let bytes = json_len(&v);
+            receive(event, v).map(|msg| (msg, bytes))
+        })
+        .collect()
 }
 
 #[cfg(test)]
