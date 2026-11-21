@@ -70,7 +70,23 @@ pub enum LockOutcome {
 #[derive(Clone)]
 pub struct Bus {
     conn: MultiplexedConnection,
+    /// Fail this many [`Bus::next_seq`] calls, as a bus that did not answer in time, before
+    /// working again. For the tests of what a transient failure does.
+    #[cfg(test)]
+    pub fail_next_seq: u32,
 }
+
+/// How long one bus command may take before it fails.
+///
+/// Every command runs with the relay's bus lock held, and an ordering one also holds the room's
+/// gate, so a Valkey that stopped answering would otherwise freeze the document (and, through
+/// the bus lock, every document) until the TCP connection died, which can take many minutes.
+/// A command that times out fails like any other, and the submit is refused as transient
+/// (`code: "retry"`), which a client sends again.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long connecting to the bus may take.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Bus {
     /// Connect.
@@ -82,8 +98,15 @@ impl Bus {
     /// from losing their data or ours.
     pub async fn connect(url: &str) -> Result<Bus, BusError> {
         let client = redis::Client::open(url)?;
-        let conn = client.get_multiplexed_async_connection().await?;
-        Ok(Bus { conn })
+        // Set here rather than left to the client's defaults, which have changed between
+        // releases: the bound matters to the relay, so it is the relay's to state.
+        let config = redis::AsyncConnectionConfig::new().set_response_timeout(Some(RESPONSE_TIMEOUT)).set_connection_timeout(Some(CONNECT_TIMEOUT));
+        let conn = client.get_multiplexed_async_connection_with_config(&config).await?;
+        Ok(Bus {
+            conn,
+            #[cfg(test)]
+            fail_next_seq: 0,
+        })
     }
 
     /// Whether the bus still answers. The health route's whole question.
@@ -113,6 +136,11 @@ impl Bus {
     /// expired key would hand out 1 again, and a client holding sequence 900
     /// would treat the next hundred ops as replays and drop them all.
     pub async fn next_seq(&mut self, room: &str, floor: u64) -> Result<u64, BusError> {
+        #[cfg(test)]
+        if self.fail_next_seq > 0 {
+            self.fail_next_seq -= 1;
+            return Err(BusError::Redis(redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::TimedOut, "injected: the bus did not answer"))));
+        }
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
 
         // NX, so a live counter is never pushed backwards by a late seed.

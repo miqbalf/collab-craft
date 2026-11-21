@@ -16,15 +16,15 @@ use tokio::sync::{Mutex, Notify};
 use crate::test_text::LivePeer;
 use crate::{Relay, bus::Bus, on_connect, token};
 
-const SECRET: &[u8] = b"a-shared-secret-at-least-32-chars-long";
+pub(crate) const SECRET: &[u8] = b"a-shared-secret-at-least-32-chars-long";
 
-struct Harness {
-    relay: Arc<Relay>,
-    url: String,
-    io: SocketIo,
+pub(crate) struct Harness {
+    pub(crate) relay: Arc<Relay>,
+    pub(crate) url: String,
+    pub(crate) io: SocketIo,
 }
 
-async fn start() -> Option<Harness> {
+pub(crate) async fn start() -> Option<Harness> {
     start_pinging(None).await
 }
 
@@ -35,7 +35,12 @@ async fn start_pinging(ping: Option<Duration>) -> Option<Harness> {
 }
 
 /// The relay with `text_cap` for every room and the transport sized from it.
-async fn start_capped(ping: Option<Duration>, text_cap: usize) -> Option<Harness> {
+pub(crate) async fn start_capped(ping: Option<Duration>, text_cap: usize) -> Option<Harness> {
+    start_with(ping, text_cap, crate::ROOM_GRACE).await
+}
+
+/// The relay as [`start_capped`] builds it, keeping an emptied room for `grace`.
+pub(crate) async fn start_with(ping: Option<Duration>, text_cap: usize, grace: Duration) -> Option<Harness> {
     let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
     let mut bus = Bus::connect(&valkey).await.expect("valkey");
     bus.check_writable().await.expect("writable");
@@ -46,6 +51,7 @@ async fn start_capped(ping: Option<Duration>, text_cap: usize) -> Option<Harness
         bus: Mutex::new(bus),
         rooms: Mutex::new(Default::default()),
         gates: Default::default(),
+        room_grace: grace,
     });
     let mut builder = crate::sized(SocketIo::builder(), text_cap);
     if let Some(ping) = ping {
@@ -62,31 +68,31 @@ async fn start_capped(ping: Option<Duration>, text_cap: usize) -> Option<Harness
     Some(Harness { relay, url: format!("http://{addr}"), io })
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
-fn unique_room(tag: &str) -> String {
+pub(crate) fn unique_room(tag: &str) -> String {
     format!("{tag}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
 }
 
-fn ticket(room: &str, pid: &str, at: i64) -> String {
+pub(crate) fn ticket(room: &str, pid: &str, at: i64) -> String {
     token::sign_at(SECRET, room, pid, pid, true, pid, at).unwrap()
 }
 
 /// Wait until `peer`'s hub says `up`.
-async fn link_is(peer: &mut LivePeer, up: bool) -> bool {
+pub(crate) async fn link_is(peer: &mut LivePeer, up: bool) -> bool {
     peer.until(Duration::from_secs(15), |live, _| live.hub().connected() == up).await
 }
 
-fn shows(live: &Live<NativeHub>, text: &str) -> bool {
+pub(crate) fn shows(live: &Live<NativeHub>, text: &str) -> bool {
     live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == text)
 }
 
 /// Poll both peers until `done` holds for them, as an app pumps every frame. A link counts as
 /// up on the relay's CONNECT, and the Joined that makes a replica send its unconfirmed edits
 /// again may still be in its inbox then: only a replica that is polled handles it.
-async fn until_both(a: &mut LivePeer, b: &mut LivePeer, d: Duration, done: impl Fn(&LivePeer, &LivePeer) -> bool) -> bool {
+pub(crate) async fn until_both(a: &mut LivePeer, b: &mut LivePeer, d: Duration, done: impl Fn(&LivePeer, &LivePeer) -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + d;
     loop {
         a.until(Duration::from_millis(25), |_, _| false).await;
@@ -100,20 +106,20 @@ async fn until_both(a: &mut LivePeer, b: &mut LivePeer, d: Duration, done: impl 
     }
 }
 
-async fn seq_of(h: &Harness, room: &str) -> u64 {
+pub(crate) async fn seq_of(h: &Harness, room: &str) -> u64 {
     h.relay.rooms.lock().await.get(room).map(crate::room::Room::seq).unwrap_or(0)
 }
 
 /// A TCP forwarder to the relay that can cut every connection and refuse new ones for a
 /// while, as a network drop or a relay restart looks to a client. Counts the connections it
 /// accepted while up.
-struct Proxy {
-    url: String,
-    cut: Arc<Notify>,
-    accepted: Arc<AtomicU64>,
+pub(crate) struct Proxy {
+    pub(crate) url: String,
+    pub(crate) cut: Arc<Notify>,
+    pub(crate) accepted: Arc<AtomicU64>,
 }
 
-async fn proxy(to: SocketAddr, down_for: Duration) -> Proxy {
+pub(crate) async fn proxy(to: SocketAddr, down_for: Duration) -> Proxy {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cut = Arc::new(Notify::new());
@@ -161,7 +167,7 @@ async fn proxy(to: SocketAddr, down_for: Duration) -> Proxy {
 
 /// A TCP forwarder to the relay that moves at most `rate` bytes a second each way, as a slow
 /// link does. Counts the connections it accepted.
-async fn throttled(to: SocketAddr, rate: usize) -> (String, Arc<AtomicU64>) {
+pub(crate) async fn throttled(to: SocketAddr, rate: usize) -> (String, Arc<AtomicU64>) {
     async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, rate: usize) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut buf = vec![0u8; 8 * 1024];
@@ -196,17 +202,17 @@ async fn throttled(to: SocketAddr, rate: usize) -> (String, Arc<AtomicU64>) {
 }
 
 /// A ticket for the document service, the one peer that may checkpoint.
-fn saver(room: &str) -> String {
+pub(crate) fn saver(room: &str) -> String {
     token::sign_at(SECRET, room, "craft_office", "alice", true, "alice", now()).unwrap()
 }
 
 /// About 256 KiB a second: a slow uplink, where a few MiB take longer than any fixed deadline.
-const SLOW_LINK: usize = 256 * 1024;
+pub(crate) const SLOW_LINK: usize = 256 * 1024;
 
 /// A text whose checkpoint snapshot is about 3.5 MiB on the wire: some 14 s on [`SLOW_LINK`],
 /// past the hub's fixed 10 s deadlines, and under the relay's 20 s engine.io ping timeout,
 /// which bounds how long any one frame may take in either direction.
-fn large_file() -> String {
+pub(crate) fn large_file() -> String {
     "ab".repeat(1_300_000)
 }
 
@@ -262,7 +268,7 @@ async fn e2e_a_large_catch_up_on_a_slow_link_settles_without_a_reconnect() {
 /// A TCP forwarder that, once `hole` is notified, stops forwarding on the connections it has
 /// without closing them, as a sleeping laptop or a NAT that dropped the mapping looks to both
 /// ends. Connections made after that are forwarded normally.
-async fn black_hole(to: SocketAddr) -> (String, Arc<Notify>) {
+pub(crate) async fn black_hole(to: SocketAddr) -> (String, Arc<Notify>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hole = Arc::new(Notify::new());
@@ -363,7 +369,7 @@ async fn e2e_a_stale_socket_closing_late_leaves_the_peer_in_the_room() {
     assert!(a.until(Duration::from_secs(10), |live, _| shows(live, ">hello!")).await, "alice has {:?}", a.text());
 }
 
-fn relay_addr(h: &Harness) -> SocketAddr {
+pub(crate) fn relay_addr(h: &Harness) -> SocketAddr {
     h.url.trim_start_matches("http://").parse().unwrap()
 }
 

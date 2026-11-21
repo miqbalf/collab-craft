@@ -34,7 +34,9 @@ pub const HISTORY: usize = 2048;
 /// are counted apart from edits: a scope keeps edits up to the cap plus at most two
 /// snapshots, and a room at most two caps of snapshots. So the worst case for one room is
 /// about `max(HISTORY_BYTES, cap) + max(TOTAL_TEXT_BYTES, cap) + 2 * cap`: 64 MiB at the
-/// default (and maximum) cap of just under 16 MiB.
+/// default (and maximum) cap of just under 16 MiB. Ephemeral state is a third pool, bounded
+/// apart from both: at most [`EPHEMERAL_PEER_BYTES`] per peer, so [`MAX_PEERS`] times that
+/// (16 MiB) per room, which brings the worst case to about 80 MiB.
 pub const HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Peers one document may hold at once.
@@ -42,6 +44,12 @@ pub const HISTORY_BYTES: usize = 8 * 1024 * 1024;
 /// The value `craft_crdt::Limits` carries. A room is a fan-out set and a roster broadcast, so
 /// an unbounded one is quadratic work per join.
 pub const MAX_PEERS: usize = 256;
+
+/// Peers one user (one ticket `uid`) may hold in one document at once.
+///
+/// A ticket mints a fresh peer id per window, so without this one account could open
+/// [`MAX_PEERS`] windows and lock everybody else out of the document.
+pub const MAX_PEERS_PER_UID: usize = 16;
 
 /// Bytes of retained CRDT operations per scope.
 ///
@@ -54,9 +62,23 @@ pub const TEXT_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// [`TEXT_BYTES`] bounds the bytes within one scope and says nothing about how
 /// many scopes there are. A client naming a fresh scope on every edit would
-/// otherwise grow a room without limit, one bounded log at a time. A real
-/// document has a scope per editable unit, far below this.
-pub const MAX_SCOPES: usize = 4096;
+/// otherwise grow a room without limit, one bounded log at a time.
+///
+/// Small on purpose. A join sends every retained scope as its own `text_ops` messages, all
+/// queued on the socket at once, and the socket holds a bounded count of them (the relay's
+/// `SOCKET_BUFFER`). At 4096 scopes one editor naming a fresh scope per edit could make the
+/// catch-up larger than that buffer, and every join was then cut and retried for ever. The
+/// live document travels under one scope (`craft_collab::DOC_SCOPE`), so 64 leaves room for
+/// other kinds of shared state and keeps the catch-up well inside the buffer.
+pub const MAX_SCOPES: usize = 64;
+
+/// The most `text_ops` messages one scope's catch-up can take.
+///
+/// A scope retains at most its edits up to the text cap plus two snapshots each up to the cap,
+/// and every piece but the last is at least half the piece budget (an op larger than what is
+/// left starts a new piece, and no op is larger than the budget), so three caps fit in at most
+/// seven pieces. One more for rounding.
+pub const MAX_PIECES_PER_SCOPE: usize = 8;
 
 /// Bytes of retained CRDT operations a document may hold across every scope.
 ///
@@ -74,6 +96,14 @@ pub const TOTAL_TEXT_BYTES: usize = HISTORY_BYTES;
 /// A camera and a selection are two kinds. An unbounded set would let one peer grow the room
 /// by inventing kind names.
 pub const MAX_EPHEMERAL_KINDS: usize = 16;
+
+/// Bytes one ephemeral value may take. A camera, a selection or a caret is a few hundred
+/// bytes; this leaves room for a selection over many ranges.
+pub const EPHEMERAL_VALUE_BYTES: usize = 16 * 1024;
+
+/// Bytes of ephemeral values one peer may hold across every kind. Allowed to read-only peers,
+/// so it is bounded on its own rather than by the text caps.
+pub const EPHEMERAL_PEER_BYTES: usize = 64 * 1024;
 
 /// One ordered edit, as the relay recorded it.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -95,6 +125,9 @@ pub struct Peer {
     /// Whether this peer may submit. A reader joins and watches.
     #[serde(skip)]
     pub may_edit: bool,
+    /// The ticket's user, for [`MAX_PEERS_PER_UID`]. Never sent: the roster names peers.
+    #[serde(skip)]
+    pub uid: String,
 }
 
 /// One peer's offered edit, before the relay has ordered it.
@@ -119,6 +152,8 @@ pub enum Refusal {
     Locked { holder: String },
     /// The document already holds [`MAX_PEERS`].
     Full,
+    /// This user already holds [`MAX_PEERS_PER_UID`] connections to the document.
+    FullForUser,
     /// The message is larger than a document may retain.
     TooLarge { bytes: usize },
     /// A save report that does not sit right before a retained checkpoint snapshot.
@@ -136,6 +171,7 @@ impl Refusal {
             Refusal::ReadOnly => "read-only access to this file".to_owned(),
             Refusal::Locked { holder } => format!("{holder} is editing that region"),
             Refusal::Full => format!("this document already has {MAX_PEERS} editors"),
+            Refusal::FullForUser => format!("you already have this document open in {MAX_PEERS_PER_UID} windows"),
             Refusal::TooLarge { bytes } => format!("that change is {bytes} bytes, more than this relay will carry"),
             Refusal::NotACheckpoint { seq } => {
                 format!("a save through {seq} is kept only when a checkpoint snapshot follows it; nothing was dropped")
@@ -191,6 +227,19 @@ impl TextLog {
     /// than from the file. The payload stays opaque; this is only the submit's own flag.
     pub fn starts_with_snapshot(&self) -> bool {
         self.snaps.first().copied().unwrap_or(false)
+    }
+
+    /// Whether this log would tell a joiner nothing: complete, and holding no op. A save
+    /// leaves such logs behind for scopes it emptied.
+    pub fn is_idle(&self) -> bool {
+        self.complete && self.ops.is_empty()
+    }
+
+    /// The ops from the newest retained snapshot ordered after `after` on, when there is one.
+    /// A joiner can start from that snapshot whatever came before it.
+    pub fn from_snapshot_after(&self, after: u64) -> Option<&[serde_json::Value]> {
+        let at = self.seqs.iter().zip(&self.snaps).rposition(|(seq, snap)| *snap && *seq > after)?;
+        Some(&self.ops[at..])
     }
 
     /// Whether the op ordered at `seq` is retained here and is a checkpoint snapshot.
@@ -307,8 +356,8 @@ pub struct Room {
     /// [`Room::retain_text`] can enforce [`TOTAL_TEXT_BYTES`] without summing every
     /// scope on each submit.
     text_bytes: usize,
-    /// peer -> kind -> the newest value that peer sent.
-    ephemeral: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// peer -> kind -> the newest value that peer sent, with its size in bytes.
+    ephemeral: HashMap<String, HashMap<String, (serde_json::Value, usize)>>,
     /// The newest `saved` marker from anyone, `(peer, value)`. Kept apart from
     /// [`Room::ephemeral`] because it says which file version is the join baseline, and that
     /// stays true after the peer that saved has left.
@@ -320,6 +369,16 @@ pub struct Room {
     oversized_snapshot: Option<(u64, usize)>,
     /// The part of [`Room::text_bytes`] that is checkpoint snapshots, across every scope.
     snap_bytes: usize,
+    /// The sequence the document was already at when this room was made, learned from the bus
+    /// on the first [`Room::observe_seq`]. `None` until then.
+    ///
+    /// Above zero means the history before it lived in a room this process no longer has (a
+    /// relay restart, or a room dropped after its grace period): the ops, the snapshot and the
+    /// saved marker are gone, and the saved file is not a starting point for this room.
+    inherited: Option<u64>,
+    /// Bumped each time the room empties, so a timer that would drop it after the grace period
+    /// can tell whether it emptied again since (see [`Room::idle_mark`]).
+    idle: u64,
 }
 
 /// The ephemeral kind that records a save: `{seq, etag}`.
@@ -357,7 +416,51 @@ impl Room {
     /// document from handing out sequence numbers the clients have already seen,
     /// which is what made a reopen replay or stall edits.
     pub fn observe_seq(&mut self, seq: u64) {
+        if self.inherited.is_none() {
+            // A submit can reach a new room before the join that reads the bus does; what it
+            // recorded is this room's own, so the inherited history ends just before it.
+            let before = self.history.first().map_or(seq, |op| op.seq.saturating_sub(1));
+            self.inherited = Some(seq.min(before));
+        }
         self.seq = self.seq.max(seq);
+    }
+
+    /// The sequence this room's own history starts after. See [`Room::inherited`] field.
+    pub fn inherited(&self) -> u64 {
+        self.inherited.unwrap_or(0)
+    }
+
+    /// Whether this room began past history it does not hold and nothing since has replaced it.
+    ///
+    /// True when the room inherited a sequence above zero, no save has been accepted since,
+    /// and no snapshot has been ordered since: a joiner then has nothing to start from that
+    /// agrees with the replicas still running, and the file is behind them with other item
+    /// identities. A checkpoint by a replica that held the document before clears it.
+    pub fn history_lost(&self) -> bool {
+        let inherited = self.inherited();
+        inherited > 0 && self.saved_seq < inherited && !self.texts.values().any(|log| log.from_snapshot_after(inherited).is_some())
+    }
+
+    /// The catch-up for a joiner whose baseline predates this room's own history: per scope,
+    /// the ops from the newest snapshot ordered in this room on. Empty when there is none.
+    pub fn texts_from_snapshot(&self) -> Vec<(String, Vec<serde_json::Value>)> {
+        let inherited = self.inherited();
+        let mut out: Vec<(String, Vec<serde_json::Value>)> =
+            self.texts.iter().filter_map(|(scope, log)| log.from_snapshot_after(inherited).map(|ops| (scope.clone(), ops.to_vec()))).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Note that the room just emptied. Returns the mark a grace timer checks with
+    /// [`Room::still_idle`] before it drops the room.
+    pub fn idle_mark(&mut self) -> u64 {
+        self.idle += 1;
+        self.idle
+    }
+
+    /// Whether the room is empty and has not emptied again since `mark` was taken.
+    pub fn still_idle(&self, mark: u64) -> bool {
+        self.is_empty() && self.idle == mark
     }
 
     pub fn peers(&self) -> &[Peer] {
@@ -396,6 +499,9 @@ impl Room {
         if !already && self.peers.len() >= MAX_PEERS {
             return Err(Refusal::Full);
         }
+        if !already && self.peers.iter().filter(|p| p.uid == peer.uid).count() >= MAX_PEERS_PER_UID {
+            return Err(Refusal::FullForUser);
+        }
         self.conns.entry(peer.peer.clone()).or_default().insert(conn.to_owned());
         self.peers.retain(|p| p.peer != peer.peer);
         self.peers.push(peer);
@@ -415,7 +521,7 @@ impl Room {
         let mut out: Vec<(String, String, serde_json::Value)> = self
             .ephemeral
             .iter()
-            .flat_map(|(peer, kinds)| kinds.iter().map(move |(kind, value)| (peer.clone(), kind.clone(), value.clone())))
+            .flat_map(|(peer, kinds)| kinds.iter().map(move |(kind, (value, _))| (peer.clone(), kind.clone(), value.clone())))
             .collect();
         if let Some((peer, value)) = &self.saved {
             out.push((peer.clone(), SAVED_KIND.to_owned(), value.clone()));
@@ -447,10 +553,12 @@ impl Room {
     ///
     /// Latest wins, so the previous value is simply replaced. A peer past
     /// [`MAX_EPHEMERAL_KINDS`] is refused, because kind names are the peer's own and an
-    /// unbounded set is a way to grow the room.
+    /// unbounded set is a way to grow the room. So is a value past [`EPHEMERAL_VALUE_BYTES`],
+    /// or one that would take the peer past [`EPHEMERAL_PEER_BYTES`] across its kinds: this is
+    /// open to read-only peers, so it is bounded on its own.
     pub fn remember_ephemeral(&mut self, peer_id: &str, kind: &str, value: serde_json::Value) -> Result<(), Refusal> {
         let bytes = value_bytes(&value);
-        if bytes > TEXT_BYTES {
+        if bytes > EPHEMERAL_VALUE_BYTES {
             return Err(Refusal::TooLarge { bytes });
         }
         if kind == SAVED_KIND {
@@ -461,7 +569,11 @@ impl Room {
         if !kinds.contains_key(kind) && kinds.len() >= MAX_EPHEMERAL_KINDS {
             return Err(Refusal::TooLarge { bytes });
         }
-        kinds.insert(kind.to_owned(), value);
+        let others: usize = kinds.iter().filter(|(k, _)| k.as_str() != kind).map(|(_, (_, size))| size).sum();
+        if others + bytes > EPHEMERAL_PEER_BYTES {
+            return Err(Refusal::TooLarge { bytes });
+        }
+        kinds.insert(kind.to_owned(), (value, bytes));
         Ok(())
     }
 
@@ -755,7 +867,7 @@ mod tests {
     use super::*;
 
     fn peer(id: &str) -> Peer {
-        Peer { peer: id.to_owned(), display: id.to_owned(), may_edit: true }
+        Peer { peer: id.to_owned(), display: id.to_owned(), may_edit: true, uid: id.to_owned() }
     }
 
     /// A replaced socket that closes late (a half-open link that only now timed out) leaves

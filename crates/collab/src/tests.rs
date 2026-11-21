@@ -19,6 +19,7 @@ fn joined(seq: u64) -> ServerMsg {
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     }
 }
 
@@ -90,6 +91,7 @@ fn a_join_sorts_existing_locks_into_mine_and_theirs() {
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     });
     assert!(s.holds("A1"), "a lock already held by us must be recognised as ours");
     assert!(!s.holds("B2"));
@@ -154,6 +156,7 @@ fn the_granted_id_space_arrives_as_an_effect() {
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     });
     assert_eq!(old_relay.space(), None);
     assert!(!effects.iter().any(|e| matches!(e, Effect::Space { .. })));

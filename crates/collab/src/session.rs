@@ -49,8 +49,9 @@ pub enum Effect {
     /// Tell the user something was refused.
     Notice { detail: String },
     /// The relay refused this client's submit with counter `local`. Raised next to the
-    /// [`Effect::Notice`] for the same error, for a caller tracking that submit.
-    SubmitRefused { local: u64, detail: String },
+    /// [`Effect::Notice`] for the same error, for a caller tracking that submit; without one
+    /// when `code` is [`crate::RETRY`], a transient failure the caller sends again.
+    SubmitRefused { local: u64, detail: String, code: Option<String> },
     /// The relay took this client's save report through `seq`.
     SavedAck { seq: u64 },
     /// The relay refused this client's save report through `seq`.
@@ -321,10 +322,15 @@ impl Session {
 
             ServerMsg::Ephemeral { origin, kind, payload, .. } => vec![Effect::Ephemeral { origin, kind, payload }],
 
-            ServerMsg::Error { detail, local, .. } => match local {
+            ServerMsg::Error { detail, local, code, .. } => match local {
+                // A transient failure is not news for the user: the edit is sent again.
+                Some(local) if code.as_deref() == Some(crate::proto::RETRY) => {
+                    self.inflight.remove(&local);
+                    vec![Effect::SubmitRefused { local, detail, code }]
+                }
                 Some(local) => {
                     self.inflight.remove(&local);
-                    vec![Effect::Notice { detail: detail.clone() }, Effect::SubmitRefused { local, detail }]
+                    vec![Effect::Notice { detail: detail.clone() }, Effect::SubmitRefused { local, detail, code }]
                 }
                 None => vec![Effect::Notice { detail }],
             },

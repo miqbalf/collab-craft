@@ -102,7 +102,7 @@ fn malformed_tokens_are_refused_without_panicking() {
 // ---- arbitration ----------------------------------------------------------
 
 fn peer(id: &str, may_edit: bool) -> Peer {
-    Peer { peer: id.to_owned(), display: id.to_uppercase(), may_edit }
+    Peer { peer: id.to_owned(), display: id.to_uppercase(), may_edit, uid: id.to_owned() }
 }
 
 /// A submission from `peer`, editing `scope` with `command`.
@@ -1985,5 +1985,176 @@ mod relay_proto {
         for bad in ["craft", "/a?b", "/a#b", "/a%2fb", "//x"] {
             assert!(normalise_base(bad).is_err(), "{bad}");
         }
+    }
+}
+
+// ---- final fix wave ------------------------------------------------------------------------
+
+mod fixwave {
+    use serde_json::json;
+
+    use crate::room::{self, Peer, Refusal, Room, Submission};
+
+    fn member(id: &str, uid: &str) -> Peer {
+        Peer { peer: id.to_owned(), display: id.to_owned(), may_edit: true, uid: uid.to_owned() }
+    }
+
+    fn crdt(scope: &str, ops: serde_json::Value, snap: bool) -> Submission {
+        let mut params = json!({ "scope": scope, "ops": ops });
+        if snap {
+            params["snap"] = json!(true);
+        }
+        Submission { peer_id: "w".to_owned(), may_edit: true, command: "crdt.text".to_owned(), params, scope: None, local: None }
+    }
+
+    /// I5: one ephemeral value is bounded at 16 KiB, and one peer's values across every kind
+    /// at 64 KiB, read-only peers included. Replacing a kind's value counts only the new one.
+    #[test]
+    fn ephemeral_state_is_bounded_per_value_and_per_peer() {
+        let mut r = Room::default();
+        let big = json!("x".repeat(room::EPHEMERAL_VALUE_BYTES));
+        assert!(matches!(r.remember_ephemeral("reader", "sel", big), Err(Refusal::TooLarge { .. })), "a value past 16 KiB");
+        let near = json!("x".repeat(room::EPHEMERAL_VALUE_BYTES - 16));
+        for kind in ["a", "b", "c"] {
+            r.remember_ephemeral("reader", kind, near.clone()).expect("within the per-peer total");
+        }
+        assert!(
+            matches!(r.remember_ephemeral("reader", "e", json!("x".repeat(room::EPHEMERAL_VALUE_BYTES))), Err(Refusal::TooLarge { .. })),
+            "a value that would take the peer past 64 KiB"
+        );
+        r.remember_ephemeral("reader", "a", near.clone()).expect("replacing a kind counts only the new value");
+        r.remember_ephemeral("other", "a", near).expect("the total is per peer");
+        const { assert!(room::EPHEMERAL_PEER_BYTES * room::MAX_PEERS <= 16 * 1024 * 1024, "the room-wide bound the docs state") };
+    }
+
+    /// I4: the catch-up of every retained scope fits the socket's buffer, so a join is never
+    /// cut for it; at 4096 scopes one editor could make every join cut and retried for ever.
+    #[test]
+    fn a_join_catch_up_always_fits_the_socket_buffer() {
+        assert!(room::MAX_SCOPES <= 64, "the scope cap");
+        assert!(1 + room::MAX_SCOPES * room::MAX_PIECES_PER_SCOPE < crate::SOCKET_BUFFER, "every scope's pieces fit");
+        assert!(1 + room::HISTORY < crate::SOCKET_BUFFER, "the longest replay fits");
+        // Three caps of ops at most each, all near half a piece: the packing's worst case.
+        let half = serde_json::Value::String("x".repeat(crate::TEXT_OPS_PIECE_BYTES / 2 + 1));
+        let ops = vec![half; 6];
+        assert!(crate::text_pieces(&ops, crate::TEXT_OPS_PIECE_BYTES).len() <= room::MAX_PIECES_PER_SCOPE);
+
+        let mut r = Room::default();
+        for i in 0..(room::MAX_SCOPES * 4) {
+            r.submit((i + 1) as u64, crdt(&format!("s{i}"), json!(["AA=="]), false)).unwrap();
+        }
+        assert_eq!(r.texts().len(), room::MAX_SCOPES);
+    }
+
+    /// I4: a scope a save emptied is not sent to a joiner, so it costs no message.
+    #[test]
+    fn a_scope_a_save_emptied_is_not_part_of_the_catch_up() {
+        let mut r = Room::default();
+        r.observe_seq(0);
+        r.submit(1, crdt("other", json!(["AA=="]), false)).unwrap();
+        r.submit(2, crdt("doc", json!(["AA=="]), false)).unwrap();
+        r.submit(3, crdt("doc", json!(["U05BUA=="]), true)).unwrap();
+        r.checkpoint(2).expect("a save before a snapshot");
+        // A burned sequence: no ordered replay from the save on, so the fallback is used.
+        r.submit(5, crdt("doc", json!(["AQ=="]), false)).unwrap();
+        let catch_up = crate::catch_up(&r, r.saved_seq());
+        assert!(catch_up.replay.is_empty());
+        let scopes: Vec<&str> = catch_up.texts.iter().map(|(scope, ..)| scope.as_str()).collect();
+        assert_eq!(scopes, vec!["doc"], "the emptied scope is skipped");
+        assert!(catch_up.texts[0].3, "and the scope left starts at its snapshot");
+    }
+
+    /// C1: a room made past history it does not hold (the relay restarted, or the room was
+    /// dropped after its grace period) says so, and gives a fresh joiner nothing to lay over the
+    /// file, even once edits were made in it. A replica resuming inside its history is replayed
+    /// as before. The first snapshot ordered in the room is what a fresh joiner then starts
+    /// from, and the save after it ends the loss.
+    #[test]
+    fn a_room_made_past_its_history_says_the_history_is_lost() {
+        let mut r = Room::default();
+        r.observe_seq(40);
+        r.join(member("fresh", "bob")).unwrap();
+        assert!(r.history_lost());
+        let fresh = crate::catch_up(&r, r.saved_seq());
+        assert_eq!(fresh, crate::CatchUp { seq: 40, replay: Vec::new(), texts: Vec::new(), history_lost: true });
+
+        r.submit(41, crdt("doc", json!(["AA=="]), false)).unwrap();
+        let fresh = crate::catch_up(&r, r.saved_seq());
+        assert!(fresh.history_lost && fresh.texts.is_empty() && fresh.replay.is_empty(), "edits since are not a starting point: {fresh:?}");
+        assert_eq!(fresh.seq, 41);
+        let resumed = crate::catch_up(&r, 40);
+        assert!(resumed.history_lost, "a resuming replica is told too, so a saver checkpoints");
+        assert_eq!(resumed.replay.iter().map(|op| op.seq).collect::<Vec<_>>(), vec![41]);
+
+        r.submit(42, crdt("doc", json!(["U05BUA=="]), true)).unwrap();
+        assert!(!r.history_lost(), "a snapshot ordered here is a starting point");
+        let fresh = crate::catch_up(&r, r.saved_seq());
+        assert!(!fresh.history_lost);
+        assert_eq!(fresh.texts, vec![("doc".to_owned(), vec![json!("U05BUA==")], true, true)], "from the snapshot on");
+
+        r.checkpoint(41).expect("the save after it");
+        assert!(!r.history_lost());
+        let fresh = crate::catch_up(&r, r.saved_seq());
+        assert_eq!(fresh.replay.iter().map(|op| op.seq).collect::<Vec<_>>(), vec![42], "the ordinary replay again");
+    }
+
+    /// C1: a new document (nothing on the bus) has no history to lose, and a submit that reached
+    /// a new room before the join read the bus is the room's own history, not inherited.
+    #[test]
+    fn only_a_room_made_past_earlier_history_is_lost() {
+        let mut new = Room::default();
+        new.observe_seq(0);
+        assert!(!new.history_lost());
+        assert!(!crate::catch_up(&new, 0).history_lost);
+
+        let mut raced = Room::default();
+        raced.submit(41, crdt("doc", json!(["AA=="]), false)).unwrap();
+        raced.observe_seq(40);
+        assert_eq!(raced.inherited(), 40);
+        raced.observe_seq(41);
+        assert_eq!(raced.inherited(), 40, "learned once");
+    }
+
+    /// The grace timer drops a room only if it is still empty and did not empty again since.
+    #[test]
+    fn an_idle_mark_is_spent_by_a_rejoin() {
+        let mut r = Room::default();
+        let mark = r.idle_mark();
+        assert!(r.still_idle(mark));
+        r.join_as(member("a", "a"), "s1").unwrap();
+        assert!(!r.still_idle(mark), "rejoined");
+        r.leave_as("a", "s1");
+        let again = r.idle_mark();
+        assert!(!r.still_idle(mark), "an older timer");
+        assert!(r.still_idle(again));
+    }
+
+    /// Minor 8: one user cannot fill a document. A second window of a peer already in is not a
+    /// new peer and is let in.
+    #[test]
+    fn one_user_holds_a_bounded_share_of_a_document() {
+        let mut r = Room::default();
+        for i in 0..room::MAX_PEERS_PER_UID {
+            r.join(member(&format!("w{i}"), "mallory")).unwrap();
+        }
+        assert_eq!(r.join(member("one-more", "mallory")), Err(Refusal::FullForUser));
+        r.join(member("w0", "mallory")).expect("a reconnect of a peer already in");
+        r.join(member("alice", "alice")).expect("somebody else");
+    }
+
+    /// I3 / Minor 8: the wire carries the codes a client acts on, and nothing new when unset.
+    #[test]
+    fn error_codes_and_history_lost_are_on_the_wire() {
+        let retry = crate::ErrorMsg { doc: "d".to_owned(), detail: "x".to_owned(), local: Some(3), code: Some(crate::CODE_RETRY) };
+        assert_eq!(serde_json::to_value(&retry).unwrap()["code"], "retry");
+        let plain = crate::ErrorMsg { doc: "d".to_owned(), detail: "x".to_owned(), local: None, code: None };
+        assert!(serde_json::to_value(&plain).unwrap().get("code").is_none());
+        let decoded: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "local": 3, "code": "retry"}).to_string()).unwrap();
+        assert!(decoded.is_retry());
+        assert_eq!(decoded.refuses_connection(), None);
+        let full: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": crate::CODE_FULL}).to_string()).unwrap();
+        assert_eq!(full.refuses_connection(), Some(craft_collab::REFUSED_FULL));
+        let reconnect: craft_collab::ServerMsg = craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": "retry"}).to_string()).unwrap();
+        assert_eq!(reconnect.refuses_connection(), None, "a transient refusal of the connection is reconnected past");
     }
 }

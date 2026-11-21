@@ -312,6 +312,44 @@ is without waiting for them to move. It needs no edit permission, because
 somebody watching a design should still be able to say where they are looking.
 Nothing ephemeral is ordered, replayed or journaled.
 
+## Known limits
+
+Phase 1 of live co-editing ships with these. Each is a decision, not an oversight.
+
+- **Room state lives in relay memory only.** The op history, the retained text with its
+  checkpoint snapshot, and the saved marker are not written to Valkey (only the sequence, the id
+  space counter and the locks are). A room whose last socket left is kept for a grace period of
+  120 s (`ROOM_GRACE`), then dropped. After a relay restart, or once a room was dropped, the
+  relay marks every join to it `history_lost` until somebody checkpoints: a replica that held
+  nothing before refuses edits and waits for a snapshot, and the document service's saver
+  checkpoints at once if it still holds the document. If no replica that held it is still
+  running, the unsaved edits since the last save are gone and the file is reopened. Persisting
+  the snapshot and the tail in Valkey is the real fix, for a later phase.
+- **The service identity is a ticket `uid`.** The relay trusts any ticket whose `uid` is
+  `COLLABCRAFT_SERVICE_UID` (default `craft_office`) to checkpoint and to report saves. The
+  Nextcloud app refuses to mint a ticket for a real user with that uid; a separate signed claim
+  would be stronger and is left for later.
+- **The id space counter has no floor.** It lives in Valkey with a 30-day TTL refreshed on every
+  connection. If it is lost (a flush, a different database) while the sequence survives, spaces
+  start again at 1 and a new connection can share a space with a replica still open from before.
+  Reopening every window after a Valkey flush avoids it.
+- **A crafted yrs update can abort a wasm build.** Native builds catch a yrs panic and mark the
+  replica damaged. A browser build targets `wasm32`, where a panic aborts and cannot be
+  caught, so a hostile update from a peer with edit rights can stop that tab; the peer already
+  had edit rights to the document.
+- **A refreshed ticket does not reach a live socket.** A ticket is read at connect, and the relay
+  drops the socket when it expires (the default lifetime is 15 minutes). The hub reconnects with
+  the newest ticket it was given, so the cost is one reconnect and its catch-up per lifetime.
+- **A join copies the retained text under the relay-wide rooms lock.** Bounded by the room's text
+  budget, but a join to a room near it briefly delays other rooms' bookkeeping.
+- **Transport crates are held at `info` logging.** At `debug` socketioxide and engineioxide trace
+  handshakes, which carry the ticket, so the relay caps both at `info` whatever `RUST_LOG` says.
+  A build that removes that cap must not run at `debug` in production.
+- **A peer that vanished is reaped at the ping timeout.** engine.io pings every 25 s and waits
+  90 s for the answer, so that a pong queued behind a large checkpoint on a slow uplink still
+  arrives. A socket whose TCP connection died without a close is noticed by the relay only then.
+- **One user holds at most 16 connections to one document**, and a document at most 256.
+
 ## Licence
 
 See `LICENSE-APACHE` and `LICENSE-MIT`.

@@ -62,6 +62,8 @@ mod review_reverify;
 #[cfg(test)]
 mod e2e_reconnect;
 #[cfg(test)]
+mod e2e_fixwave;
+#[cfg(test)]
 mod review_reverify2;
 
 #[cfg(test)]
@@ -106,17 +108,52 @@ fn transport_cap(text_cap: usize) -> usize {
 /// `max_payload` bounds only an HTTP long-polling body. A WebSocket message has its own two
 /// limits, which default to 16 MiB a frame and 64 MiB a message, so a polling client was held
 /// to 1 MiB while a WebSocket one was not. All three now say the same thing.
+///
+/// The engine.io heartbeat is set here too, so every relay built from this (the binary and
+/// the tests) pings the same way.
 fn sized(builder: socketioxide::SocketIoBuilder, text_cap: usize) -> socketioxide::SocketIoBuilder {
     let cap = transport_cap(text_cap);
-    builder.max_payload(cap as u64).ws_max_message_size(cap).ws_max_frame_size(cap).max_buffer_size(SOCKET_BUFFER)
+    builder
+        .max_payload(cap as u64)
+        .ws_max_message_size(cap)
+        .ws_max_frame_size(cap)
+        .max_buffer_size(SOCKET_BUFFER)
+        .ping_interval(PING_INTERVAL)
+        .ping_timeout(PING_TIMEOUT)
 }
 
 /// Packets a socket may have queued and not yet written. engineioxide's default is 128, and
-/// an emit past it fails rather than waits. A join queues its whole replay at once (up to
-/// [`room::HISTORY`] ops) plus the joined message, the text pieces, the ephemeral state and
-/// whatever goes live meanwhile, so the buffer holds all of that. It is a bound on a count,
-/// not memory set aside: the bytes queued are bounded by what the room retains.
-const SOCKET_BUFFER: usize = room::HISTORY + 512;
+/// an emit past it fails rather than waits.
+///
+/// A bound on a COUNT of packets, not on bytes, and not memory set aside: engineioxide queues
+/// up to this many packets whatever their size, so the bytes queued are bounded only by what
+/// the room retains (its op history and retained text, see [`room::HISTORY_BYTES`]). A join
+/// queues the joined message, its whole ordered replay (up to [`room::HISTORY`] ops) or the
+/// `text_ops` pieces of every retained scope (at most [`room::MAX_SCOPES`] scopes of at most
+/// [`room::MAX_PIECES_PER_SCOPE`] pieces), all at once and before anything is written, so the
+/// buffer holds the larger of those with room to spare. Ephemeral state is sent after the
+/// socket joined, and one that does not fit is only dropped, never a cut join.
+const SOCKET_BUFFER: usize = 1 + max_usize(room::HISTORY, room::MAX_SCOPES * room::MAX_PIECES_PER_SCOPE) + 512;
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// How long a document's room stays in memory after its last socket left.
+///
+/// The room holds what a joiner needs and Valkey does not: the op history, the retained text
+/// with its checkpoint snapshot, and the saved marker. A reconnect storm, a page reload or a
+/// worker restarting would otherwise empty the room for a moment and drop all of that, and the
+/// next joiner would find the history gone (see `Joined.history_lost`).
+const ROOM_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`ErrorMsg::code`]: a transient relay failure (the bus did not answer). Send the same thing
+/// again after a backoff; nothing was ordered or decided.
+const CODE_RETRY: &str = "retry";
+
+/// [`ErrorMsg::code`] on a refused connection: the document, or this user's share of it, is
+/// full. Reconnecting at once cannot help.
+const CODE_FULL: &str = "full";
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -170,6 +207,14 @@ fn text_pieces(ops: &[serde_json::Value], budget: usize) -> Vec<Vec<serde_json::
 /// at 100 s, so this stays well under that.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
 
+/// How long engine.io waits for a pong before it closes the socket. A pong queued behind a
+/// large frame (a checkpoint of a few MiB on a slow uplink) arrives only after that frame, and
+/// engineioxide's default of 20 s closed such a socket mid transfer, so every retry of the same
+/// checkpoint died the same way. 90 s carries a frame at the text cap at
+/// `craft_collab::SLOW_LINK_BYTES_PER_SEC`-ish rates, and still reaps a dead socket in under two
+/// minutes; the client's own heartbeat notices a dead link much sooner.
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Shared relay state.
 struct Relay {
     /// Per-scope cap on retained CRDT text for every room this relay creates.
@@ -185,6 +230,8 @@ struct Relay {
     rooms: Mutex<HashMap<String, Room>>,
     /// file id -> that room's broadcast gate. See [`Relay::gate`].
     gates: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// How long an emptied room is kept. [`ROOM_GRACE`] in the binary.
+    room_grace: std::time::Duration,
 }
 
 /// What a peer sends in the Socket.IO handshake.
@@ -352,6 +399,12 @@ struct JoinedMsg<'a> {
     text_cap: usize,
     /// This relay acknowledges the `alive` heartbeat (see `on_alive`).
     heartbeat: bool,
+    /// The room began past history this relay no longer holds (it restarted, or the room was
+    /// dropped after its grace period) and nobody has checkpointed since. A joiner that holds
+    /// nothing from before must not take the saved file as current: it waits for a checkpoint
+    /// snapshot. A replica that held the document before may checkpoint at once.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    history_lost: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +429,10 @@ struct ErrorMsg {
     /// The `local` counter of the submit this refuses, when it refuses one.
     #[serde(skip_serializing_if = "Option::is_none")]
     local: Option<u64>,
+    /// [`CODE_RETRY`] for a transient failure, [`CODE_FULL`] for a refused connection, absent
+    /// otherwise. An older client ignores the field and reads the error as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 /// Key space for sessions and account links, kept apart from the relay's
@@ -385,7 +442,14 @@ const PREFIX_SERVICE: &str = "collabcraft:svc";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("collabcraft_relay=info".parse()?))
+        // The transport crates are held at info whatever RUST_LOG says: at debug they trace
+        // handshakes, and a handshake's auth carries the ticket.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("collabcraft_relay=info".parse()?)
+                .add_directive("socketioxide=info".parse()?)
+                .add_directive("engineioxide=info".parse()?),
+        )
         .init();
 
     let secret = std::env::var("COLLABCRAFT_SECRET").map_err(|_| {
@@ -421,6 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bus: Mutex::new(bus),
         rooms: Mutex::new(HashMap::new()),
         gates: std::sync::Mutex::new(HashMap::new()),
+        room_grace: ROOM_GRACE,
     });
     // For the health route, which outlives the move into the socket layer.
     let health_relay = relay.clone();
@@ -430,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // socket, which is the only place that costs nothing. Sized for the largest snapshot the
     // rooms retain; see `transport_cap`.
     let (layer, io) =
-        sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).ping_interval(PING_INTERVAL).with_state(relay).build_layer();
+        sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay).build_layer();
     // ns returns () for the local adapter, so there is nothing to await here.
     io.ns("/", on_connect);
 
@@ -689,7 +754,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
                 // either silent divergence or a window that cannot type, and neither is
                 // something a user could act on.
                 tracing::error!(error = %e, room = %room_key, "could not grant an id space");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None });
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) });
                 let _ = socket.disconnect();
                 return;
             }
@@ -699,9 +764,21 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // Where the document already was, read from the bus before the first peer
     // joins. A room rebuilt in memory starts at sequence zero, and handing out
     // a number a client has already seen is what made a reopen replay or stall.
+    //
+    // A failed read refuses the connection as transient rather than reading as zero: zero
+    // would make a room rebuilt after a restart look like a brand new document, and a joiner
+    // would then take the saved file as current next to replicas that are not on it.
     let retained_seq = {
         let mut bus = relay.bus.lock().await;
-        bus.current_seq(&room_key).await.unwrap_or(0)
+        match bus.current_seq(&room_key).await {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::error!(error = %e, room = %room_key, "could not read the document's sequence");
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: "relay could not start a session".to_owned(), local: None, code: Some(CODE_RETRY) });
+                let _ = socket.disconnect();
+                return;
+            }
+        }
     };
 
     // The room's gate is held until the socket has joined the broadcast room, after the
@@ -715,51 +792,30 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let joined = {
         let room = relay.room(&mut rooms, &room_key);
         room.observe_seq(retained_seq);
-        match room.join_as(Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit() }, &socket.id.to_string()) {
+        let peer = Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit(), uid: claims.uid.clone() };
+        match room.join_as(peer, &socket.id.to_string()) {
             Ok(()) => {
                 for (scope, holder) in &locks {
                     room.record_holder(scope.clone(), holder.clone());
                 }
-                // Catch the joiner up from where IT already is, not from where the
-                // saved file is. A connection resuming a session knows what it has
-                // already applied, and that is the only baseline that is correct
-                // for it: the saved file's sequence can be ahead of it (a save
-                // happened while it was gone, and resuming there would skip the
-                // edits made before that save that it never saw) or behind it (it
-                // is already caught up, and resuming at the file's sequence would
-                // re-send ops it has). A fresh load has no applied sequence of its
-                // own to offer, and the file it just read is at `saved_seq`, so
-                // that is the only baseline available to it. Either way the ops
-                // after the baseline bring it current, replayed as ordered ops so
-                // the path is the same one a live edit already takes. When the
-                // history no longer reaches that baseline, or a burned sequence
-                // broke the run, there is nothing clean to replay, so the join
-                // falls back to the current sequence and the retained text: the
-                // joiner then leans on the file alone, the older behaviour.
+                // See `catch_up` for which baseline and why.
                 let baseline = handshake.applied.unwrap_or_else(|| room.saved_seq());
-                match room.since(baseline) {
-                    Some(replay) => Some((baseline, replay, Vec::new(), room.peers().to_vec(), room.ephemeral())),
-                    None => {
-                        let texts: Vec<(String, Vec<serde_json::Value>, bool, bool)> = room
-                            .texts()
-                            .iter()
-                            .map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete(), log.starts_with_snapshot()))
-                            .collect();
-                        Some((room.seq(), Vec::new(), texts, room.peers().to_vec(), room.ephemeral()))
-                    }
-                }
+                Ok((catch_up(room, baseline), room.peers().to_vec(), room.ephemeral()))
             }
-            Err(_) => None,
+            Err(refusal) => Err(refusal),
         }
     };
 
     drop(rooms);
-    let Some((seq, replay, texts, roster, ephemeral)) = joined else {
-        drop(ordered);
-        tracing::warn!(room = %room_key, "refusing a peer: the document is full");
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: Refusal::Full.detail(), local: None });
-        let _ = socket.disconnect();
-        return;
+    let (CatchUp { seq, replay, texts, history_lost }, roster, ephemeral) = match joined {
+        Ok(joined) => joined,
+        Err(refusal) => {
+            drop(ordered);
+            tracing::warn!(room = %room_key, "refusing a peer: the document is full");
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: refusal.detail(), local: None, code: Some(CODE_FULL) });
+            let _ = socket.disconnect();
+            return;
+        }
     };
 
     // Mark this socket as having actually reached `Room::join`. `on_disconnect` is registered
@@ -783,6 +839,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
             fallback: !texts.is_empty(),
             text_cap: relay.text_cap,
             heartbeat: true,
+            history_lost,
         },
     );
 
@@ -836,7 +893,63 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
 
     emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
 
-    tracing::info!(uid = %claims.uid, peer = %peer_id, room = %room_key, may_edit = claims.may_edit(), "peer joined");
+    tracing::info!(uid = %claims.uid, peer = %peer_id, room = %room_key, may_edit = claims.may_edit(), history_lost, "peer joined");
+}
+
+/// What a join is caught up with.
+#[derive(Debug, PartialEq)]
+struct CatchUp {
+    /// `Joined.seq`: the sequence the catch-up brings the joiner to before its replay.
+    seq: u64,
+    /// The ordered replay after `seq`.
+    replay: Vec<Op>,
+    /// The fallback instead of a replay, per scope: `(scope, ops, complete, starts with a snapshot)`.
+    texts: Vec<(String, Vec<serde_json::Value>, bool, bool)>,
+    /// `Joined.history_lost`, see [`Room::history_lost`].
+    history_lost: bool,
+}
+
+/// The catch-up for a joiner at `baseline`.
+///
+/// Catch the joiner up from where IT already is, not from where the saved file is. A
+/// connection resuming a session knows what it has already applied, and that is the only
+/// baseline that is correct for it: the saved file's sequence can be ahead of it (a save
+/// happened while it was gone, and resuming there would skip the edits made before that save
+/// that it never saw) or behind it (it is already caught up, and resuming at the file's
+/// sequence would re-send ops it has). A fresh load has no applied sequence of its own to
+/// offer, and the file it just read is at `saved_seq`, so that is the only baseline available
+/// to it. Either way the ops after the baseline bring it current, replayed as ordered ops so
+/// the path is the same one a live edit already takes. When the history no longer reaches
+/// that baseline, or a burned sequence broke the run, there is nothing clean to replay, so the
+/// join falls back to the current sequence and the retained text: the joiner then leans on the
+/// file alone, the older behaviour.
+///
+/// A baseline before this room's own history (the relay restarted, or the room was dropped
+/// after its grace period) is different: what this room retained builds on ops it no longer
+/// has, so it cannot be laid over the file. Such a joiner starts from a snapshot ordered in
+/// this room when there is one, and otherwise gets nothing and is told the history is lost.
+///
+/// Scopes that would tell a joiner nothing (complete and empty, as a save leaves them) are not
+/// sent, so they do not take a message each.
+fn catch_up(room: &Room, baseline: u64) -> CatchUp {
+    let history_lost = room.history_lost();
+    if baseline < room.inherited() && room.saved_seq() < room.inherited() {
+        let texts = room.texts_from_snapshot().into_iter().map(|(scope, ops)| (scope, ops, true, true)).collect();
+        return CatchUp { seq: room.seq(), replay: Vec::new(), texts, history_lost };
+    }
+    match room.since(baseline) {
+        Some(replay) => CatchUp { seq: baseline, replay, texts: Vec::new(), history_lost },
+        None => {
+            let mut texts: Vec<(String, Vec<serde_json::Value>, bool, bool)> = room
+                .texts()
+                .iter()
+                .filter(|(_, log)| !log.is_idle())
+                .map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete(), log.starts_with_snapshot()))
+                .collect();
+            texts.sort_by(|a, b| a.0.cmp(&b.0));
+            CatchUp { seq: room.seq(), replay: Vec::new(), texts, history_lost }
+        }
+    }
 }
 
 async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): State<Arc<Relay>>) {
@@ -861,7 +974,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     let scope = if is_crdt_command(&msg.command) { None } else { msg.scope };
     if is_snapshot(&msg.command, &msg.params) && !saved_allowed(&claims, &relay.service_uid) {
         let refusal = if claims.may_edit() { Refusal::NotTheSaver } else { Refusal::ReadOnly };
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local, code: None });
         return;
     }
     let preflight = match &scope {
@@ -925,7 +1038,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         None => Ok(()),
     };
     if let Err(refusal) = preflight {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local, code: None });
         return;
     }
 
@@ -957,7 +1070,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
-                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local });
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
                 return;
             }
         }
@@ -998,7 +1111,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             emit_live(socket.within(room_name), "op", &OpMsg::new(&claims, &op));
         }
         Err(refusal) => {
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local });
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local, code: None });
         }
     }
 }
@@ -1035,7 +1148,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
     let room_name = claims.room();
 
     if !claims.may_edit() {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None, code: None });
         return;
     }
 
@@ -1066,7 +1179,7 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         }
         Err(e) => {
             tracing::error!(error = %e, room = %claims.rm, "lock failed");
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned(), local: None });
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: "relay could not take that lock".to_owned(), local: None, code: Some(CODE_RETRY) });
         }
     }
 }
@@ -1138,11 +1251,11 @@ async fn on_frame(socket: SocketRef, Data(msg): Data<FrameMsg>) {
     let room_name = claims.room();
 
     if !claims.may_edit() {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::ReadOnly.detail(), local: None, code: None });
         return;
     }
     if msg.payload.len() > MAX_FRAME_BYTES {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail(), local: None });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: Refusal::TooLarge { bytes: msg.payload.len() }.detail(), local: None, code: None });
         return;
     }
 
@@ -1184,7 +1297,7 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
         relay.room(&mut rooms, &claims.rm).remember_ephemeral(&claims.pid, &msg.kind, msg.payload.clone())
     };
     if let Err(refusal) = remembered {
-        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local: None });
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local: None, code: None });
         return;
     }
 
@@ -1210,7 +1323,14 @@ async fn on_ephemeral(socket: SocketRef, Data(msg): Data<EphemeralMsg>, State(re
 /// The client's heartbeat. Acknowledged with nothing and not logged: it exists so a client
 /// can tell a live link from a half-open one (laptop sleep, a Wi-Fi roam, a NAT that dropped
 /// the mapping), where its sends succeed into a socket nothing reads.
-async fn on_alive(ack: socketioxide::extract::AckSender) {
+///
+/// Not acknowledged once the socket's token has lapsed: [`live_claims`] drops the socket
+/// instead, as every other handler does, so a socket that only listens and beats cannot outlive
+/// its ticket.
+async fn on_alive(socket: SocketRef, ack: socketioxide::extract::AckSender) {
+    if live_claims(&socket).is_none() {
+        return;
+    }
     let _ = ack.send(&());
 }
 
@@ -1219,12 +1339,18 @@ async fn on_saved(socket: SocketRef, Data(msg): Data<SavedMsg>, State(relay): St
     let doc = claims.room();
     // Answered either way, so the saver knows whether it may write the file: the baseline
     // moved (`saved_ack`) or it did not (`saved_refused`, with the same `seq`).
-    let outcome = if claims.may_edit() {
+    //
+    // Only the service peer may move the baseline, by the same rule as the snapshot it names
+    // ([`saved_allowed`]): an editor never wrote the file, so its report would only ever be a
+    // way to prune another editor's unsaved work out of the replay.
+    let outcome = if saved_allowed(&claims, &relay.service_uid) {
         let mut rooms = relay.rooms.lock().await;
         match rooms.get_mut(&claims.rm) {
             Some(room) => room.checkpoint(msg.seq).map_err(|refusal| refusal.detail()),
             None => Err("this document is not open on the relay".to_owned()),
         }
+    } else if claims.may_edit() {
+        Err(Refusal::NotTheSaver.detail())
     } else {
         Err(Refusal::ReadOnly.detail())
     };
@@ -1234,7 +1360,7 @@ async fn on_saved(socket: SocketRef, Data(msg): Data<SavedMsg>, State(relay): St
         }
         Err(reason) => {
             let _ = socket.emit("saved_refused", &serde_json::json!({ "doc": doc, "seq": msg.seq, "reason": reason }));
-            let _ = socket.emit("error", &ErrorMsg { doc, detail: reason, local: None });
+            let _ = socket.emit("error", &ErrorMsg { doc, detail: reason, local: None, code: None });
         }
     }
 }
@@ -1264,11 +1390,22 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
         let roster = room.peers().to_vec();
         let empty = room.is_empty();
         if empty {
-            // Dropping the room frees the op history. The sequence stays in
-            // Valkey, so a later peer continues from where this one left off
-            // rather than starting again at 1.
-            rooms.remove(&claims.rm);
-            relay.forget_gate(&claims.rm);
+            // Kept for the grace period, then dropped if nobody came back: dropping frees the
+            // op history and the retained text, which only this room holds. The sequence stays
+            // in Valkey, so a later peer continues from where this one left off rather than
+            // starting again at 1, but a joiner after the drop finds the history gone.
+            let mark = room.idle_mark();
+            let (relay, key) = (Arc::clone(&relay), claims.rm.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(relay.room_grace).await;
+                let mut rooms = relay.rooms.lock().await;
+                if rooms.get(&key).is_some_and(|room| room.still_idle(mark)) {
+                    rooms.remove(&key);
+                    drop(rooms);
+                    relay.forget_gate(&key);
+                    tracing::debug!(room = %key, "an idle room was dropped after its grace period");
+                }
+            });
         }
         (dropped, gone, roster, empty)
     };

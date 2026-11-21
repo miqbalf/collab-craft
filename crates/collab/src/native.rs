@@ -124,7 +124,12 @@ impl NativeHub {
         let link = Link { url: Endpoint::of(url).url(), in_tx, control: control.clone(), shared: shared.clone() };
 
         let first = serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO });
-        let client = link.builder(0).auth(first).connect().await.map_err(|e| Error::Hub(e.to_string()))?;
+        // Bounded like every later attempt: a relay that accepts the TCP connection and never
+        // answers (a stalled proxy, a half-open route) would otherwise hang the caller for ever.
+        let client = match tokio::time::timeout(EMIT_TIMEOUT, link.builder(0).auth(first).connect()).await {
+            Ok(connected) => connected.map_err(|e| Error::Hub(e.to_string()))?,
+            Err(_) => return Err(Error::Hub(format!("the relay did not answer in {EMIT_TIMEOUT:?}"))),
+        };
         let (stop, stopped) = oneshot::channel();
         tokio::spawn(link.run(client, out_rx, control_rx, stopped));
         Ok(NativeHub { outbox, inbox, control, shared, _stop: stop })
@@ -248,6 +253,10 @@ struct Connection {
     /// Until when what was written may still be in the socket's buffers: an emit returns once
     /// the transport took it, and a heartbeat written after it waits behind it on the link.
     busy_until: tokio::time::Instant,
+    /// The transfer time of what was written since the heartbeat in flight was sent. An
+    /// acknowledgement of that heartbeat proves everything written before it arrived, so only
+    /// this part of [`Connection::busy_until`] still stands then.
+    since_beat: Duration,
 }
 
 impl Connection {
@@ -264,12 +273,36 @@ impl Connection {
             catching_up: false,
             frame_time: transfer_time(MAX_FRAME_BYTES),
             busy_until: tokio::time::Instant::now(),
+            since_beat: Duration::ZERO,
         }
     }
 
     /// `bytes` were handed to the transport: allow them their transfer time on a slow link.
     fn wrote(&mut self, bytes: usize) {
-        self.busy_until = self.busy_until.max(tokio::time::Instant::now()) + transfer_time(bytes);
+        let time = transfer_time(bytes);
+        self.busy_until = self.busy_until.max(tokio::time::Instant::now()) + time;
+        self.since_beat += time;
+    }
+
+    /// A heartbeat went out at `at`: what is written from now on is written after it.
+    fn beat_sent(&mut self, n: u64, at: tokio::time::Instant) {
+        self.beat = self.acks.then_some((n, at));
+        self.since_beat = Duration::ZERO;
+    }
+
+    /// The relay acknowledged heartbeat `n` at `at`. Everything written before that heartbeat
+    /// has arrived, so the transfer time still allowed shrinks to what was written after it.
+    /// Without this, a few large emits on a fast link left `busy_until` minutes ahead, and a
+    /// link that died after them was noticed only that much later.
+    fn acked(&mut self, n: u64, at: tokio::time::Instant) {
+        self.heard = at;
+        // Acknowledged behind whatever the relay queued before it, so the join's catch-up, if
+        // any, is in.
+        self.catching_up = false;
+        if self.beat.is_some_and(|(b, _)| b == n) {
+            self.beat = None;
+            self.busy_until = busy_after_ack(self.busy_until, at, self.since_beat);
+        }
     }
 
     /// When the heartbeat in flight is overdue, on a relay that acknowledges them: counted
@@ -280,6 +313,12 @@ impl Connection {
         let (_, sent) = self.beat?;
         Some(beat_deadline(sent.max(self.busy_until), self.heard, self.catching_up, self.frame_time))
     }
+}
+
+/// What is still in flight once a heartbeat was acknowledged at `at`: only what was written
+/// after that heartbeat, `since_beat` of transfer time from now, and never more than before.
+fn busy_after_ack(busy_until: tokio::time::Instant, at: tokio::time::Instant, since_beat: Duration) -> tokio::time::Instant {
+    busy_until.min(at + since_beat)
 }
 
 /// When a heartbeat sent at `sent` is overdue, with the relay last heard at `heard`.
@@ -452,13 +491,7 @@ impl Link {
                         }
                         Control::Alive(generation, n) => {
                             if let Some(c) = conn.as_mut().filter(|c| c.generation == generation) {
-                                c.heard = tokio::time::Instant::now();
-                                // Acknowledged behind whatever the relay queued before it, so
-                                // the join's catch-up, if any, is in.
-                                c.catching_up = false;
-                                if c.beat.is_some_and(|(b, _)| b == n) {
-                                    c.beat = None;
-                                }
+                                c.acked(n, tokio::time::Instant::now());
                             }
                         }
                         Control::Heard(generation, more) => {
@@ -521,7 +554,7 @@ impl Link {
                     if sent {
                         // Only a relay that acknowledges is waited on; for an older one the
                         // emit succeeding is all there is to know.
-                        c.beat = c.acks.then(|| (n, tokio::time::Instant::now()));
+                        c.beat_sent(n, tokio::time::Instant::now());
                     } else {
                         self.dead(c);
                     }
@@ -627,6 +660,8 @@ fn decode_payload(event: &str, payload: Payload) -> Vec<ServerMsg> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     #[test]
@@ -645,6 +680,41 @@ mod tests {
         assert_eq!(frame, Duration::from_secs(64));
         assert_eq!(beat_deadline(sent, sent, true, frame), sent + HEARTBEAT_TIMEOUT + frame);
         assert!(ACK_WINDOW > HEARTBEAT_TIMEOUT + transfer_time(MAX_FRAME_BYTES), "a late acknowledgement is still delivered");
+    }
+
+    /// I2 (R6-1): an acknowledged heartbeat proves everything written before it arrived, so the
+    /// transfer time allowed for those writes no longer delays noticing a dead link. Only what
+    /// was written after the heartbeat still counts.
+    #[test]
+    fn an_acknowledged_heartbeat_clamps_the_transfer_time_still_allowed() {
+        let now = tokio::time::Instant::now();
+        let heavy = now + Duration::from_secs(120);
+        assert_eq!(busy_after_ack(heavy, now, Duration::ZERO), now, "everything before the beat is in");
+        assert_eq!(busy_after_ack(heavy, now, Duration::from_secs(3)), now + Duration::from_secs(3), "what came after it still counts");
+        assert_eq!(busy_after_ack(now, now + Duration::from_secs(1), Duration::from_secs(5)), now, "never later than before");
+        // The deadline of the next heartbeat then starts from its own send, not minutes ahead.
+        let next = now + Duration::from_secs(5);
+        let deadline = beat_deadline(next.max(busy_after_ack(heavy, now, Duration::ZERO)), next, false, transfer_time(MAX_FRAME_BYTES));
+        assert_eq!(deadline, next + HEARTBEAT_TIMEOUT);
+    }
+
+    /// Minor 6: the first connection is bounded like every later one. A relay that takes the
+    /// TCP connection and never answers the upgrade used to hang the caller for ever.
+    #[tokio::test]
+    async fn the_first_connect_gives_up_on_a_relay_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("has an address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(EMIT_TIMEOUT + Duration::from_secs(10), NativeHub::connect(&format!("http://{addr}"), "t", None)).await;
+        let Ok(connected) = outcome else { panic!("connect hung past {:?}", started.elapsed()) };
+        assert!(connected.is_err(), "a relay that never answered was taken as connected");
+        assert!(started.elapsed() >= EMIT_TIMEOUT, "gave up early: {:?}", started.elapsed());
     }
 
     #[test]

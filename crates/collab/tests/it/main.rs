@@ -582,6 +582,7 @@ fn joined(peer: &str, space: u32) -> ServerMsg {
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     }
 }
 
@@ -783,6 +784,7 @@ fn joined_at(peer: &str, space: u32, seq: u64, replay_until: Option<u64>) -> Ser
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     }
 }
 
@@ -999,6 +1001,7 @@ fn fallback_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
         fallback: true,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     }
 }
 
@@ -1491,7 +1494,9 @@ fn a_refused_edit_breaks_the_replica_and_says_so() {
     live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
     let (local, _) = last_submit(&hub);
     live.notices.clear();
-    hub.0.borrow_mut().inbox.push(submit_refused(local, "relay could not order that edit"));
+    // A refusal a retry cannot change. A transient one keeps the edit instead (see
+    // `a_transient_refusal_keeps_the_edit_and_sends_it_again`).
+    hub.0.borrow_mut().inbox.push(submit_refused(local, "that change is 99 bytes, more than this relay will carry"));
     let work = live.pump();
     assert!(work.iter().any(|w| matches!(w, Work::TextIncomplete { .. })), "{work:?}");
     assert!(!live.ready_to_type());
@@ -1621,4 +1626,163 @@ fn applied_counts_only_ops_in_order() {
     bob_hub.0.borrow_mut().inbox.push(op(1, "alice", None, edits[0].clone()));
     bob.pump();
     assert_eq!(bob.applied(), 2);
+}
+
+
+// ---- final fix wave ------------------------------------------------------------------------
+
+fn retry_refused(local: u64) -> ServerMsg {
+    ServerMsg::Error { doc: "d".to_owned(), detail: "relay could not order that edit".to_owned(), local: Some(local), code: Some(craft_collab::RETRY.to_owned()) }
+}
+
+fn lost_join(peer: &str, space: u32, seq: u64) -> ServerMsg {
+    let mut join = joined_at(peer, space, seq, Some(seq));
+    if let ServerMsg::Joined { history_lost, .. } = &mut join {
+        *history_lost = true;
+    }
+    join
+}
+
+fn submits(hub: &FakeHub) -> Vec<(u64, Value)> {
+    hub.0
+        .borrow()
+        .sent
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::Submit { local, params, .. } => Some((*local, params.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// I3: a submit the relay refused for now (`code: "retry"`, its bus did not answer) is kept,
+/// not taken for a lost edit: the replica stays sound, and after a backoff the same update goes
+/// out again under a new counter. Once that one is confirmed nothing more is sent. An older
+/// relay's wording without a code is treated the same, because it is not one of the refusals a
+/// retry cannot change.
+#[test]
+fn a_transient_refusal_keeps_the_edit_and_sends_it_again() {
+    for coded in [true, false] {
+        let hub = FakeHub::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&sample()).unwrap();
+        hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+        live.pump();
+        live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
+        let (local, params) = last_submit(&hub);
+        let refusal = if coded { retry_refused(local) } else { submit_refused(local, "relay could not order that edit") };
+        hub.0.borrow_mut().inbox.push(refusal);
+        let work = live.pump();
+        assert!(!work.iter().any(|w| matches!(w, Work::TextIncomplete { .. })), "{coded}: {work:?}");
+        assert!(live.ready_to_type(), "{coded}: a transient refusal broke the replica");
+        assert!(submits(&hub).is_empty(), "{coded}: sent again before the backoff");
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        live.pump();
+        let again = submits(&hub);
+        assert_eq!(again.len(), 1, "{coded}: the refused edit was not sent again: {again:?}");
+        let (resent, resent_params) = again[0].clone();
+        assert_ne!(resent, local, "a new counter");
+        assert_eq!(resent_params["ops"], params["ops"], "{coded}: the same update");
+        hub.0.borrow_mut().sent.clear();
+
+        hub.0.borrow_mut().inbox.push(op(1, "alice", Some(resent), resent_params));
+        live.pump();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        live.pump();
+        assert!(submits(&hub).is_empty(), "{coded}: a confirmed edit went out again");
+        assert!(live.ready_to_type());
+    }
+}
+
+/// C1: a replica that joins a room whose history the relay lost, holding nothing from before,
+/// is told once and does not take the file as current: no edit, undo or checkpoint, and the
+/// room's ordinary updates are not laid over the file. The room's next snapshot restarts it,
+/// and it edits from there.
+#[test]
+fn a_fresh_replica_waits_for_the_snapshot_after_a_lost_history() {
+    // The room's real state: the file plus edits the joiner's file does not have, made by a
+    // replica whose items the file's seed does not share.
+    let mut room = replica(&sample(), 2);
+    room.insert_text(1, 0, "Live ", &Map::new()).unwrap();
+    let saved_file = file_of(&room);
+    let edit = room.insert_text(4, 0, "unsaved ", &Map::new()).unwrap();
+    let snap = serde_json::to_value(TextPayload::snapshot(&room.state())).unwrap();
+
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    hub.0.borrow_mut().inbox.push(lost_join("fresh", 9, 40));
+    let work = live.pump();
+    assert_eq!(work.iter().filter(|w| matches!(w, Work::HistoryLost)).count(), 1, "{work:?}");
+    assert!(live.awaiting_snapshot());
+    live.seed(&saved_file).unwrap();
+    assert!(!live.ready_to_type());
+    let refused = live.edit(|d| d.insert_text(1, 0, "x", &Map::new()));
+    assert!(refused.is_err_and(|e| e.to_string().contains("lost its history")), "the reason is clear");
+    assert!(live.undo().is_err());
+    assert!(live.checkpoint().is_err());
+
+    // An ordinary update, ordered before the snapshot, is left to it.
+    hub.0.borrow_mut().inbox.push(op(41, "worker", Some(7), serde_json::to_value(TextPayload::new(&edit)).unwrap()));
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::Doc { .. } | Work::HistoryLost)), "{work:?}");
+    assert!(submits(&hub).is_empty(), "nothing went out while waiting");
+
+    hub.0.borrow_mut().inbox.push(op(42, "worker", Some(8), snap));
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+    assert!(!live.awaiting_snapshot());
+    assert!(live.ready_to_type());
+    assert_same(live.doc().unwrap(), &room, &whole(&room));
+
+    live.edit(|d| d.insert_text(1, 0, ">", &Map::new())).unwrap();
+    let (_, params) = last_submit(&hub);
+    room.apply(&bytes_of(&params)[0]).unwrap();
+    assert_same(live.doc().unwrap(), &room, &whole(&room));
+    assert_eq!(room.block(1).unwrap().text, ">Live Title");
+}
+
+/// C1: the snapshot can arrive before the app loaded the file. Then the file is never seeded:
+/// the seed restores the snapshot.
+#[test]
+fn a_lost_history_snapshot_before_the_seed_is_what_the_seed_restores() {
+    let mut room = replica(&sample(), 2);
+    room.insert_text(1, 0, "Live ", &Map::new()).unwrap();
+    let snap = serde_json::to_value(TextPayload::snapshot(&room.state())).unwrap();
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    hub.0.borrow_mut().inbox.extend([lost_join("fresh", 9, 40), op(41, "worker", Some(1), snap)]);
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::SeedWanted { .. })), "{work:?}");
+    live.seed(&sample()).unwrap();
+    assert!(!live.awaiting_snapshot());
+    assert!(live.ready_to_type());
+    assert_same(live.doc().unwrap(), &room, &whole(&room));
+}
+
+/// C1: a replica that settled on the room's history before the relay lost it keeps working
+/// when it rejoins: it is told (so the service saver checkpoints at once) and waits for
+/// nothing.
+#[test]
+fn a_settled_replica_is_told_of_a_lost_history_and_keeps_working() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("worker", 1, 0, Some(0)));
+    live.pump();
+    live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
+    let (local, params) = last_submit(&hub);
+    hub.0.borrow_mut().inbox.push(op(1, "worker", Some(local), params));
+    live.pump();
+
+    hub.0.borrow_mut().inbox.push(lost_join("worker", 5, 1));
+    let work = live.pump();
+    assert_eq!(work.iter().filter(|w| matches!(w, Work::HistoryLost)).count(), 1, "{work:?}");
+    assert!(!live.awaiting_snapshot());
+    assert!(live.ready_to_type());
+    live.checkpoint().expect("the saver checkpoints at once");
+
+    // Told once per join that lost it, not per message.
+    let work = live.pump();
+    assert!(!work.iter().any(|w| matches!(w, Work::HistoryLost)), "{work:?}");
 }

@@ -21,7 +21,7 @@ const SECRET: &[u8] = b"a-shared-secret-at-least-32-chars-long";
 const NOW: i64 = 1_760_000_000;
 
 fn peer(id: &str) -> Peer {
-    Peer { peer: id.to_owned(), display: id.to_uppercase(), may_edit: true }
+    Peer { peer: id.to_owned(), display: id.to_uppercase(), may_edit: true, uid: id.to_owned() }
 }
 
 fn sub(peer: &str, command: &str, params: serde_json::Value, scope: Option<&str>, local: Option<u64>) -> Submission {
@@ -52,6 +52,7 @@ fn joined(doc: &str, me: &str, seq: u64) -> craft_collab::ServerMsg {
         fallback: false,
         text_cap: None,
         heartbeat: false,
+        history_lost: false,
     }
 }
 
@@ -276,6 +277,7 @@ mod e2e {
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
             gates: Default::default(),
+            room_grace: crate::ROOM_GRACE,
         });
         let (layer, io) = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);

@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Effect::TextOps { scope, complete, .. } => println!("TEXTOPS {scope} (complete {complete})"),
                     Effect::Frame { origin, .. } => println!("FRAME   from {origin}"),
                     Effect::Ephemeral { origin, kind, .. } => println!("EPHEM   {origin} {kind}"),
-                    Effect::SubmitRefused { local, detail } => println!("REFUSED local {local}: {detail}"),
+                    Effect::SubmitRefused { local, detail, .. } => println!("REFUSED local {local}: {detail}"),
                     Effect::SavedAck { seq } => println!("SAVED   through {seq}"),
                     Effect::SavedRefused { seq, reason } => println!("SAVE    through {seq} refused: {reason}"),
                 }

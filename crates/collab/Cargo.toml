@@ -36,7 +36,7 @@ yrs = { version = "0.28", features = ["sync"] }
 
 [dev-dependencies]
 proptest = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 
 # The example drives a live relay, so it needs the native transport. Declaring
 # required-features keeps a default-feature `cargo test` from trying to build

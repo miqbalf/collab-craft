@@ -34,6 +34,7 @@ mod e2e {
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
             gates: Default::default(),
+            room_grace: crate::ROOM_GRACE,
         });
         let (layer, io) = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);

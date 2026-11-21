@@ -40,6 +40,7 @@ mod unit {
             fallback: false,
             text_cap: None,
             heartbeat: false,
+            history_lost: false,
         });
         let mut fx = Vec::new();
         for seq in 4..=100u64 {
@@ -67,7 +68,7 @@ mod unit {
     fn unit_retained_text_bytes_are_bounded_per_room() {
         use crate::room::{MAX_SCOPES, Room, Submission, TEXT_BYTES, TOTAL_TEXT_BYTES};
         let mut r = Room::default();
-        r.join(crate::room::Peer { peer: "mallory".into(), display: "mallory".into(), may_edit: true }).unwrap();
+        r.join(crate::room::Peer { peer: "mallory".into(), display: "mallory".into(), may_edit: true, uid: "mallory".into() }).unwrap();
         let blob = "x".repeat(TEXT_BYTES - 64);
         for i in 0..16u64 {
             let sub = Submission {
@@ -134,6 +135,7 @@ mod e2e {
             bus: Mutex::new(bus),
             rooms: Mutex::new(Default::default()),
             gates: Default::default(),
+            room_grace: crate::ROOM_GRACE,
         });
         let (layer, io) = crate::sized(SocketIo::builder(), text_cap).req_path(format!("{base}/socket.io")).with_state(relay.clone()).build_layer();
         io.ns("/", on_connect);

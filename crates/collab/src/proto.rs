@@ -49,6 +49,17 @@ pub const REFUSED_AUTH: &str = "auth";
 /// [`ServerMsg::Error`] `code`: this client speaks another protocol version than the relay.
 pub const REFUSED_PROTO: &str = "proto";
 
+/// [`ServerMsg::Error`] `code`: the document, or this user's share of it, is full. The relay
+/// closes the connection; reconnecting at once cannot help.
+pub const REFUSED_FULL: &str = "full";
+
+/// [`ServerMsg::Error`] `code`: a transient relay failure (its bus did not answer). Nothing was
+/// ordered or decided, so the same thing may be sent again after a backoff. On a submit
+/// ([`ServerMsg::Error::local`] set) [`crate::Live`] keeps the edit and resends it; on a
+/// connection the relay closes it and the hub reconnects as after any drop. Never a refusal of
+/// the connection itself ([`ServerMsg::refuses_connection`]).
+pub const RETRY: &str = "retry";
+
 /// Insert or move a sibling by fractional key. Payload is a position change.
 pub const CRDT_POS: &str = "crdt.pos";
 
@@ -155,6 +166,14 @@ pub enum ServerMsg {
         /// dead link. Absent (false) from an older relay, which has no handler for it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         heartbeat: bool,
+        /// The room began past history the relay no longer holds (it restarted, or the room was
+        /// dropped after its grace period) and nobody has checkpointed since. The saved file is
+        /// not a starting point then: its items differ from the replicas still running. A
+        /// replica that held nothing before this join waits for a checkpoint snapshot
+        /// ([`crate::Live::awaiting_snapshot`]); one that held a settled document may
+        /// checkpoint at once. Absent (false) from an older relay.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        history_lost: bool,
     },
     /// CRDT operations a joining peer missed, outside the sequence.
     ///
@@ -267,8 +286,9 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local: Option<u64>,
         /// Set when the relay refused the connection itself and is closing it:
-        /// [`REFUSED_AUTH`] or [`REFUSED_PROTO`]. Reconnecting with the same auth cannot help.
-        /// Absent from an older relay.
+        /// [`REFUSED_AUTH`], [`REFUSED_PROTO`] or [`REFUSED_FULL`]. Reconnecting with the same
+        /// auth cannot help. [`RETRY`] instead marks a transient failure, on a submit or on the
+        /// connection, that a later attempt may get past. Absent from an older relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
     },
@@ -308,11 +328,17 @@ impl ServerMsg {
         }
     }
 
-    /// The code of a refusal of the connection itself, when this is one.
+    /// The code of a refusal of the connection itself, when this is one. [`RETRY`] never is:
+    /// the hub reconnects past it as after any drop.
     pub fn refuses_connection(&self) -> Option<&str> {
         match self {
-            ServerMsg::Error { code: Some(code), local: None, .. } => Some(code),
+            ServerMsg::Error { code: Some(code), local: None, .. } if code != RETRY => Some(code),
             _ => None,
         }
+    }
+
+    /// Whether this is a transient relay failure that a later attempt may get past ([`RETRY`]).
+    pub fn is_retry(&self) -> bool {
+        matches!(self, ServerMsg::Error { code: Some(code), .. } if code == RETRY)
     }
 }

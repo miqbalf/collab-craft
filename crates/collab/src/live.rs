@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::hub::Hub;
-use crate::proto::{CRDT_TEXT, ClientMsg, ServerMsg};
+use crate::proto::{CRDT_TEXT, ClientMsg, RETRY, ServerMsg};
 use crate::session::{Effect, Session};
 use crate::ydoc::{BlockChange, LiveDoc, LiveError, SeedBlock};
 
@@ -145,10 +145,22 @@ pub enum Work {
     /// save report's sequence) counts. Other relay errors leave a checkpoint in flight alone.
     CheckpointRefused { reason: String },
     /// The relay refused the connection itself and closed it: `code` is
-    /// [`crate::REFUSED_AUTH`] (a bad or expired ticket) or [`crate::REFUSED_PROTO`]. The hub
-    /// stops reconnecting; give it a new ticket with [`Hub::set_token`] (through
-    /// [`Live::hub_mut`]) and it connects again.
+    /// [`crate::REFUSED_AUTH`] (a bad or expired ticket), [`crate::REFUSED_PROTO`] or
+    /// [`crate::REFUSED_FULL`]. The hub stops reconnecting; give it a new ticket with
+    /// [`Hub::set_token`] (through [`Live::hub_mut`]) and it connects again.
     ConnectionRefused { code: String, reason: String },
+    /// The relay joined this link to a room that lost its history (`Joined.history_lost`): it
+    /// restarted, or the room was dropped after its grace period, and nobody has checkpointed
+    /// since. Raised once per such join.
+    ///
+    /// * A replica that held a settled document before this join (the document service's
+    ///   saver, an editor that stayed open) keeps working. The saver should checkpoint at once
+    ///   ([`Live::checkpoint`]): that snapshot is what every other replica restarts from.
+    /// * A replica that held nothing from before (a fresh file seed) cannot trust the file: its
+    ///   items are not the ones the running replicas hold. It refuses edits
+    ///   ([`Live::awaiting_snapshot`]) until the room's next checkpoint snapshot arrives, then
+    ///   restarts from it ([`Work::Reset`], or the snapshot is what [`Live::seed`] restores).
+    HistoryLost,
 }
 
 /// Whether a relay error says something a retry cannot change.
@@ -157,6 +169,8 @@ pub enum Work {
 /// past what the relay carries, and a checkpoint past what it retains for joiners.
 #[must_use]
 pub fn refusal_is_permanent(detail: &str) -> bool {
+    // ReadOnly, NotTheSaver and TooLarge (both a submit and a checkpoint snapshot), and nothing
+    // else: every other refusal of an edit is sent again.
     detail.starts_with("read-only access")
         || detail.starts_with("only the document service may checkpoint")
         || detail.contains("more than this relay will carry")
@@ -168,6 +182,13 @@ const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
 
 /// How long a checkpoint may wait for its ordering and the save acknowledgement.
 pub const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The first wait before an edit the relay refused for now is sent again. It doubles on each
+/// refusal in a row, up to [`RETRY_MOST`], and starts over once an edit is confirmed.
+const RETRY_FIRST: Duration = Duration::from_millis(250);
+
+/// The longest wait before an edit refused for now is sent again.
+const RETRY_MOST: Duration = Duration::from_secs(5);
 
 /// A checkpoint snapshot this replica sent and the relay has not acknowledged yet.
 struct PendingCheckpoint {
@@ -302,6 +323,18 @@ pub struct Live<H> {
     unconfirmed: std::collections::BTreeMap<u64, Vec<u8>>,
     /// The bytes in [`Live::unconfirmed`], bounded by [`MAX_UNCONFIRMED_BYTES`].
     unconfirmed_bytes: usize,
+    /// Submits in [`Live::unconfirmed`] the relay refused for now (a transient failure), to be
+    /// sent again at [`Live::retry_at`].
+    retrying: std::collections::BTreeSet<u64>,
+    /// When to send [`Live::retrying`] again, on [`now_ms`]. `None` with no clock: next pump.
+    retry_at: Option<f64>,
+    /// The wait before the next resend, doubling from [`RETRY_FIRST`] to [`RETRY_MOST`].
+    retry_wait: Duration,
+    /// This replica joined a room that lost its history holding nothing from before, so the
+    /// file it seeded is not the room's: it takes no edit until the room's snapshot restarts it.
+    awaiting_snapshot: bool,
+    /// [`Work::HistoryLost`] was raised for the current join.
+    told_lost: bool,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -339,6 +372,11 @@ impl<H: Hub> Live<H> {
             told_incomplete: false,
             unconfirmed: std::collections::BTreeMap::new(),
             unconfirmed_bytes: 0,
+            retrying: std::collections::BTreeSet::new(),
+            retry_at: None,
+            retry_wait: RETRY_FIRST,
+            awaiting_snapshot: false,
+            told_lost: false,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -376,7 +414,10 @@ impl<H: Hub> Live<H> {
         }
         let mut doc = match self.snapshot.take() {
             Some(snapshot) => match LiveDoc::from_state(&snapshot) {
-                Ok(doc) => doc,
+                Ok(doc) => {
+                    self.awaiting_snapshot = false;
+                    doc
+                }
                 Err(e) => {
                     self.break_replica(&format!("the room's checkpoint did not restore: {e}"));
                     return Err(e);
@@ -420,10 +461,23 @@ impl<H: Hub> Live<H> {
         self.wire.applied()
     }
 
-    /// Whether the relay has granted an id space and the document is loaded and sound.
-    /// Editing is refused until all three hold.
+    /// Whether the relay has granted an id space and the document is loaded and sound, and the
+    /// replica is not [waiting for a snapshot](Live::awaiting_snapshot). Editing is refused
+    /// until all of that holds.
     pub fn ready_to_type(&self) -> bool {
-        self.space.is_some() && self.doc.as_ref().is_some_and(|d| !d.damaged()) && !self.broken
+        self.space.is_some() && self.doc.as_ref().is_some_and(|d| !d.damaged()) && !self.broken && !self.awaiting_snapshot
+    }
+
+    /// Whether this replica waits for the room's checkpoint snapshot before it may edit.
+    ///
+    /// Set when it joined a room that lost its history ([`Work::HistoryLost`]) holding nothing
+    /// from before: the file it seeded has other item identities than the replicas still
+    /// running, so an edit from it would never land right. Cleared when the room's next
+    /// snapshot restarts it ([`Work::Reset`], or [`Live::seed`] restoring it). Meanwhile
+    /// [`edit`](Live::edit), undo, redo and [`checkpoint`](Live::checkpoint) are refused, and
+    /// the room's ordinary updates are not applied (the snapshot carries them).
+    pub fn awaiting_snapshot(&self) -> bool {
+        self.awaiting_snapshot
     }
 
     /// Whether the join's catch-up may still restart this replica onto the room's snapshot.
@@ -584,9 +638,9 @@ impl<H: Hub> Live<H> {
                 log::warn!("collab: the relay refused the connection ({code}): {detail}");
                 work.push(Work::ConnectionRefused { code: code.to_owned(), reason: detail.clone() });
             }
-            if let ServerMsg::Joined { seq, replay_until, fallback, text_cap, .. } = &msg {
+            if let ServerMsg::Joined { seq, replay_until, fallback, text_cap, history_lost, .. } = &msg {
                 self.text_cap = *text_cap;
-                self.joined(*seq, *replay_until, *fallback, &mut work);
+                self.joined(*seq, *replay_until, *fallback, *history_lost, &mut work);
                 let named = msg.doc().to_owned();
                 if named != self.wire.doc() {
                     log::info!("collab: the relay named the room {named}");
@@ -599,6 +653,7 @@ impl<H: Hub> Live<H> {
             }
         }
         self.time_out_checkpoint(&mut work);
+        self.send_retries();
         work
     }
 
@@ -606,6 +661,12 @@ impl<H: Hub> Live<H> {
     fn sound_doc(&mut self) -> Result<&mut LiveDoc> {
         if self.broken {
             return Err(Error::malformed("client", "the shared document is broken; reopen the file"));
+        }
+        if self.awaiting_snapshot {
+            return Err(Error::malformed(
+                "client",
+                "the live session lost its history; editing waits for the document service's snapshot",
+            ));
         }
         let doc = self.doc.as_mut().ok_or_else(|| Error::malformed("client", "the document was never seeded"))?;
         if doc.damaged() {
@@ -621,6 +682,7 @@ impl<H: Hub> Live<H> {
         self.snapshot = None;
         self.unconfirmed.clear();
         self.unconfirmed_bytes = 0;
+        self.retrying.clear();
         self.held.clear();
         self.notices.push("the shared document could not be restored; reopen the file".to_owned());
     }
@@ -628,7 +690,25 @@ impl<H: Hub> Live<H> {
     /// A join, first or not. Only the first one's catch-up can restart the replica; a later one
     /// re-arms it only if no catch-up was handled and nothing went live since. A checkpoint in
     /// flight is treated as lost, because the submit may not survive the reconnect.
-    fn joined(&mut self, seq: u64, replay_until: Option<u64>, fallback: bool, work: &mut Vec<Work>) {
+    ///
+    /// On a join that lost the room's history, a replica that held nothing from before waits
+    /// for a snapshot, and [`Work::HistoryLost`] is raised either way.
+    fn joined(&mut self, seq: u64, replay_until: Option<u64>, fallback: bool, history_lost: bool, work: &mut Vec<Work>) {
+        if history_lost {
+            // What it held before is only the room's if it settled on the room's history,
+            // which a replica still waiting for a snapshot never did.
+            let held_before = self.joined_once && self.settled && !self.awaiting_snapshot && self.doc.is_some();
+            if !held_before && !self.broken && !self.awaiting_snapshot {
+                log::warn!("collab: the relay lost this room's history; waiting for the room's snapshot");
+                self.awaiting_snapshot = true;
+                self.notices.push("the live session restarted; waiting for the document service before editing".to_owned());
+            }
+            if !std::mem::replace(&mut self.told_lost, true) {
+                work.push(Work::HistoryLost);
+            }
+        } else {
+            self.told_lost = false;
+        }
         if !self.joined_once || !self.settled {
             let catchup = Catchup { joined: seq, until: replay_until };
             self.catchup = catchup.replays_anything().then_some(catchup);
@@ -648,6 +728,8 @@ impl<H: Hub> Live<H> {
         if self.joined_once {
             self.resend_unconfirmed();
         }
+        self.retrying.clear();
+        self.retry_at = None;
         self.joined_once = true;
         self.lose_checkpoint(work, "the link rejoined");
     }
@@ -747,6 +829,36 @@ impl<H: Hub> Live<H> {
         }
     }
 
+    /// Send again the edits the relay refused for now, once their backoff is over and the link
+    /// is up. While it is down they wait for the rejoin, which sends every unconfirmed edit.
+    fn send_retries(&mut self) {
+        if self.retrying.is_empty() || self.broken || !self.hub.connected() {
+            return;
+        }
+        if let (Some(at), Some(now)) = (self.retry_at, now_ms())
+            && now < at
+        {
+            return;
+        }
+        self.retry_at = None;
+        let mut updates = Vec::new();
+        for local in std::mem::take(&mut self.retrying) {
+            if let Some(update) = self.unconfirmed.remove(&local) {
+                self.unconfirmed_bytes -= update.len();
+                updates.push(update);
+            }
+        }
+        log::info!("collab: sending {} edits the relay refused for now again", updates.len());
+        for chunk in self.chunked(updates) {
+            if self.broken {
+                break;
+            }
+            if let Err(e) = self.send_update(&chunk) {
+                log::warn!("collab: an edit refused for now could not be sent again: {e}");
+            }
+        }
+    }
+
     /// Merge `updates` in order into as few updates as fit the relay's cap, each measured as
     /// [`Live::over_cap`] measures a submit. An update that does not fit merged with anything
     /// goes as it was: it was sent once, so it fits alone.
@@ -810,7 +922,9 @@ impl<H: Hub> Live<H> {
             }
         }
         // While nothing is loaded, any snapshot is a starting point: the file must never be
-        // seeded once the room is known to have checkpointed past it.
+        // seeded once the room is known to have checkpointed past it. So is the first one a
+        // replica waiting after a lost history sees.
+        let restart = restart || (snap && self.awaiting_snapshot);
         if snap && !updates.is_empty() && (restart || self.doc.is_none()) {
             let snapshot = updates.remove(0);
             match self.restart_from(snapshot, &scope, work) {
@@ -818,6 +932,12 @@ impl<H: Hub> Live<H> {
                 Restart::Refused => return,
                 Restart::Ordinary(snapshot) => updates.insert(0, snapshot),
             }
+        }
+        if self.awaiting_snapshot && self.snapshot.is_none() {
+            // Ordered before the snapshot this replica waits for, which carries them. Laid
+            // over the file they would only show text the room does not have.
+            log::debug!("collab: waiting for the room's snapshot; {} updates left to it", updates.len());
+            return;
         }
         if restart {
             // Live ops that overtook the text ops landed on the replica the restart may just
@@ -869,7 +989,7 @@ impl<H: Hub> Live<H> {
             self.snapshot = Some(snapshot);
             return Restart::Done;
         }
-        if !self.from_file {
+        if !self.from_file && !self.awaiting_snapshot {
             return Restart::Ordinary(snapshot);
         }
         if self.edited {
@@ -891,6 +1011,10 @@ impl<H: Hub> Live<H> {
             Ok(doc) => {
                 self.doc = Some(doc);
                 self.from_file = false;
+                if std::mem::replace(&mut self.awaiting_snapshot, false) {
+                    log::info!("collab: restarted from the room's snapshot after its history was lost");
+                    self.settled = true;
+                }
                 work.push(Work::Reset);
                 Restart::Done
             }
@@ -917,8 +1041,9 @@ impl<H: Hub> Live<H> {
             Some(_) => false,
             None => {
                 // A live op before a marked fallback's text ops does not end the catch-up:
-                // only its last piece does.
-                if !(self.text_catchup && self.marked) {
+                // only its last piece does. Nor does one before the snapshot a replica waits
+                // for after a lost history: until that, it holds nothing of the room's.
+                if !(self.text_catchup && self.marked) && !self.awaiting_snapshot {
                     self.settled = true;
                 }
                 false
@@ -1027,7 +1152,7 @@ impl<H: Hub> Live<H> {
                 } else {
                     self.text_more = false;
                     self.text_catchup = false;
-                    self.settled = true;
+                    self.settled |= !self.awaiting_snapshot;
                     self.since_join.clear();
                 }
             }
@@ -1036,6 +1161,7 @@ impl<H: Hub> Live<H> {
             Effect::Confirmed { local, seq } => {
                 if let Some(update) = self.unconfirmed.remove(&local) {
                     self.unconfirmed_bytes -= update.len();
+                    self.retry_wait = RETRY_FIRST;
                 }
                 self.first_of_catchup(seq);
                 self.confirmed(local, seq, work);
@@ -1045,6 +1171,7 @@ impl<H: Hub> Live<H> {
                 // Edits made against what is being replaced cannot be reconciled with it.
                 self.unconfirmed.clear();
                 self.unconfirmed_bytes = 0;
+                self.retrying.clear();
                 if document.is_null() {
                     // The relay keeps no document, so this is not a recovery. Saying nothing
                     // and carrying on would leave the peer believing it is current when it has
@@ -1068,11 +1195,22 @@ impl<H: Hub> Live<H> {
                 log::info!("collab: {detail}");
                 self.notices.push(detail);
             }
-            Effect::SubmitRefused { local, detail } => {
+            Effect::SubmitRefused { local, detail, code } => {
                 // The relay refused one of this client's submits by its counter. It is the
                 // checkpoint's own only while that has not been ordered.
+                let retry = code.as_deref() == Some(RETRY) || !refusal_is_permanent(&detail);
                 if self.checkpoint.as_ref().is_some_and(|p| p.local == local && p.ordered.is_none()) {
                     self.refuse_checkpoint(work, &detail);
+                } else if self.unconfirmed.contains_key(&local) && !self.broken && retry {
+                    // Refused for now (the relay's bus did not answer, or the link was down too
+                    // long). Nothing was ordered, so it stays unconfirmed and goes again after a
+                    // backoff; only a refusal a retry cannot change breaks the replica.
+                    log::info!("collab: the relay refused an edit for now; sending it again in {:?}", self.retry_wait);
+                    self.retrying.insert(local);
+                    if self.retry_at.is_none() {
+                        self.retry_at = now_ms().map(|now| now + self.retry_wait.as_secs_f64() * 1000.0);
+                        self.retry_wait = (self.retry_wait * 2).min(RETRY_MOST);
+                    }
                 } else if self.unconfirmed.contains_key(&local) && !self.broken {
                     // An edit. It already landed in this replica and the room will never order
                     // it, so the two have parted for good.
@@ -1164,6 +1302,7 @@ mod tests {
             fallback: false,
             text_cap: None,
             heartbeat: false,
+            history_lost: false,
         });
         live.pump();
         live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
