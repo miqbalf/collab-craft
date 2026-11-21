@@ -163,6 +163,8 @@ pub enum Refusal {
     TooLargeToRetain { bytes: usize },
     /// A checkpoint snapshot from a peer that is not the service saver.
     NotTheSaver,
+    /// The join named another replica schema than the one the room is pinned to.
+    Schema { pinned: String },
 }
 
 impl Refusal {
@@ -180,6 +182,9 @@ impl Refusal {
                 format!("that checkpoint is {bytes} bytes, too large to retain for joining editors; nothing was dropped")
             }
             Refusal::NotTheSaver => "only the document service may checkpoint; editors send edits".to_owned(),
+            Refusal::Schema { pinned } => {
+                format!("this file is being edited live by another app or version ({pinned}); reopen it once that session has ended")
+            }
         }
     }
 }
@@ -379,6 +384,9 @@ pub struct Room {
     /// Bumped each time the room empties, so a timer that would drop it after the grace period
     /// can tell whether it emptied again since (see [`Room::idle_mark`]).
     idle: u64,
+    /// The replica schema the first join that named one named (`"wordcraft/1"`), kept while the
+    /// room lives. See [`Room::check_schema`].
+    schema: Option<String>,
 }
 
 /// The ephemeral kind that records a save: `{seq, etag}`.
@@ -491,6 +499,30 @@ impl Room {
         self.unnamed += 1;
         let conn = format!("#{}", self.unnamed);
         self.join_as(peer, &conn)
+    }
+
+    /// Whether a join naming replica schema `schema` may enter: one naming none always may (a
+    /// client from before the field) and pins nothing; one naming the schema the room is pinned
+    /// to may; one naming another is refused, so two apps' (or two versions') updates never mix
+    /// in one room. Pinning is [`Room::pin_schema`], once the join went through.
+    pub fn check_schema(&self, schema: Option<&str>) -> Result<(), Refusal> {
+        match (schema, &self.schema) {
+            (Some(asked), Some(pinned)) if asked != pinned => Err(Refusal::Schema { pinned: pinned.clone() }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Pin the room to `schema` if it is not pinned yet. A join naming none pins nothing.
+    pub fn pin_schema(&mut self, schema: Option<&str>) {
+        if let (Some(schema), None) = (schema, &self.schema) {
+            self.schema = Some(schema.to_owned());
+        }
+    }
+
+    /// The replica schema the room is pinned to, if any.
+    #[cfg(test)]
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
     }
 
     /// [`Room::join`] by the connection named `conn`, which [`Room::leave_as`] names again.

@@ -64,6 +64,8 @@ mod e2e_fixwave;
 #[cfg(test)]
 mod e2e_reconnect;
 #[cfg(test)]
+mod e2e_schema;
+#[cfg(test)]
 mod review_reverify2;
 
 #[cfg(test)]
@@ -154,6 +156,10 @@ const CODE_RETRY: &str = "retry";
 /// [`ErrorMsg::code`] on a refused connection: the document, or this user's share of it, is
 /// full. Reconnecting at once cannot help.
 const CODE_FULL: &str = "full";
+
+/// [`ErrorMsg::code`] on a refused connection: the join named another replica schema than the
+/// one its room is pinned to, or a malformed one. Reconnecting with the same build cannot help.
+const CODE_SCHEMA: &str = "schema";
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -254,6 +260,29 @@ struct Handshake {
     /// the relay.
     #[serde(default)]
     proto: Option<String>,
+    /// The replica schema the peer edits with (`"wordcraft/1"`, `"gridcraft/1"`). Optional: the
+    /// room is pinned to the first one a join names, and a join naming another is refused with
+    /// [`CODE_SCHEMA`]. A join naming none (a client from before the field) is not checked and
+    /// pins nothing.
+    #[serde(default)]
+    schema: Option<String>,
+}
+
+/// The longest replica schema name a handshake may carry.
+const MAX_SCHEMA_BYTES: usize = 64;
+
+/// Whether the handshake's replica schema, when it names one, is a short plain name
+/// (`app/version`: ASCII letters, digits, `.`, `-`, `_`, `/`).
+fn check_schema(handshake: &Handshake) -> Result<(), &'static str> {
+    match handshake.schema.as_deref() {
+        None => Ok(()),
+        Some(s)
+            if !s.is_empty() && s.len() <= MAX_SCHEMA_BYTES && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/')) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err("the replica schema named in the handshake is not a valid name"),
+    }
 }
 
 /// Whether the handshake names the protocol this relay speaks.
@@ -707,6 +736,12 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         let _ = socket.disconnect();
         return;
     }
+    if let Err(detail) = check_schema(&handshake) {
+        tracing::warn!("rejecting a connection: malformed replica schema");
+        let _ = socket.emit("error", &RefusedMsg { doc: String::new(), detail: detail.to_owned(), code: CODE_SCHEMA });
+        let _ = socket.disconnect();
+        return;
+    }
     let now = now_unix();
     let claims = match token::verify(&handshake.token, &relay.secret, now) {
         Ok(c) => c,
@@ -817,8 +852,10 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         let room = relay.room(&mut rooms, &room_key);
         room.observe_seq(retained_seq);
         let peer = Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit(), uid: claims.uid.clone() };
-        match room.join_as(peer, &socket.id.to_string()) {
+        let schema = handshake.schema.as_deref();
+        match room.check_schema(schema).and_then(|()| room.join_as(peer, &socket.id.to_string())) {
             Ok(()) => {
+                room.pin_schema(schema);
                 for (scope, holder) in &locks {
                     room.record_holder(scope.clone(), holder.clone());
                 }
@@ -835,8 +872,14 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
         Ok(joined) => joined,
         Err(refusal) => {
             drop(ordered);
-            tracing::warn!(room = %room_key, "refusing a peer: the document is full");
-            let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: refusal.detail(), local: None, code: Some(CODE_FULL) });
+            let code = if matches!(refusal, Refusal::Schema { .. }) {
+                tracing::warn!(room = %room_key, "refusing a peer: it edits with another replica schema than the room's");
+                CODE_SCHEMA
+            } else {
+                tracing::warn!(room = %room_key, "refusing a peer: the document is full");
+                CODE_FULL
+            };
+            let _ = socket.emit("error", &ErrorMsg { doc: room_name.clone(), detail: refusal.detail(), local: None, code: Some(code) });
             let _ = socket.disconnect();
             return;
         }

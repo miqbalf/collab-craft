@@ -1673,7 +1673,7 @@ mod relay_proto {
 
     use crate::room::{Room, Submission};
     use crate::token::{PERMISSION_READ, PERMISSION_UPDATE};
-    use crate::{Handshake, PROTO, check_proto};
+    use crate::{Handshake, PROTO, check_proto, check_schema};
 
     fn handshake(v: serde_json::Value) -> Handshake {
         serde_json::from_value(v).expect("a handshake")
@@ -1691,6 +1691,40 @@ mod relay_proto {
         ] {
             assert_eq!(check_proto(&handshake(bad.clone())), Err("version mismatch"), "{bad}");
         }
+    }
+
+    /// A handshake may leave the replica schema out; one it names must be a short plain name.
+    #[test]
+    fn a_schema_is_optional_and_must_be_a_plain_name() {
+        for good in [
+            json!({"token": "t", "proto": PROTO}),
+            json!({"token": "t", "proto": PROTO, "schema": null}),
+            json!({"token": "t", "proto": PROTO, "schema": "gridcraft/1"}),
+        ] {
+            assert!(check_schema(&handshake(good.clone())).is_ok(), "{good}");
+        }
+        let long = "x".repeat(65);
+        for bad in ["", "grid craft/1", "gridcraft/1\n", long.as_str(), "gr\u{e4}d/1"] {
+            assert!(check_schema(&handshake(json!({"token": "t", "proto": PROTO, "schema": bad}))).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The first join that names a schema pins the room; another schema is refused, the pinned
+    /// one and none are let in, and a join naming none pins nothing.
+    #[test]
+    fn a_room_is_pinned_to_the_first_schema_named() {
+        let mut r = Room::default();
+        assert!(r.check_schema(None).is_ok());
+        r.pin_schema(None);
+        assert_eq!(r.schema(), None, "a join naming no schema pinned one");
+        assert!(r.check_schema(Some("gridcraft/1")).is_ok());
+        r.pin_schema(Some("gridcraft/1"));
+        assert!(matches!(r.check_schema(Some("wordcraft/1")), Err(crate::room::Refusal::Schema { .. })));
+        assert!(r.check_schema(Some("gridcraft/2")).is_err(), "another version of the same app mixed in");
+        assert!(r.check_schema(Some("gridcraft/1")).is_ok());
+        assert!(r.check_schema(None).is_ok(), "a client from before the field was locked out");
+        r.pin_schema(Some("wordcraft/1"));
+        assert_eq!(r.schema(), Some("gridcraft/1"), "a later join moved the pin");
     }
 
     fn submit(r: &mut Room, seq: u64, command: &str, params: serde_json::Value) -> Result<(), crate::room::Refusal> {
@@ -1865,7 +1899,9 @@ mod relay_proto {
     #[test]
     fn the_refusal_codes_match_the_client() {
         let msg = |code| serde_json::to_value(crate::RefusedMsg { doc: String::new(), detail: "x".to_owned(), code }).expect("encodes");
-        for (code, client) in [("auth", craft_collab::REFUSED_AUTH), ("proto", craft_collab::REFUSED_PROTO)] {
+        for (code, client) in
+            [("auth", craft_collab::REFUSED_AUTH), ("proto", craft_collab::REFUSED_PROTO), (crate::CODE_SCHEMA, craft_collab::REFUSED_SCHEMA)]
+        {
             assert_eq!(code, client);
             let read = craft_collab::receive("error", msg(code)).expect("the client reads it");
             assert_eq!(read.refuses_connection(), Some(client));
