@@ -83,8 +83,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use craft_collab::{ClientMsg, Hub, Live, LiveError, Replica, ServerMsg, Work};
+use craft_collab::{ClientMsg, Hub, Live, LiveError, LockEvent, Replica, ServerMsg, Work};
 use serde_json::{Value, json};
+
+pub mod ordered;
 
 /// An in-memory relay for host tests; feature `test-util`, never in a release build.
 #[cfg(any(test, feature = "test-util"))]
@@ -496,6 +498,8 @@ pub struct LiveEditing<H: Hub, K: LiveKind> {
     saver_wait: Option<CatchUp>,
     /// Live, yet no document service has been in the room for [`SAVER_WAIT_MS`].
     saver_missing: bool,
+    /// What the relay said about lock scopes since the app last took it, oldest first.
+    lock_events: Vec<LockEvent>,
 }
 
 impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
@@ -532,6 +536,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             snapshot_wait: None,
             saver_wait: None,
             saver_missing: false,
+            lock_events: Vec::new(),
         })
     }
 
@@ -603,6 +608,30 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// when the document still equals it.
     pub fn newest_seq(&self) -> u64 {
         self.live.applied()
+    }
+
+    /// Ask the relay for `scope`; the answer comes back through [`take_lock_events`](Self::take_lock_events).
+    pub fn lock(&mut self, scope: &str) -> craft_collab::Result<()> {
+        self.live.lock(scope)
+    }
+
+    /// Give `scope` back. Do it only once [`local_settled`](Self::local_settled): a lock released
+    /// ahead of the holder's own edit lets the next holder run on stale state.
+    pub fn unlock(&mut self, scope: &str) -> craft_collab::Result<()> {
+        self.live.unlock(scope)
+    }
+
+    /// What the relay said about locks since the last call, oldest first. A rejoin drops what
+    /// was not taken: the relay released this peer's locks with the old link.
+    pub fn take_lock_events(&mut self) -> Vec<LockEvent> {
+        std::mem::take(&mut self.lock_events)
+    }
+
+    /// Every local edit this replica sent has been ordered by the relay (none pending, none
+    /// waiting to be sent again).
+    pub fn local_settled(&self) -> bool {
+        let s = lock(&self.seen);
+        !s.stale && s.pending.is_empty()
     }
 
     /// Whether the host may take edits now: live, connected, with an edit ticket.
@@ -728,6 +757,9 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         }
         self.joins = joins;
         self.need_join = false;
+        // The relay released this peer's locks with the old link and told nobody here: what it
+        // said before is stale.
+        self.lock_events.clear();
         match space {
             Some(space) if space > 0 => {
                 self.refused = None;
@@ -756,8 +788,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
-            // Lock events are for an app that takes locks (the structure lock, task C3).
-            Work::Lock(_) => {}
+            Work::Lock(event) => self.lock_events.push(event),
             // The relay lost the room's history. A replica that held a settled state goes on
             // (the saver checkpoints it at once, see `take_history_lost`); one that held nothing
             // waits for the snapshot (`Live::awaiting_snapshot`), see `update_status`.

@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 
-use craft_collab::{BlockChange, Hub, LiveDoc, SeedBlock};
+use craft_collab::{BlockChange, Hub, LiveDoc, LockEvent, SeedBlock, ServerMsg};
 use serde_json::{Map, Value, json};
 
+use crate::ordered::{Action, GIVE_UP_MS, Ordered, Polled};
 use crate::testing::{MemHub, MemRelay, ROOM};
 use crate::{
     Access, CONNECTING, Change, ENDED_KIND, Landed, LiveApp, LiveEditing, LiveKind, LiveStatus, LocalError, NOTICE_KIND, SAVED_KIND, SERVICE_UID,
@@ -299,4 +300,333 @@ fn a_late_catch_up_is_told_then_given_up() {
     *now.lock().unwrap() += 10_000.0;
     late.pump(&mut engine);
     assert!(matches!(late.status(), LiveStatus::Broken(_)), "{:?}", late.status());
+}
+
+const SCOPE: &str = "grid/struct";
+
+fn granted(seq: u64) -> LockEvent {
+    LockEvent::Granted { scope: SCOPE.into(), seq: Some(seq) }
+}
+
+fn denied(holder: &str) -> LockEvent {
+    LockEvent::Denied { scope: SCOPE.into(), holder: holder.into() }
+}
+
+fn released() -> LockEvent {
+    LockEvent::Released { scope: SCOPE.into() }
+}
+
+/// With a grant at seq 5 the item waits for the replica to apply up to it.
+#[test]
+fn a_free_lock_runs_after_the_grant_seq_is_applied() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    assert_eq!(q.request("insert", 0.0), Ok(vec![Action::SendLock]));
+    assert!(q.on_lock(&granted(5), 1.0).is_empty());
+    assert_eq!(q.poll(4, 2.0), Polled::Nothing);
+    assert_eq!(q.poll(5, 3.0), Polled::Run("insert"));
+    assert_eq!(q.poll(9, 4.0), Polled::Nothing, "the item ran twice");
+}
+
+/// A grant from an older relay carries no seq: nothing to wait for.
+#[test]
+fn a_grant_without_seq_runs_at_once() {
+    let mut q = Ordered::<u8>::new(SCOPE);
+    q.request(1, 0.0).unwrap();
+    q.on_lock(&LockEvent::Granted { scope: SCOPE.into(), seq: None }, 1.0);
+    assert_eq!(q.poll(0, 2.0), Polled::Run(1));
+}
+
+/// A refused request names the holder, asks again when it is released, and runs when granted.
+#[test]
+fn a_held_lock_waits_and_retries_on_release() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("delete", 0.0).unwrap();
+    assert!(q.on_lock(&denied("alice~1"), 1.0).is_empty());
+    assert_eq!(q.waiting_for(), Some("alice~1"));
+    assert_eq!(q.poll(100, 2.0), Polled::Nothing);
+    assert_eq!(q.on_lock(&released(), 3.0), vec![Action::SendLock]);
+    assert_eq!(q.waiting_for(), None);
+    assert!(q.on_lock(&granted(7), 4.0).is_empty());
+    assert_eq!(q.poll(7, 5.0), Polled::Run("delete"));
+}
+
+/// Somebody else's take of the scope updates who is waited for; another scope changes nothing.
+#[test]
+fn held_by_other_updates_the_holder_and_other_scopes_are_ignored() {
+    let mut q = Ordered::<u8>::new(SCOPE);
+    q.request(1, 0.0).unwrap();
+    q.on_lock(&denied("alice~1"), 1.0);
+    q.on_lock(&LockEvent::HeldByOther { scope: SCOPE.into(), holder: "carol~3".into() }, 2.0);
+    assert_eq!(q.waiting_for(), Some("carol~3"));
+    let other = "grid/other".to_owned();
+    assert!(q.on_lock(&LockEvent::Released { scope: other.clone() }, 3.0).is_empty());
+    assert!(q.on_lock(&LockEvent::Granted { scope: other, seq: Some(1) }, 3.0).is_empty());
+    assert_eq!(q.waiting_for(), Some("carol~3"));
+    assert_eq!(q.poll(99, 4.0), Polled::Nothing);
+}
+
+#[test]
+fn gives_up_after_ten_seconds() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 100.0).unwrap();
+    q.on_lock(&denied("alice~1"), 101.0);
+    assert_eq!(q.poll(0, 100.0 + GIVE_UP_MS), Polled::Nothing, "gave up early");
+    assert_eq!(q.poll(0, 100.0 + GIVE_UP_MS + 1.0), Polled::GaveUp { item: "insert", holder: "alice~1".into() });
+    // Free again: the next request goes out.
+    assert_eq!(q.request("again", 20_000.0), Ok(vec![Action::SendLock]));
+}
+
+/// A relay that never answers also ends the wait; a grant that comes late is given back.
+#[test]
+fn an_unanswered_request_gives_up_and_a_late_grant_is_given_back() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 0.0).unwrap();
+    assert_eq!(q.poll(0, GIVE_UP_MS + 1.0), Polled::GaveUp { item: "insert", holder: String::new() });
+    assert_eq!(q.on_lock(&granted(3), GIVE_UP_MS + 2.0), vec![Action::SendUnlock]);
+}
+
+#[test]
+fn one_pending_at_a_time() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("first", 0.0).unwrap();
+    assert_eq!(q.request("second", 1.0), Err("second"));
+    q.on_lock(&granted(0), 2.0);
+    assert_eq!(q.request("third", 3.0), Err("third"), "granted but not run");
+    assert_eq!(q.poll(0, 4.0), Polled::Run("first"));
+    assert_eq!(q.request("fourth", 5.0), Err("fourth"), "running");
+    assert_eq!(q.finish(true), vec![Action::SendUnlock]);
+    assert_eq!(q.request("fifth", 6.0), Ok(vec![Action::SendLock]));
+}
+
+#[test]
+fn unlock_waits_for_the_submit_to_be_ordered() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 0.0).unwrap();
+    q.on_lock(&granted(1), 1.0);
+    assert_eq!(q.poll(1, 2.0), Polled::Run("insert"));
+    assert!(q.finish(false).is_empty());
+    assert!(q.finish(false).is_empty());
+    assert_eq!(q.finish(true), vec![Action::SendUnlock]);
+    assert!(q.finish(true).is_empty(), "unlocked twice");
+}
+
+/// The room-wide `Released` that echoes this queue's own unlock must not disturb it.
+#[test]
+fn the_echo_of_our_own_release_changes_nothing() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    assert!(q.on_lock(&released(), 0.0).is_empty(), "idle");
+    q.request("a", 1.0).unwrap();
+    assert!(q.on_lock(&released(), 2.0).is_empty(), "request out, nothing refused yet");
+    q.on_lock(&granted(2), 3.0);
+    assert!(q.on_lock(&released(), 4.0).is_empty(), "granted");
+    assert_eq!(q.poll(2, 5.0), Polled::Run("a"));
+    assert!(q.on_lock(&released(), 6.0).is_empty(), "running");
+    assert_eq!(q.finish(true), vec![Action::SendUnlock]);
+}
+
+/// After a rejoin the relay holds nothing for us: a waiting item asks again; a run that lost
+/// its grant owes no unlock.
+#[test]
+fn a_rejoin_asks_again_or_owes_no_unlock() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    assert!(q.rejoined(0.0).is_empty(), "idle");
+    q.request("x", 0.0).unwrap();
+    q.on_lock(&granted(9), 1.0);
+    assert_eq!(q.rejoined(2.0), vec![Action::SendLock]);
+    assert_eq!(q.poll(9, 3.0), Polled::Nothing, "the dropped grant still ran the item");
+    q.on_lock(&granted(10), 4.0);
+    assert_eq!(q.poll(10, 5.0), Polled::Run("x"));
+    assert!(q.rejoined(6.0).is_empty());
+    assert!(q.finish(true).is_empty(), "unlocked a lock the relay had already released");
+    assert_eq!(q.request("y", 7.0), Ok(vec![Action::SendLock]));
+    // A refused request asks again too, with a fresh wait.
+    q.on_lock(&denied("a~1"), 8.0);
+    assert_eq!(q.rejoined(9_000.0), vec![Action::SendLock]);
+    assert_eq!(q.waiting_for(), None);
+    assert_eq!(q.poll(0, 9_000.0 + GIVE_UP_MS), Polled::Nothing);
+}
+
+fn lock_both(a: &mut Window, b: &mut Window) {
+    a.le.lock(SCOPE).unwrap();
+    settle(&mut [a, b]);
+}
+
+fn peer_of(relay: &MemRelay, w: &Window) -> String {
+    relay.peer_id(w.le.hub())
+}
+
+#[test]
+fn mem_relay_serialises_two_holders() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let a_peer = peer_of(&relay, &a);
+    lock_both(&mut a, &mut b);
+    assert_eq!(a.le.take_lock_events(), vec![granted(relay.seq())]);
+    assert!(b.le.take_lock_events().contains(&LockEvent::HeldByOther { scope: SCOPE.into(), holder: a_peer.clone() }));
+    // B asks while A holds: refused with A's peer id.
+    b.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.le.take_lock_events(), vec![denied(&a_peer)]);
+    assert!(a.le.take_lock_events().is_empty(), "A heard B's refusal");
+    // A edits under the lock and unlocks once the relay ordered the edit.
+    a.set(1, "uno");
+    let edit_seq = relay.seq();
+    assert!(!a.le.local_settled());
+    for _ in 0..4 {
+        if a.le.local_settled() {
+            break;
+        }
+        a.pump();
+    }
+    assert!(a.le.local_settled());
+    a.le.unlock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    // Everyone is told, A too; B asks again and is granted at or after A's edit.
+    assert_eq!(b.le.take_lock_events(), vec![released()]);
+    assert_eq!(a.le.take_lock_events(), vec![released()]);
+    b.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    let events = b.le.take_lock_events();
+    let Some(LockEvent::Granted { seq: Some(seq), .. }) = events.first().cloned() else { panic!("{events:?}") };
+    assert!(seq >= edit_seq, "granted at {seq} before the edit's {edit_seq}");
+    assert!(b.le.newest_seq() >= seq && b.line(1) == "uno", "B saw the edit by the time it held the lock");
+}
+
+/// The lock a peer holds goes with its link, so nobody waits on a dead holder.
+#[test]
+fn a_dropped_link_releases_its_lock() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    lock_both(&mut a, &mut b);
+    b.le.take_lock_events();
+    relay.drop_link(a.le.hub());
+    settle(&mut [&mut b]);
+    assert_eq!(b.le.take_lock_events(), vec![released()]);
+    b.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut b]);
+    assert!(matches!(b.le.take_lock_events().first(), Some(LockEvent::Granted { .. })));
+}
+
+#[test]
+fn local_settled_is_false_until_the_relay_orders_the_edit() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    assert!(a.le.local_settled(), "nothing sent yet");
+    a.set(1, "uno");
+    assert!(!a.le.local_settled(), "sent, not yet ordered back to the sender");
+    assert!(!a.le.local_settled(), "asking twice changed it");
+    a.pump();
+    assert!(a.le.local_settled(), "the relay's order reached the sender");
+    // A second burst unsettles it again, and every edit must come back.
+    a.set(2, "dos");
+    a.set(1, "eins");
+    assert!(!a.le.local_settled());
+    a.pump();
+    assert!(a.le.local_settled());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), ("eins", "dos"));
+}
+
+/// A link that drops with an edit in flight is not settled until the rejoin's resend is ordered
+/// (the edit may be lost or resent, never counted as ordered).
+#[test]
+fn local_settled_stays_false_across_a_rejoin_until_the_resend_is_ordered() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.set(1, "uno");
+    relay.drop_link(a.le.hub());
+    assert!(!a.le.local_settled(), "dropped with the edit unconfirmed");
+    relay.restore_link(a.le.hub());
+    let mut seen_unsettled_after_join = false;
+    for _ in 0..8 {
+        a.pump();
+        b.pump();
+        if !a.le.local_settled() {
+            seen_unsettled_after_join = true;
+        }
+    }
+    assert!(a.le.local_settled(), "the resend was never ordered");
+    assert!(seen_unsettled_after_join || b.line(1) == "uno");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(a.line(1), b.line(1));
+}
+
+/// The settled guard does not trust the order of messages between the relay's grant and the
+/// ops: an unlock is held back by a still-unordered edit even when the grant came first.
+#[test]
+fn a_grant_ahead_of_our_own_op_does_not_let_the_unlock_go() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 1.0);
+    }
+    let Polled::Run(_) = q.poll(a.le.newest_seq(), 2.0) else { panic!("not granted") };
+    a.set(1, "uno");
+    // The relay's order for the edit sits unread in A's inbox: not settled, no unlock.
+    assert!(q.finish(a.le.local_settled()).is_empty());
+    a.pump();
+    assert_eq!(q.finish(a.le.local_settled()), vec![Action::SendUnlock]);
+}
+
+/// Another peer's `PresenceLock` is `HeldByOther`; this peer's own never is.
+#[test]
+fn own_presence_lock_is_never_held_by_other() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let me = peer_of(&relay, &a);
+    let them = peer_of(&relay, &b);
+    let presence = |holder: &str| ServerMsg::PresenceLock { doc: ROOM.into(), scope: SCOPE.into(), holder: holder.into() };
+    relay.inject(a.le.hub(), presence(&me));
+    a.pump();
+    assert!(a.le.take_lock_events().is_empty(), "this peer waited on itself");
+    relay.inject(a.le.hub(), presence(&them));
+    a.pump();
+    assert_eq!(a.le.take_lock_events(), vec![LockEvent::HeldByOther { scope: SCOPE.into(), holder: them }]);
+}
+
+/// Lock events not yet taken belong to the link that said them: a rejoin drops them.
+#[test]
+fn a_rejoin_drops_untaken_lock_events() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert!(a.le.take_lock_events().is_empty(), "a stale grant survived the rejoin");
+    // The relay released it with the old link: B can take it now.
+    b.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert!(matches!(b.le.take_lock_events().last(), Some(LockEvent::Granted { .. })));
+}
+
+/// A lock events buffer is emptied by taking it.
+#[test]
+fn taking_lock_events_empties_them() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    a.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a]);
+    assert_eq!(a.le.take_lock_events().len(), 1);
+    assert!(a.le.take_lock_events().is_empty());
 }
