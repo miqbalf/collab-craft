@@ -26,6 +26,8 @@ struct Conn {
     inbox: VecDeque<ServerMsg>,
     /// The tickets the host handed this connection with [`Hub::set_token`], oldest first.
     tokens: Vec<String>,
+    /// Sends from this connection fail, as a link that broke under the sender.
+    send_fails: bool,
 }
 
 #[derive(Default)]
@@ -37,6 +39,8 @@ struct Relay {
     ephemeral: Vec<(String, String, Value)>,
     /// The holder (connection index) of each locked scope.
     locks: Vec<(String, usize)>,
+    /// How many of the next submits the relay refuses for now (the retry code).
+    refuse_submits: usize,
 }
 
 /// The relay, shared by its hubs.
@@ -67,6 +71,7 @@ impl MemRelay {
             connected: true,
             inbox: VecDeque::new(),
             tokens: Vec::new(),
+            send_fails: false,
         });
         r.join(at);
         MemHub { relay: self.clone(), at }
@@ -82,6 +87,19 @@ impl MemRelay {
         r.release_locks_of(hub.at);
         let presence = ServerMsg::Presence { doc: ROOM.into(), roster: r.roster() };
         r.broadcast(&presence, None);
+    }
+
+    /// The next `count` submits are refused for now (the relay's bus did not answer): the client
+    /// sends them again later.
+    pub fn refuse_next_submits(&self, count: usize) {
+        self.0.borrow_mut().refuse_submits = count;
+    }
+
+    /// While `fail`, every send from `hub` returns an error and reaches nobody.
+    pub fn fail_sends(&self, hub: &MemHub, fail: bool) {
+        if let Some(c) = self.0.borrow_mut().conns.get_mut(hub.at) {
+            c.send_fails = fail;
+        }
     }
 
     /// `hub`'s relay peer id.
@@ -150,6 +168,9 @@ impl MemRelay {
 
 impl Hub for MemHub {
     fn send(&mut self, msg: ClientMsg) -> craft_collab::Result<()> {
+        if self.relay.0.borrow().conns.get(self.at).is_some_and(|c| c.send_fails) {
+            return Err(craft_collab::Error::Refused("the link failed".into()));
+        }
         self.relay.0.borrow_mut().handle(self.at, msg);
         Ok(())
     }
@@ -250,6 +271,16 @@ impl Relay {
                         detail: "read-only access to this file".into(),
                         local: Some(local),
                         code: None,
+                    });
+                    return;
+                }
+                if self.refuse_submits > 0 {
+                    self.refuse_submits -= 1;
+                    conn.inbox.push_back(ServerMsg::Error {
+                        doc: ROOM.into(),
+                        detail: "the relay's bus did not answer".into(),
+                        local: Some(local),
+                        code: Some(craft_collab::RETRY.into()),
                     });
                     return;
                 }

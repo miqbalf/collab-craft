@@ -533,10 +533,10 @@ fn local_settled_is_false_until_the_relay_orders_the_edit() {
     assert_eq!((b.line(1), b.line(2)), ("eins", "dos"));
 }
 
-/// A link that drops with an edit in flight is not settled until the rejoin's resend is ordered
-/// (the edit may be lost or resent, never counted as ordered).
+/// A link that drops with an edit in flight is not settled until the rejoin's resend is
+/// ordered, and the edit still reaches the room.
 #[test]
-fn local_settled_stays_false_across_a_rejoin_until_the_resend_is_ordered() {
+fn local_settled_is_false_across_a_rejoin_until_the_resend_is_ordered() {
     let relay = MemRelay::new();
     let mut a = Window::join(&relay, "alice", Access::Edit);
     let mut b = Window::join(&relay, "bob", Access::Edit);
@@ -545,24 +545,123 @@ fn local_settled_stays_false_across_a_rejoin_until_the_resend_is_ordered() {
     relay.drop_link(a.le.hub());
     assert!(!a.le.local_settled(), "dropped with the edit unconfirmed");
     relay.restore_link(a.le.hub());
-    let mut seen_unsettled_after_join = false;
-    for _ in 0..8 {
-        a.pump();
-        b.pump();
-        if !a.le.local_settled() {
-            seen_unsettled_after_join = true;
-        }
-    }
-    assert!(a.le.local_settled(), "the resend was never ordered");
-    assert!(seen_unsettled_after_join || b.line(1) == "uno");
+    assert!(!a.le.local_settled(), "the join has not been read yet");
     settle(&mut [&mut a, &mut b]);
-    assert_eq!(a.line(1), b.line(1));
+    assert!(a.le.local_settled());
+    assert_eq!((a.line(1), b.line(1)), ("uno", "uno"));
 }
 
-/// The settled guard does not trust the order of messages between the relay's grant and the
-/// ops: an unlock is held back by a still-unordered edit even when the grant came first.
+/// The rejoin's resend never left (the link failed again): the edit is not ordered, so the
+/// replica is not settled, even though nothing is waiting for an answer any more.
 #[test]
-fn a_grant_ahead_of_our_own_op_does_not_let_the_unlock_go() {
+fn local_settled_is_false_while_the_rejoin_resend_has_not_gone_out() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.set(1, "uno");
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    relay.fail_sends(a.le.hub(), true);
+    a.pump();
+    assert!(!a.le.local_settled(), "an edit that never reached the relay counted as ordered");
+    relay.fail_sends(a.le.hub(), false);
+}
+
+/// A submit the relay refuses for now is sent again under a new counter: the first counter must
+/// not keep the replica unsettled for good (the structure lock would never be released).
+#[test]
+fn a_submit_refused_for_now_settles_once_its_resend_is_ordered() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    relay.refuse_next_submits(1);
+    a.set(1, "uno");
+    a.pump();
+    assert!(!a.le.local_settled(), "refused, so not ordered");
+    let mut settled = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        settle(&mut [&mut a, &mut b]);
+        if a.le.local_settled() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the refused counter kept the replica unsettled");
+    assert_eq!(b.line(1), "uno", "the resend was ordered");
+}
+
+/// The relay's order for the run's edit has been read but the edit is still in the engine's
+/// queue (not flushed): not settled, whatever the order the app calls things in.
+#[test]
+fn an_unflushed_edit_is_not_settled() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    let before = a.engine.doc.clone();
+    a.engine.doc[0].1 = "uno".to_owned();
+    a.le.queue().push((before, a.engine.doc.clone()));
+    assert!(!a.le.local_settled(), "queued, not sent");
+    a.le.flush(&mut a.engine);
+    assert!(!a.le.local_settled(), "sent, not ordered");
+    a.pump();
+    assert!(a.le.local_settled());
+}
+
+/// A grant from the old link never survives a rejoin, whichever side of the join it is on in
+/// the same poll; one from the new link does.
+#[test]
+fn a_grant_before_the_join_in_one_poll_is_dropped() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    // Old link's grant, then the rejoin, all unread: one poll gets both.
+    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(1) });
+    relay.restore_link(a.le.hub());
+    a.pump();
+    assert!(a.le.take_lock_events().is_empty(), "a stale grant survived the rejoin");
+    // The new link's grant comes after its join and is kept, in order with what follows.
+    relay.restore_link(a.le.hub());
+    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(2) });
+    relay.inject(a.le.hub(), ServerMsg::LockReleased { doc: ROOM.into(), scope: SCOPE.into() });
+    a.pump();
+    assert_eq!(a.le.take_lock_events(), vec![granted(2), released()]);
+}
+
+/// The relay's `lock_released` can overtake its `lock_denied`: the request is asked again.
+#[test]
+fn a_release_heard_before_the_denial_asks_again() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    assert!(q.on_lock(&released(), 1.0).is_empty());
+    assert_eq!(q.on_lock(&denied("a~1"), 2.0), vec![Action::SendLock], "the holder had already let go");
+    assert_eq!(q.waiting_for(), None);
+    assert!(q.on_lock(&denied("a~1"), 3.0).is_empty(), "a second denial is a real one");
+    assert_eq!(q.waiting_for(), Some("a~1"));
+}
+
+/// A rejoin during a run tells the app once, so it can treat the edit as unprotected.
+#[test]
+fn a_rejoin_during_a_run_is_reported_once() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    q.on_lock(&granted(1), 1.0);
+    assert_eq!(q.poll(1, 2.0), Polled::Run("x"));
+    assert_eq!(q.poll(1, 3.0), Polled::Nothing);
+    assert!(q.rejoined(4.0).is_empty());
+    assert_eq!(q.poll(1, 5.0), Polled::LockLost { scope: SCOPE.into() });
+    assert_eq!(q.poll(1, 6.0), Polled::Nothing, "told twice");
+    assert!(q.finish(true).is_empty(), "no lock to give back");
+}
+
+/// Over a real `LiveEditing`: the unlock stays held back while the relay's order for the run's
+/// own edit sits unread, whatever else has been heard since the grant.
+#[test]
+fn unlock_is_held_back_until_the_own_op_is_ordered() {
     let relay = MemRelay::new();
     let mut a = Window::join(&relay, "alice", Access::Edit);
     let mut b = Window::join(&relay, "bob", Access::Edit);
