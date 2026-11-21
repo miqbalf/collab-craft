@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::hub::Hub;
-use crate::proto::{CRDT_TEXT, ClientMsg, RETRY, ServerMsg};
+use crate::proto::{CRDT_TEXT, ClientMsg, PeerId, RETRY, Scope, ServerMsg};
 use crate::replica::Replica;
 use crate::session::{Effect, Session};
 use crate::ydoc::{BlockChange, LiveDoc, LiveError};
@@ -90,11 +90,27 @@ pub fn update_from_wire(op: &str) -> std::result::Result<Vec<u8>, LiveError> {
 
 /// Work the app must do after one [`Live::pump`].
 ///
+/// What the relay said about a lock scope, in the order it said it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockEvent {
+    /// This client holds `scope`. `seq` is the room's sequence at the grant, when the relay says;
+    /// an edit under the lock is safe once the replica has applied up to it.
+    Granted { scope: Scope, seq: Option<u64> },
+    /// The request was refused; `holder` has the scope.
+    Denied { scope: Scope, holder: PeerId },
+    /// A scope this client held, or was refused, is free or no longer held.
+    Released { scope: Scope },
+    /// Somebody else took `scope`.
+    HeldByOther { scope: Scope, holder: PeerId },
+}
+
 /// Document updates are already merged here. [`Work::Doc`] says what changed, in the replica
 /// schema's own terms (`C`, [`BlockChange`] for [`LiveDoc`]), to re-read through [`Live::doc`].
 /// Other commands still go through the app's `apply_remote`.
 #[derive(Debug)]
 pub enum Work<C = BlockChange> {
+    /// The relay answered a lock request, released one, or announced somebody else's.
+    Lock(LockEvent),
     /// A lock-scoped command that is not a document update.
     Command { command: String, params: Value },
     /// Remote updates landed. Re-read what they changed.
@@ -608,6 +624,19 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// Send a lock-scoped command. Document edits go through [`edit`](Live::edit).
     pub fn submit(&mut self, command: impl Into<String>, params: Value, scope: Option<String>) -> Result<()> {
         let msg = self.wire.submit(command, params, scope);
+        self.hub.send(msg)
+    }
+
+    /// Ask the relay for `scope`. The answer arrives from [`pump`](Live::pump) as
+    /// [`Work::Lock`].
+    pub fn lock(&mut self, scope: &str) -> Result<()> {
+        let msg = self.wire.request_lock(scope);
+        self.hub.send(msg)
+    }
+
+    /// Give `scope` back. Nothing waits on it: a release cannot be refused.
+    pub fn unlock(&mut self, scope: &str) -> Result<()> {
+        let msg = self.wire.release_lock(scope);
         self.hub.send(msg)
     }
 
@@ -1191,10 +1220,11 @@ impl<H: Hub, R: Replica> Live<H, R> {
                     self.notices.push("the other editors sent a document this window cannot install; reopen the file".to_owned());
                 }
             }
-            Effect::LockHeld { .. } | Effect::LockDropped { .. } | Effect::RemoteLocks { .. } => {}
-            Effect::LockRefused { scope, holder } => {
-                self.notices.push(format!("{holder} is editing {scope}"));
-            }
+            Effect::LockHeld { scope, seq } => work.push(Work::Lock(LockEvent::Granted { scope, seq })),
+            Effect::LockDropped { scope } => work.push(Work::Lock(LockEvent::Released { scope })),
+            Effect::RemoteLocks { .. } => {}
+            Effect::LockBusy { scope, holder } => work.push(Work::Lock(LockEvent::HeldByOther { scope, holder })),
+            Effect::LockRefused { scope, holder } => work.push(Work::Lock(LockEvent::Denied { scope, holder })),
             Effect::Roster { roster } => {
                 let me = self.wire.me().cloned();
                 self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).map(|p| (p.peer.to_string(), p.display)).collect();
@@ -1288,6 +1318,83 @@ mod tests {
         fn connected(&self) -> bool {
             true
         }
+    }
+
+    fn joined_msg() -> ServerMsg {
+        ServerMsg::Joined {
+            doc: "d".to_owned(),
+            peer: "me".to_owned(),
+            seq: 0,
+            space: 1,
+            roster: Vec::new(),
+            locks: Vec::new(),
+            replay_until: None,
+            fallback: false,
+            text_cap: None,
+            heartbeat: false,
+            history_lost: false,
+        }
+    }
+
+    #[test]
+    fn lock_events_reach_the_app_in_order() {
+        let hub = Hub0::default();
+        let mut live = Live::new(hub.clone(), "d");
+        hub.0.borrow_mut().1.push(joined_msg());
+        live.pump();
+        let d = || "d".to_owned();
+        let b2 = || "B2".to_owned();
+        hub.0.borrow_mut().1.extend([
+            ServerMsg::LockGranted { doc: d(), scope: b2(), seq: Some(7) },
+            ServerMsg::LockDenied { doc: d(), scope: "C3".to_owned(), holder: "bob".to_owned() },
+            ServerMsg::LockReleased { doc: d(), scope: b2() },
+            ServerMsg::PresenceLock { doc: d(), scope: "D4".to_owned(), holder: "carol".to_owned() },
+        ]);
+        let events: Vec<LockEvent> = live
+            .pump()
+            .into_iter()
+            .filter_map(|w| match w {
+                Work::Lock(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                LockEvent::Granted { scope: b2(), seq: Some(7) },
+                LockEvent::Denied { scope: "C3".to_owned(), holder: "bob".to_owned() },
+                LockEvent::Released { scope: b2() },
+                LockEvent::HeldByOther { scope: "D4".to_owned(), holder: "carol".to_owned() },
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_and_unlock_send_the_scope() {
+        let hub = Hub0::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.lock("grid/struct").unwrap();
+        live.unlock("grid/struct").unwrap();
+        let sent = hub.0.borrow().0.clone();
+        assert_eq!(
+            sent,
+            vec![
+                ClientMsg::Lock { doc: "d".to_owned(), scope: "grid/struct".to_owned() },
+                ClientMsg::Unlock { doc: "d".to_owned(), scope: "grid/struct".to_owned() },
+            ]
+        );
+    }
+
+    #[test]
+    fn denied_lock_adds_no_notice() {
+        let hub = Hub0::default();
+        let mut live = Live::new(hub.clone(), "d");
+        hub.0.borrow_mut().1.push(joined_msg());
+        live.pump();
+        let before = live.notices.clone();
+        hub.0.borrow_mut().1.push(ServerMsg::LockDenied { doc: "d".to_owned(), scope: "B2".to_owned(), holder: "bob".to_owned() });
+        live.pump();
+        assert_eq!(live.notices, before);
     }
 
     fn block() -> SeedBlock {

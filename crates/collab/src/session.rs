@@ -36,14 +36,17 @@ pub enum Effect {
     Confirmed { local: u64, seq: u64 },
     /// Replace the whole document, then continue from `seq`.
     Replace { document: Value, seq: u64 },
-    /// A lock request succeeded. The app may now edit that scope.
-    LockHeld { scope: Scope },
+    /// A lock request succeeded. The app may now edit that scope. `seq` is the room's sequence
+    /// when it was granted, when the relay says.
+    LockHeld { scope: Scope, seq: Option<u64> },
     /// A lock request failed. `holder` is who has it.
     LockRefused { scope: Scope, holder: PeerId },
     /// A scope this client held is no longer held.
     LockDropped { scope: Scope },
     /// Somebody else's lock changed. Useful for showing a region as busy.
     RemoteLocks { locks: Vec<LockState> },
+    /// Somebody else just took `scope`. Raised with the [`Effect::RemoteLocks`] it belongs to.
+    LockBusy { scope: Scope, holder: PeerId },
     /// The roster changed.
     Roster { roster: Vec<Presence> },
     /// Tell the user something was refused.
@@ -280,10 +283,10 @@ impl Session {
                 vec![Effect::Replace { document, seq }]
             }
 
-            ServerMsg::LockGranted { scope, .. } => {
+            ServerMsg::LockGranted { scope, seq, .. } => {
                 self.remote_locks.remove(&scope);
                 self.held.insert(scope.clone());
-                vec![Effect::LockHeld { scope }]
+                vec![Effect::LockHeld { scope, seq }]
             }
 
             ServerMsg::LockDenied { scope, holder, .. } => {
@@ -306,9 +309,9 @@ impl Session {
                     return Vec::new();
                 }
                 self.held.remove(&scope);
-                self.remote_locks.insert(scope, holder);
+                self.remote_locks.insert(scope.clone(), holder.clone());
                 let locks = self.remote_locks.iter().map(|(scope, holder)| LockState { scope: scope.clone(), holder: holder.clone() }).collect();
-                vec![Effect::RemoteLocks { locks }]
+                vec![Effect::RemoteLocks { locks }, Effect::LockBusy { scope, holder }]
             }
 
             ServerMsg::Presence { roster, .. } => {

@@ -83,10 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Effect::Apply { command, params, seq } => println!("APPLY   {seq} {command} {params}"),
                     Effect::Confirmed { local, seq } => println!("OK      local {local} ordered at seq {seq}"),
                     Effect::Replace { seq, .. } => println!("REPLACE from seq {seq}"),
-                    Effect::LockHeld { scope } => println!("LOCK    held {scope}"),
+                    Effect::LockHeld { scope, .. } => println!("LOCK    held {scope}"),
                     Effect::LockRefused { scope, holder } => println!("LOCK    {scope} refused, {holder} has it"),
                     Effect::LockDropped { scope } => println!("LOCK    dropped {scope}"),
                     Effect::RemoteLocks { locks } => println!("LOCKS   {locks:?}"),
+                    Effect::LockBusy { scope, holder } => println!("LOCK    {scope} taken by {holder}"),
                     Effect::Roster { roster } => {
                         println!("ROSTER  {:?}", roster.iter().map(|p| &p.display).collect::<Vec<_>>())
                     }
