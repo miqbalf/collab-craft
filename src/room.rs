@@ -645,6 +645,13 @@ impl Room {
         Some(Left { dropped: self.release(peer_id), gone: true })
     }
 
+    /// Whether `conn` is still one of this peer's connections in the room: false once it left
+    /// or was replaced. A lock is recorded only for a connection that passes this, so a peer
+    /// that is gone is never left as a holder.
+    pub fn has_conn(&self, peer_id: &str, conn: &str) -> bool {
+        self.conns.get(peer_id).is_some_and(|conns| conns.contains(conn))
+    }
+
     /// Remove a peer and everything it held. Returns the scopes it held.
     fn release(&mut self, peer_id: &str) -> Vec<String> {
         self.peers.retain(|p| p.peer != peer_id);

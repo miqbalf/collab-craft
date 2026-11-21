@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::e2e_reconnect::{Harness, now, seq_of, start, ticket, unique_room};
-use crate::test_text::{Replica, SCOPE};
+use crate::room::Submission;
+use crate::test_text::Replica;
 
 const STRUCT: &str = "grid/struct";
 
@@ -100,11 +101,12 @@ async fn lock_grant_carries_the_room_seq() {
     let seq = seq_in(&granted);
     assert!(seq >= last, "grant seq {seq} is before the last op {last}");
     assert_eq!(seq, seq_of(&h, &room).await, "grant seq is not the room's seq");
-    let _ = SCOPE;
 }
 
 /// A locks, submits and unlocks at once; B, once the lock is released, is granted a seq that
-/// includes A's op.
+/// includes A's op. This covers the case where the relay handles A's submit before B's grant.
+/// A submit still on its way to the room when the unlock lands is C3's job: the holder unlocks
+/// only after its own submit is ordered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn submit_then_unlock_orders_the_submit_first() {
@@ -116,25 +118,92 @@ async fn submit_then_unlock_orders_the_submit_first() {
     a.submit(1, text.insert(0, "x")).await;
     a.send("unlock", json!({ "scope": STRUCT })).await;
 
-    // B asks until it is granted; a denial means A still holds it.
-    let granted = loop {
-        b.send("lock", json!({ "scope": STRUCT })).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        let mut got = None;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(100), b.heard.recv()).await {
-                Ok(Some((name, body))) if name == "lock_granted" => {
-                    got = Some(body);
-                    break;
-                }
-                Ok(Some(_)) | Err(_) => {}
-                Ok(None) => panic!("socket gone"),
-            }
-        }
-        if let Some(body) = got {
-            break body;
-        }
-    };
+    // B waits for the release, then locks once: the relay's own order, within ten seconds.
+    b.next("lock_released").await;
+    b.send("lock", json!({ "scope": STRUCT })).await;
+    let granted = b.next("lock_granted").await;
     let op = seq_in(&a.next("op").await);
     assert!(seq_in(&granted) >= op, "grant seq {} is before A's op {op}", seq_in(&granted));
+}
+
+/// Whoever holds the lease for `STRUCT` on the bus.
+async fn lease(h: &Harness, room: &str) -> Option<String> {
+    h.relay.bus.lock().await.current_holder(room, STRUCT).await.expect("the bus answers")
+}
+
+/// Poll `done` every 20 ms until it holds or `d` passes. Whether it held.
+async fn within(d: Duration, mut done: impl AsyncFnMut() -> bool) -> bool {
+    let end = tokio::time::Instant::now() + d;
+    loop {
+        if done().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A requester that disconnects while its grant waits on the room's gate is never recorded as
+/// the holder, and its lease on the bus is given back. The test holds the gate itself, so the
+/// request is parked after it took the lease and before it recorded anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_requester_that_left_while_waiting_holds_nothing() {
+    let Some(h) = start().await else { return };
+    let (room, a, _b) = pair(&h, "lock-left").await;
+    let gate = h.relay.gate(&room);
+    let parked = gate.lock().await;
+
+    a.send("lock", json!({ "scope": STRUCT })).await;
+    assert!(within(Duration::from_secs(10), async || lease(&h, &room).await.as_deref() == Some("alice")).await, "the lease was never taken");
+    a.client.disconnect().await.expect("disconnects");
+    let gone =
+        within(Duration::from_secs(10), async || h.relay.rooms.lock().await.get(&room).is_some_and(|r| !r.peers().iter().any(|p| p.peer == "alice")))
+            .await;
+    assert!(gone, "alice never left the room");
+    drop(parked);
+
+    assert!(within(Duration::from_secs(5), async || lease(&h, &room).await.is_none()).await, "a departed peer still holds the lease");
+    assert_eq!(h.relay.rooms.lock().await.get(&room).and_then(|r| r.holder_of(STRUCT)), None, "a departed peer is the recorded holder");
+}
+
+/// A grant is not given while an op is between its number and the room's record: the test is
+/// that op (it holds the gate), and the grant must wait for it and then count it. Without the
+/// gate the grant arrives at once, with the seq from before the op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_grant_waits_for_an_op_that_is_being_ordered() {
+    let Some(h) = start().await else { return };
+    let (room, _a, mut b) = pair(&h, "lock-gate").await;
+    let before = seq_of(&h, &room).await;
+    let gate = h.relay.gate(&room);
+    let ordering = gate.lock().await;
+
+    b.send("lock", json!({ "scope": STRUCT })).await;
+    assert!(within(Duration::from_secs(10), async || lease(&h, &room).await.as_deref() == Some("bob")).await, "the lease was never taken");
+    // Numbered under the gate, as `on_submit` does; recorded below, still under it.
+    let seq = {
+        let floor = seq_of(&h, &room).await;
+        h.relay.bus.lock().await.next_seq(&room, floor).await.expect("a seq")
+    };
+    let early = tokio::time::timeout(Duration::from_millis(400), b.next("lock_granted")).await;
+    assert!(early.is_err(), "the grant did not wait for the op being ordered: {early:?}");
+    {
+        let mut rooms = h.relay.rooms.lock().await;
+        let submission = Submission {
+            peer_id: "alice".to_owned(),
+            may_edit: true,
+            command: craft_collab::CRDT_TEXT.to_owned(),
+            params: Replica::seeded(1, "hello").insert(0, "x"),
+            scope: None,
+            local: Some(1),
+        };
+        h.relay.room(&mut rooms, &room).submit(seq, submission).expect("the op is recorded");
+    }
+    drop(ordering);
+
+    let granted = seq_in(&b.next("lock_granted").await);
+    assert!(granted >= seq && seq > before, "grant seq {granted} does not count the op {seq}");
 }

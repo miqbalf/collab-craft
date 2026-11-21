@@ -1245,14 +1245,29 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
             // The room's sequence at the moment of the grant, read in the same rooms lock that
             // records the holder. The ordering gate is held across the read, so an op that was
             // numbered before this grant is recorded, and counted, before the seq is read: the
-            // holder knows how far to apply before it edits on what the lock protects.
+            // holder knows how far to apply before it edits on what the lock protects. The wait
+            // can be as long as one op's number plus one join's replay, since both hold the gate.
+            //
+            // The requester may have left while it waited. The holder is recorded only if its
+            // connection is still in the room, checked under the rooms lock that `on_disconnect`
+            // also takes, so a disconnect either finds the record and releases it, or happens
+            // first and is seen here. Otherwise the lease taken above is given back now.
             let seq = {
                 let gate = relay.gate(&claims.rm);
                 let _ordered = gate.lock().await;
                 let mut rooms = relay.rooms.lock().await;
-                let room = relay.room(&mut rooms, &claims.rm);
-                room.record_lock(&claims.pid, msg.scope.clone());
-                room.seq()
+                match rooms.get_mut(&claims.rm).filter(|room| room.has_conn(&claims.pid, &socket.id.to_string())) {
+                    Some(room) => {
+                        room.record_lock(&claims.pid, msg.scope.clone());
+                        Some(room.seq())
+                    }
+                    None => None,
+                }
+            };
+            let Some(seq) = seq else {
+                let mut bus = relay.bus.lock().await;
+                let _ = bus.release(&claims.rm, &msg.scope, &claims.pid).await;
+                return;
             };
             let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq }));
             emit_live(
