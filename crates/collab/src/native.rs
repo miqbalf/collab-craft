@@ -48,6 +48,9 @@ struct Shared {
     /// The token the next (re)connect joins with, and how many times it has been replaced.
     /// [`Hub::set_token`] replaces it.
     token: Mutex<(String, u64)>,
+    /// The replica schema every (re)connect names, if the app named one
+    /// ([`NativeHub::connect_as`]).
+    schema: Option<String>,
 }
 
 impl Shared {
@@ -60,7 +63,9 @@ impl Shared {
     /// the relay can replay from.
     fn rejoin(&self) -> (serde_json::Value, u64) {
         let (token, generation) = self.token();
-        (serde_json::json!({ "token": token, "proto": crate::proto::PROTO }), generation)
+        let mut auth = serde_json::json!({ "token": token, "proto": crate::proto::PROTO });
+        add_schema(&mut auth, self.schema.as_deref());
+        (auth, generation)
     }
 
     fn current(&self, generation: u64) -> bool {
@@ -117,13 +122,26 @@ impl NativeHub {
     /// The connection is WebSocket only, with no long-polling fallback, so every proxy between
     /// the app and the relay must pass the WebSocket upgrade on the Socket.IO path.
     pub async fn connect(url: &str, token: &str, applied: Option<u64>) -> Result<NativeHub> {
+        NativeHub::connect_as(url, token, applied, None).await
+    }
+
+    /// [`NativeHub::connect`] naming the replica schema the app edits with (`"gridcraft/1"`) in
+    /// every handshake, so the relay pins the room to it and refuses a join naming another
+    /// ([`crate::REFUSED_SCHEMA`]). `None` names none, as [`NativeHub::connect`] does.
+    pub async fn connect_as(url: &str, token: &str, applied: Option<u64>, schema: Option<&str>) -> Result<NativeHub> {
         let (in_tx, inbox) = unbounded_channel::<ServerMsg>();
         let (outbox, out_rx) = unbounded_channel::<ClientMsg>();
         let (control, control_rx) = unbounded_channel::<Control>();
-        let shared = Arc::new(Shared { connected: AtomicBool::new(false), generation: AtomicU64::new(0), token: Mutex::new((token.to_owned(), 0)) });
+        let shared = Arc::new(Shared {
+            connected: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            token: Mutex::new((token.to_owned(), 0)),
+            schema: schema.map(str::to_owned),
+        });
         let link = Link { url: Endpoint::of(url).url(), in_tx, control: control.clone(), shared: shared.clone() };
 
-        let first = serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO });
+        let mut first = serde_json::json!({ "token": token, "applied": applied, "proto": crate::proto::PROTO });
+        add_schema(&mut first, schema);
         // Bounded like every later attempt: a relay that accepts the TCP connection and never
         // answers (a stalled proxy, a half-open route) would otherwise hang the caller for ever.
         let client = match tokio::time::timeout(EMIT_TIMEOUT, link.builder(0).auth(first).connect()).await {
@@ -133,6 +151,14 @@ impl NativeHub {
         let (stop, stopped) = oneshot::channel();
         tokio::spawn(link.run(client, out_rx, control_rx, stopped));
         Ok(NativeHub { outbox, inbox, control, shared, _stop: stop })
+    }
+}
+
+/// Name the replica schema in a handshake's auth, when there is one. Left out otherwise, so a
+/// handshake without one is what it was before the field.
+fn add_schema(auth: &mut serde_json::Value, schema: Option<&str>) {
+    if let (Some(schema), Some(map)) = (schema, auth.as_object_mut()) {
+        map.insert("schema".to_owned(), serde_json::Value::from(schema));
     }
 }
 

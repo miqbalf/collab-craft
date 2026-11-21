@@ -72,6 +72,13 @@ impl WebHub {
     /// Returns as soon as the socket exists. Socket.IO connects in the background and queues what
     /// is sent meanwhile, and [`Hub::connected`] says whether it has arrived.
     pub fn connect(url: &str, token: &str, applied: Option<u64>) -> Result<WebHub> {
+        WebHub::connect_as(url, token, applied, None)
+    }
+
+    /// [`WebHub::connect`] naming the replica schema the app edits with (`"gridcraft/1"`) in
+    /// the handshake, which socket.io-client sends again on every reconnect. The relay pins the
+    /// room to it and refuses a join naming another ([`crate::REFUSED_SCHEMA`]).
+    pub fn connect_as(url: &str, token: &str, applied: Option<u64>, schema: Option<&str>) -> Result<WebHub> {
         let global = js_sys::global();
         let io = function(global.as_ref(), "io").ok_or_else(|| Error::Hub("this page has not loaded socket.io-client".to_owned()))?;
 
@@ -83,6 +90,9 @@ impl WebHub {
         };
         Reflect::set(&auth, &JsValue::from_str("applied"), &applied_js).map_err(js)?;
         Reflect::set(&auth, &JsValue::from_str("proto"), &JsValue::from_str(crate::proto::PROTO)).map_err(js)?;
+        if let Some(schema) = schema {
+            Reflect::set(&auth, &JsValue::from_str("schema"), &JsValue::from_str(schema)).map_err(js)?;
+        }
         let options = Object::new();
         Reflect::set(&options, &JsValue::from_str("auth"), &auth).map_err(js)?;
         // socket.io-client reads a URL path as a namespace, so the relay's base path goes in

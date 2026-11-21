@@ -16,7 +16,9 @@
 //! * [`Session`] orders, deduplicates and tracks locks. It performs no IO and returns [`Effect`]
 //!   values describing what the app should do.
 //! * [`Hub`] is the transport seam a caller implements, intended for Socket.IO at both ends.
-//! * [`LiveDoc`] is the shared block document, and [`Live`] pumps a hub plus that replica.
+//! * [`LiveDoc`] is the shared block document, and [`Live`] pumps a hub plus that replica. Any
+//!   other schema implements [`Replica`] (most of it on [`YReplica`]) and [`Live`] pumps it the
+//!   same way.
 //!   That is the shared solution. It does not live in `craft-cloud` (files) and it does not
 //!   live in one app's desktop binary.
 //!
@@ -42,6 +44,7 @@ mod error;
 mod hub;
 mod live;
 pub mod proto;
+pub mod replica;
 mod session;
 mod token;
 mod ydoc;
@@ -67,9 +70,12 @@ pub use error::{Error, Result};
 pub use hub::{EVENTS, Endpoint, Hub, SLOW_LINK_BYTES_PER_SEC, decode, emit, encode, receive, transfer_time};
 pub use live::{CHECKPOINT_TIMEOUT, DOC_SCOPE, Live, TextPayload, Work, refusal_is_permanent, update_from_wire, update_to_wire};
 pub use proto::{
-    CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PROTO, PeerId, Presence, REFUSED_AUTH, REFUSED_FULL, REFUSED_PROTO, RETRY, Scope, ServerMsg,
-    is_crdt_command,
+    CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PROTO, PeerId, Presence, REFUSED_AUTH, REFUSED_FULL, REFUSED_PROTO, REFUSED_SCHEMA, RETRY,
+    Scope, ServerMsg, is_crdt_command,
 };
+pub use replica::{Replica, YReplica};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};
+/// The CRDT under every replica, for an app that writes its own schema on [`YReplica`].
+pub use yrs;

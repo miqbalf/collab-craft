@@ -53,6 +53,11 @@ pub const REFUSED_PROTO: &str = "proto";
 /// closes the connection; reconnecting at once cannot help.
 pub const REFUSED_FULL: &str = "full";
 
+/// [`ServerMsg::Error`] `code`: the room is pinned to another replica schema than the one this
+/// client named in its handshake (another app, or another version of the same app, edits the
+/// file live), or the name was malformed. Reconnecting with the same build cannot help.
+pub const REFUSED_SCHEMA: &str = "schema";
+
 /// [`ServerMsg::Error`] `code`: a transient relay failure (its bus did not answer). Nothing was
 /// ordered or decided, so the same thing may be sent again after a backoff. On a submit
 /// ([`ServerMsg::Error::local`] set) [`crate::Live`] keeps the edit and resends it; on a

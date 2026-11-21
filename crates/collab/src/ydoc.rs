@@ -36,30 +36,23 @@
 //! its own edit methods. Updates that arrive through [`LiveDoc::apply`] are never undone. Every
 //! local edit is its own undo step. A `set_client` starts a fresh history.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 use yrs::types::text::YChange;
 use yrs::types::{Attrs, Event, PathSegment};
-use yrs::undo::UndoManager;
-use yrs::updates::decoder::Decode;
 use yrs::{
-    Any, Array, ArrayRef, ClientID, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, OffsetKind, Options, Origin, Out, ReadTxn,
-    StateVector, Text, TextPrelim, TextRef, Transact, TransactionMut, Update,
+    Any, Array, ArrayRef, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact,
+    TransactionMut,
 };
+
+use crate::replica::{REMOTE, Replica, YReplica, byte_at, byte_span, integrate, put_sorted, to_any, to_json};
 
 const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
 const TEXT: &str = "t";
 const ATTRS: &str = "a";
-/// The origin of this replica's own edits, and the only one the undo manager tracks.
-const LOCAL: &str = "craft-collab/local";
-/// The origin of updates from other replicas, and of the state carried across `set_client`.
-const REMOTE: &str = "craft-collab/remote";
-/// The origin of this replica's own edits made through [`LiveDoc::untracked`]: sent like any
-/// local edit, never undone.
-const UNTRACKED: &str = "craft-collab/untracked";
 /// The key the change observer is registered under.
 const OBSERVER: &str = "craft-collab/changes";
 
@@ -133,19 +126,12 @@ pub enum LiveError {
 ///
 /// See the [module documentation](self) for the layout, the client id rules and the undo scope.
 pub struct LiveDoc {
-    // Declared before `doc` so it is dropped first and unhooks itself from a live document.
-    undo: UndoManager<()>,
-    doc: Doc,
+    /// The document, its undo history, its client id and its damage mark.
+    y: YReplica,
     body: ArrayRef,
     blocks: MapRef,
-    /// The relay-granted space, once [`LiveDoc::set_client`] has run.
-    client: Option<u32>,
     /// Text and attribute changes the observer saw, drained by [`LiveDoc::apply`].
     seen: Arc<Mutex<Vec<BlockChange>>>,
-    /// yrs panicked part way through an apply, so this replica may hold half an update.
-    damaged: bool,
-    /// Local edits are made outside the undo history ([`LiveDoc::untracked`]).
-    untracked: bool,
 }
 
 impl LiveDoc {
@@ -162,7 +148,7 @@ impl LiveDoc {
         if !blocks.iter().all(|b| ids.insert(b.id)) {
             return Err(LiveError::Exists);
         }
-        let doc = build_doc(0);
+        let doc = YReplica::seed_doc();
         let body = doc.get_or_insert_array(BODY);
         let map = doc.get_or_insert_map(BLOCKS);
         {
@@ -189,17 +175,13 @@ impl LiveDoc {
             log::warn!("collab: client id 0 belongs to the seed and is never adopted");
             return Ok(());
         }
-        if self.client == Some(space) {
+        if self.y.client() == Some(space) {
             return Ok(());
         }
-        let doc = build_doc(u64::from(space));
-        if let Err(e) = integrate(&doc, &self.state()) {
-            log::warn!("collab: this replica's own state did not carry across a client change: {e}");
-            return Err(LiveError::from(e));
-        }
-        let damaged = self.damaged;
+        let doc = self.y.rebuilt(space)?;
+        let damaged = self.y.damaged();
         *self = assemble(doc, Some(space));
-        self.damaged = damaged;
+        self.y.set_damaged(damaged);
         Ok(())
     }
 
@@ -210,7 +192,7 @@ impl LiveDoc {
     /// starts from a snapshot must not also seed the file: the file's text, seeded as client 0,
     /// would be different items from the ones the snapshot holds.
     pub fn from_state(state: &[u8]) -> Result<LiveDoc, LiveError> {
-        let doc = build_doc(0);
+        let doc = YReplica::seed_doc();
         integrate(&doc, state)?;
         Ok(assemble(doc, None))
     }
@@ -219,7 +201,7 @@ impl LiveDoc {
     /// should be rebuilt (from a snapshot, or by reopening) rather than trusted.
     #[must_use]
     pub fn damaged(&self) -> bool {
-        self.damaged
+        self.y.damaged()
     }
 
     /// Merge an update from another replica, and say what it changed.
@@ -229,12 +211,7 @@ impl LiveDoc {
     pub fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
         let before = self.order();
         self.drain_seen();
-        if let Err(e) = integrate(&self.doc, update) {
-            if e == Integrate::Panicked {
-                self.damaged = true;
-            }
-            return Err(LiveError::Decode);
-        }
+        self.y.apply(update)?;
         let after = self.order();
         let seen = self.drain_seen();
 
@@ -399,14 +376,14 @@ impl LiveDoc {
     /// The block ids in document order.
     #[must_use]
     pub fn order(&self) -> Vec<u64> {
-        let txn = self.doc.transact();
+        let txn = self.y.doc().transact();
         order_of(&txn, &self.body)
     }
 
     /// One block's text, attributes and runs, including a removed block's.
     #[must_use]
     pub fn block(&self, id: u64) -> Option<SeedBlock> {
-        let txn = self.doc.transact();
+        let txn = self.y.doc().transact();
         let Some(Out::YMap(block)) = self.blocks.get(&txn, &key(id)) else {
             return None;
         };
@@ -419,27 +396,19 @@ impl LiveDoc {
     /// Undo this replica's last local edit and return the update to send.
     /// `None` on a [`damaged`](Self::damaged) replica too.
     pub fn undo(&mut self) -> Option<Vec<u8>> {
-        if self.damaged || !self.undo.can_undo() {
-            return None;
-        }
-        let before = self.doc.transact().state_vector();
-        self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        self.y.undo()
     }
 
     /// Redo the last undone local edit and return the update to send.
     /// `None` on a [`damaged`](Self::damaged) replica too.
     pub fn redo(&mut self) -> Option<Vec<u8>> {
-        if self.damaged || !self.undo.can_redo() {
-            return None;
-        }
-        let before = self.doc.transact().state_vector();
-        self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        self.y.redo()
     }
 
     /// The whole document as one update (v1), for a checkpoint or a peer starting from nothing.
     #[must_use]
     pub fn state(&self) -> Vec<u8> {
-        self.doc.transact().encode_state_as_update_v1(&StateVector::default())
+        self.y.state()
     }
 
     /// Run `edits` with this replica's local edits kept out of its undo history: they are sent
@@ -447,9 +416,9 @@ impl LiveDoc {
     /// on the user's behalf in answer to a remote edit (text recovered from a block this
     /// replica removed), which the user's own Undo must not erase.
     pub fn untracked<R>(&mut self, edits: impl FnOnce(&mut LiveDoc) -> R) -> R {
-        let was = std::mem::replace(&mut self.untracked, true);
+        let was = self.y.set_untracked(true);
         let out = edits(self);
-        self.untracked = was;
+        self.y.set_untracked(was);
         out
     }
 
@@ -461,18 +430,8 @@ impl LiveDoc {
     where
         F: FnOnce(&mut TransactionMut, &Roots) -> Result<(), LiveError>,
     {
-        if self.damaged {
-            return Err(LiveError::Damaged);
-        }
-        if self.client.is_none() {
-            return Err(LiveError::NoClient);
-        }
         let roots = Roots { body: self.body.clone(), blocks: self.blocks.clone() };
-        let update = {
-            let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
-            edit(&mut txn, &roots)?;
-            txn.encode_update_v1()
-        };
+        let update = self.y.local(|txn| edit(txn, &roots))?;
         // The observer saw this replica's own change; nobody needs it reported back.
         self.drain_seen();
         Ok(update)
@@ -481,7 +440,7 @@ impl LiveDoc {
     /// Mark the replica damaged, as a caught yrs panic would.
     #[cfg(test)]
     pub(crate) fn force_damaged(&mut self) {
-        self.damaged = true;
+        self.y.set_damaged(true);
     }
 
     /// How many changes the observer is holding, for a test of local edits draining them.
@@ -495,6 +454,35 @@ impl LiveDoc {
             Ok(mut seen) => std::mem::take(&mut *seen),
             Err(_) => Vec::new(),
         }
+    }
+}
+
+impl Replica for LiveDoc {
+    type Change = BlockChange;
+    type Seed = [SeedBlock];
+    fn seeded(seed: &[SeedBlock]) -> Result<LiveDoc, LiveError> {
+        LiveDoc::seeded(seed)
+    }
+    fn from_state(state: &[u8]) -> Result<LiveDoc, LiveError> {
+        LiveDoc::from_state(state)
+    }
+    fn set_client(&mut self, space: u32) -> Result<(), LiveError> {
+        LiveDoc::set_client(self, space)
+    }
+    fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        LiveDoc::apply(self, update)
+    }
+    fn state(&self) -> Vec<u8> {
+        LiveDoc::state(self)
+    }
+    fn undo(&mut self) -> Option<Vec<u8>> {
+        LiveDoc::undo(self)
+    }
+    fn redo(&mut self) -> Option<Vec<u8>> {
+        LiveDoc::redo(self)
+    }
+    fn damaged(&self) -> bool {
+        LiveDoc::damaged(self)
     }
 }
 
@@ -549,49 +537,6 @@ impl Roots {
     }
 }
 
-/// Why [`integrate`] failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-enum Integrate {
-    #[error("the update did not decode or apply")]
-    Refused,
-    #[error("yrs panicked while applying the update")]
-    Panicked,
-}
-
-impl From<Integrate> for LiveError {
-    fn from(_: Integrate) -> LiveError {
-        LiveError::Decode
-    }
-}
-
-/// Decode and apply one update as a remote change.
-///
-/// yrs can panic on bytes that decode but do not describe a valid document, so the apply runs
-/// under `catch_unwind`: a hostile or damaged update must not take the app down. That only holds
-/// where panics unwind; a wasm build with `panic = "abort"` still aborts.
-fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let update = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
-        let mut txn = doc.transact_mut_with(REMOTE);
-        txn.apply_update(update).map_err(|_| Integrate::Refused)
-    }));
-    match outcome {
-        Ok(result) => result,
-        Err(_) => {
-            log::warn!("collab: yrs panicked on an update; it was refused");
-            Err(Integrate::Panicked)
-        }
-    }
-}
-
-fn build_doc(client: u64) -> Doc {
-    let mut options = Options::with_client_id(ClientID::new(client));
-    options.offset_kind = OffsetKind::Bytes;
-    // Never mutate on a remote apply: what this replica holds is exactly what it was sent.
-    options.cleanup_formatting = false;
-    Doc::with_options(options)
-}
-
 /// Wrap a built document with its roots, its change observer and its undo manager.
 fn assemble(doc: Doc, client: Option<u32>) -> LiveDoc {
     let body = doc.get_or_insert_array(BODY);
@@ -604,21 +549,13 @@ fn assemble(doc: Doc, client: Option<u32>) -> LiveDoc {
             seen.extend(found);
         }
     });
-    // Spelled out because yrs has no `Default` for these on wasm, where it has no system clock.
-    let options = yrs::undo::Options {
-        // Each local edit is its own step, so the clock is never consulted.
-        capture_timeout_millis: 0,
-        tracked_origins: HashSet::new(),
-        capture_transaction: None,
-        timestamp: Arc::new(|| 0),
-        init_undo_stack: Vec::new(),
-        init_redo_stack: Vec::new(),
-    };
-    let mut undo = UndoManager::with_options(options);
-    undo.expand_scope(&doc, &body);
-    undo.expand_scope(&doc, &blocks);
-    undo.include_origin(Origin::from(LOCAL));
-    LiveDoc { undo, doc, body, blocks, client, seen, damaged: false, untracked: false }
+    let (b, m) = (body.clone(), blocks.clone());
+    // One undo manager over both roots, tracking only this replica's own edits.
+    let y = YReplica::assemble(doc, client, move |doc, undo| {
+        undo.expand_scope(doc, &b);
+        undo.expand_scope(doc, &m);
+    });
+    LiveDoc { y, body, blocks, seen }
 }
 
 /// The block a nested event belongs to, from its path below `"blocks"`.
@@ -696,10 +633,7 @@ fn put_block(txn: &mut TransactionMut, blocks: &MapRef, block: &SeedBlock) {
     let inner = blocks.insert(txn, key(block.id), MapPrelim::default());
     let text = inner.insert(txn, TEXT, TextPrelim::new(block.text.clone()));
     let attrs = inner.insert(txn, ATTRS, MapPrelim::default());
-    let sorted: BTreeMap<&String, &Value> = block.attrs.iter().collect();
-    for (k, v) in sorted {
-        attrs.insert(txn, k.as_str(), to_any(v));
-    }
+    put_sorted(txn, &attrs, &block.attrs);
 
     // Char ranges of each run, clamped to the text.
     let total = block.text.chars().count();
@@ -793,46 +727,6 @@ fn canonical_runs(runs: impl Iterator<Item = (usize, Attributes)>) -> Vec<(usize
 /// Run attributes for an insert: nulls dropped, so the inserted text carries exactly these.
 fn run_attrs_of(attrs: &Attributes) -> Attrs {
     attrs.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (Arc::from(k.as_str()), to_any(v))).collect()
-}
-
-/// Byte offset of char `char_at`, which may be the end of the text.
-fn byte_at(s: &str, char_at: usize) -> Result<u32, LiveError> {
-    let byte = if char_at == 0 { Some(0) } else { s.char_indices().map(|(b, _)| b).chain(std::iter::once(s.len())).nth(char_at) };
-    byte.and_then(|b| u32::try_from(b).ok()).ok_or(LiveError::OutOfRange)
-}
-
-/// Byte offset and byte length of `len` chars from `char_at`.
-fn byte_span(s: &str, char_at: usize, len: usize) -> Result<(u32, u32), LiveError> {
-    let start = byte_at(s, char_at)?;
-    let end = byte_at(s, char_at.checked_add(len).ok_or(LiveError::OutOfRange)?)?;
-    Ok((start, end - start))
-}
-
-fn to_any(v: &Value) -> Any {
-    match v {
-        Value::Null => Any::Null,
-        Value::Bool(b) => Any::Bool(*b),
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => Any::Number(Number::Int(i)),
-            None => Any::Number(Number::Float(n.as_f64().unwrap_or(f64::NAN))),
-        },
-        Value::String(s) => Any::String(Arc::from(s.as_str())),
-        Value::Array(items) => Any::Array(items.iter().map(to_any).collect()),
-        Value::Object(m) => Any::Map(Arc::new(m.iter().map(|(k, v)| (k.clone(), to_any(v))).collect::<HashMap<_, _>>())),
-    }
-}
-
-fn to_json(a: &Any) -> Value {
-    match a {
-        Any::Null | Any::Undefined => Value::Null,
-        Any::Bool(b) => Value::Bool(*b),
-        Any::Number(Number::Int(i)) => Value::from(*i),
-        Any::Number(Number::Float(f)) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
-        Any::String(s) => Value::String(s.to_string()),
-        Any::Buffer(b) => Value::Array(b.iter().map(|x| Value::from(*x)).collect()),
-        Any::Array(items) => Value::Array(items.iter().map(to_json).collect()),
-        Any::Map(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()),
-    }
 }
 
 #[cfg(test)]

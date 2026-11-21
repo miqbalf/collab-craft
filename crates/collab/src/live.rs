@@ -44,8 +44,9 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::hub::Hub;
 use crate::proto::{CRDT_TEXT, ClientMsg, RETRY, ServerMsg};
+use crate::replica::Replica;
 use crate::session::{Effect, Session};
-use crate::ydoc::{BlockChange, LiveDoc, LiveError, SeedBlock};
+use crate::ydoc::{BlockChange, LiveDoc, LiveError};
 
 /// The one scope the document's updates travel under.
 pub const DOC_SCOPE: &str = "doc";
@@ -89,14 +90,15 @@ pub fn update_from_wire(op: &str) -> std::result::Result<Vec<u8>, LiveError> {
 
 /// Work the app must do after one [`Live::pump`].
 ///
-/// Document updates are already merged here. [`Work::Doc`] says which blocks to re-read
-/// through [`Live::doc`]. Other commands still go through the app's `apply_remote`.
+/// Document updates are already merged here. [`Work::Doc`] says what changed, in the replica
+/// schema's own terms (`C`, [`BlockChange`] for [`LiveDoc`]), to re-read through [`Live::doc`].
+/// Other commands still go through the app's `apply_remote`.
 #[derive(Debug)]
-pub enum Work {
+pub enum Work<C = BlockChange> {
     /// A lock-scoped command that is not a document update.
     Command { command: String, params: Value },
-    /// Remote updates landed. Re-read these blocks.
-    Doc { changes: Vec<BlockChange> },
+    /// Remote updates landed. Re-read what they changed.
+    Doc { changes: Vec<C> },
     /// Load the document from the file, through [`Live::seed`].
     ///
     /// Raised when updates arrive before this replica has loaded it. They are held until it
@@ -269,12 +271,13 @@ impl Catchup {
     }
 }
 
-/// One live shared-editing link, over any [`Hub`].
-pub struct Live<H> {
+/// One live shared-editing link, over any [`Hub`], with a replica of any [`Replica`] schema
+/// ([`LiveDoc`] unless named).
+pub struct Live<H, R: Replica = LiveDoc> {
     hub: H,
     wire: Session,
     /// The replica, once the app has seeded it from the file.
-    doc: Option<LiveDoc>,
+    doc: Option<R>,
     /// Updates that arrived before the file was loaded, in arrival order.
     held: Vec<Vec<u8>>,
     /// The id space the relay granted, once it has.
@@ -345,8 +348,16 @@ pub struct Live<H> {
 
 impl<H: Hub> Live<H> {
     /// Takes an already-connected hub. The relay admits a peer from the token in the
-    /// handshake; nothing is sent here on purpose.
+    /// handshake; nothing is sent here on purpose. The replica is a [`LiveDoc`]; another schema
+    /// starts with [`Live::with_replica`].
     pub fn new(hub: H, doc: impl Into<String>) -> Live<H> {
+        Live::with_replica(hub, doc)
+    }
+}
+
+impl<H: Hub, R: Replica> Live<H, R> {
+    /// [`Live::new`] for a replica of schema `R`.
+    pub fn with_replica(hub: H, doc: impl Into<String>) -> Live<H, R> {
         Live {
             hub,
             wire: Session::new(doc.into()),
@@ -394,7 +405,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// The replica, once seeded.
-    pub fn doc(&self) -> Option<&LiveDoc> {
+    pub fn doc(&self) -> Option<&R> {
         self.doc.as_ref()
     }
 
@@ -405,7 +416,7 @@ impl<H: Hub> Live<H> {
     /// restore fails the replica is broken for good and the file is never seeded instead,
     /// because the room has moved past it. A document already seeded is left alone and nothing
     /// is reported.
-    pub fn seed(&mut self, blocks: &[SeedBlock]) -> std::result::Result<Vec<BlockChange>, LiveError> {
+    pub fn seed(&mut self, blocks: &R::Seed) -> std::result::Result<Vec<R::Change>, LiveError> {
         if self.broken {
             return Err(LiveError::Decode);
         }
@@ -413,7 +424,7 @@ impl<H: Hub> Live<H> {
             return Ok(Vec::new());
         }
         let mut doc = match self.snapshot.take() {
-            Some(snapshot) => match LiveDoc::from_state(&snapshot) {
+            Some(snapshot) => match R::from_state(&snapshot) {
                 Ok(doc) => {
                     self.awaiting_snapshot = false;
                     doc
@@ -424,7 +435,7 @@ impl<H: Hub> Live<H> {
                 }
             },
             None => {
-                let doc = LiveDoc::seeded(blocks)?;
+                let doc = R::seeded(blocks)?;
                 self.from_file = true;
                 doc
             }
@@ -503,7 +514,7 @@ impl<H: Hub> Live<H> {
     /// reopened. Split very large pastes so each stays under it.
     pub fn edit<F>(&mut self, edit: F) -> Result<()>
     where
-        F: FnOnce(&mut LiveDoc) -> std::result::Result<Vec<u8>, LiveError>,
+        F: FnOnce(&mut R) -> std::result::Result<Vec<u8>, LiveError>,
     {
         let doc = self.sound_doc()?;
         let update = edit(doc).map_err(refusal)?;
@@ -621,7 +632,7 @@ impl<H: Hub> Live<H> {
 
     /// One frame of inbound work. Outbound is the app's: it calls edit/submit
     /// first, then this.
-    pub fn pump(&mut self) -> Vec<Work> {
+    pub fn pump(&mut self) -> Vec<Work<R::Change>> {
         let now = self.hub.connected();
         if now != self.was_connected {
             self.notices.push(if now {
@@ -658,7 +669,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// The document, when it may take a local edit.
-    fn sound_doc(&mut self) -> Result<&mut LiveDoc> {
+    fn sound_doc(&mut self) -> Result<&mut R> {
         if self.broken {
             return Err(Error::malformed("client", "the shared document is broken; reopen the file"));
         }
@@ -690,7 +701,7 @@ impl<H: Hub> Live<H> {
     ///
     /// On a join that lost the room's history, a replica that held nothing from before waits
     /// for a snapshot, and [`Work::HistoryLost`] is raised either way.
-    fn joined(&mut self, seq: u64, replay_until: Option<u64>, fallback: bool, history_lost: bool, work: &mut Vec<Work>) {
+    fn joined(&mut self, seq: u64, replay_until: Option<u64>, fallback: bool, history_lost: bool, work: &mut Vec<Work<R::Change>>) {
         if history_lost {
             // What it held before is only the room's if it settled on the room's history,
             // which a replica still waiting for a snapshot never did.
@@ -732,7 +743,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// Drop a checkpoint whose submit may never be ordered, reported as raced so it is retried.
-    fn lose_checkpoint(&mut self, work: &mut Vec<Work>, why: &str) {
+    fn lose_checkpoint(&mut self, work: &mut Vec<Work<R::Change>>, why: &str) {
         if self.checkpoint.take().is_some() {
             log::info!("collab: a checkpoint in flight was dropped: {why}");
             work.push(Work::CheckpointRaced);
@@ -742,7 +753,7 @@ impl<H: Hub> Live<H> {
     /// Drop the checkpoint in flight on a refusal the relay tied to it. Permanent refusals are
     /// told apart from the rest, so an app that retries on [`Work::CheckpointRaced`] does not
     /// loop on them.
-    fn refuse_checkpoint(&mut self, work: &mut Vec<Work>, detail: &str) {
+    fn refuse_checkpoint(&mut self, work: &mut Vec<Work<R::Change>>, detail: &str) {
         if refusal_is_permanent(detail) {
             if self.checkpoint.take().is_some() {
                 log::info!("collab: the relay refused a checkpoint: {detail}");
@@ -754,7 +765,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// Give up on a checkpoint that got no answer in time.
-    fn time_out_checkpoint(&mut self, work: &mut Vec<Work>) {
+    fn time_out_checkpoint(&mut self, work: &mut Vec<Work<R::Change>>) {
         let Some((sent_at, allowance)) = self.checkpoint.as_ref().and_then(|p| p.sent_at.map(|at| (at, p.allowance))) else { return };
         let Some(now) = now_ms() else { return };
         if now - sent_at >= (self.checkpoint_timeout + allowance).as_secs_f64() * 1000.0 {
@@ -895,7 +906,7 @@ impl<H: Hub> Live<H> {
     ///
     /// `snap` says the first update is a checkpoint snapshot. `restart` says it is the one this
     /// replica must start from (the first op of its first catch-up).
-    fn merge_updates(&mut self, scope: String, ops: &[String], snap: bool, restart: bool, work: &mut Vec<Work>) {
+    fn merge_updates(&mut self, scope: String, ops: &[String], snap: bool, restart: bool, work: &mut Vec<Work<R::Change>>) {
         if scope != DOC_SCOPE {
             log::warn!("collab: ignoring updates for scope {scope:?}, not {DOC_SCOPE:?}");
             return;
@@ -976,7 +987,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// Start from a snapshot.
-    fn restart_from(&mut self, snapshot: Vec<u8>, scope: &str, work: &mut Vec<Work>) -> Restart {
+    fn restart_from(&mut self, snapshot: Vec<u8>, scope: &str, work: &mut Vec<Work<R::Change>>) -> Restart {
         if self.doc.is_none() {
             // The common case: the file is not loaded yet, so it never will be. A second
             // snapshot before then is the same history, so it lands as an ordinary update.
@@ -997,7 +1008,7 @@ impl<H: Hub> Live<H> {
             work.push(Work::TextIncomplete { scope: scope.to_owned() });
             return Restart::Refused;
         }
-        let restored = LiveDoc::from_state(&snapshot).and_then(|mut doc| match self.space {
+        let restored = R::from_state(&snapshot).and_then(|mut doc| match self.space {
             Some(space) => doc.set_client(space).map(|()| doc),
             None => Ok(doc),
         });
@@ -1049,7 +1060,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// One of this replica's submits was ordered. Finishes a checkpoint when it was that one.
-    fn confirmed(&mut self, local: u64, seq: u64, work: &mut Vec<Work>) {
+    fn confirmed(&mut self, local: u64, seq: u64, work: &mut Vec<Work<R::Change>>) {
         if self.checkpoint.as_ref().is_none_or(|p| p.local != local) {
             return;
         }
@@ -1072,7 +1083,7 @@ impl<H: Hub> Live<H> {
     }
 
     /// The relay answered a save report. Only the answer for the one in flight counts.
-    fn save_answered(&mut self, seq: u64, refusal: Option<&str>, work: &mut Vec<Work>) {
+    fn save_answered(&mut self, seq: u64, refusal: Option<&str>, work: &mut Vec<Work<R::Change>>) {
         if self.checkpoint.as_ref().and_then(PendingCheckpoint::saved_through) != Some(seq) {
             return;
         }
@@ -1086,7 +1097,7 @@ impl<H: Hub> Live<H> {
         }
     }
 
-    fn act(&mut self, effect: Effect, work: &mut Vec<Work>) {
+    fn act(&mut self, effect: Effect, work: &mut Vec<Work<R::Change>>) {
         match effect {
             Effect::Space { space } => {
                 self.space = Some(space);
@@ -1238,7 +1249,7 @@ enum Restart {
 }
 
 /// Add changes not already listed.
-fn merge_changes(into: &mut Vec<BlockChange>, found: Vec<BlockChange>) {
+fn merge_changes<C: PartialEq>(into: &mut Vec<C>, found: Vec<C>) {
     for c in found {
         if !into.contains(&c) {
             into.push(c);
@@ -1261,6 +1272,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
+    use crate::SeedBlock;
 
     #[derive(Clone, Default)]
     struct Hub0(Rc<RefCell<(Vec<ClientMsg>, Vec<ServerMsg>)>>);
@@ -1310,5 +1322,113 @@ mod tests {
         assert!(live.redo().is_err());
         assert!(live.checkpoint().is_err());
         assert_eq!(hub.0.borrow().0.len(), 1, "only the edit before the damage went out");
+    }
+
+    /// A schema that is not `LiveDoc`: one text, written on `YReplica`. What `Live` needs from
+    /// a replica is the trait, nothing of the block layout.
+    struct Note {
+        y: crate::YReplica,
+        text: yrs::TextRef,
+    }
+
+    impl Note {
+        fn assemble(doc: yrs::Doc, client: Option<u32>) -> Note {
+            let text = doc.get_or_insert_text("note");
+            let t = text.clone();
+            Note { y: crate::YReplica::assemble(doc, client, move |doc, undo| undo.expand_scope(doc, &t)), text }
+        }
+        fn read(&self) -> String {
+            use yrs::{GetString, Transact};
+            self.text.get_string(&self.y.doc().transact())
+        }
+        fn append(&mut self, s: &str) -> std::result::Result<Vec<u8>, LiveError> {
+            use yrs::Text;
+            let text = self.text.clone();
+            let at = u32::try_from(self.read().len()).map_err(|_| LiveError::OutOfRange)?;
+            self.y.local(|txn| {
+                text.insert(txn, at, s);
+                Ok(())
+            })
+        }
+    }
+
+    impl Replica for Note {
+        type Change = ();
+        type Seed = str;
+        fn seeded(seed: &str) -> std::result::Result<Note, LiveError> {
+            use yrs::{Text, Transact};
+            let doc = crate::YReplica::seed_doc();
+            let text = doc.get_or_insert_text("note");
+            text.insert(&mut doc.transact_mut_with(crate::replica::REMOTE), 0, seed);
+            Ok(Note::assemble(doc, None))
+        }
+        fn from_state(state: &[u8]) -> std::result::Result<Note, LiveError> {
+            let doc = crate::YReplica::seed_doc();
+            crate::replica::integrate(&doc, state)?;
+            Ok(Note::assemble(doc, None))
+        }
+        fn set_client(&mut self, space: u32) -> std::result::Result<(), LiveError> {
+            let doc = self.y.rebuilt(space)?;
+            *self = Note::assemble(doc, Some(space));
+            Ok(())
+        }
+        fn apply(&mut self, update: &[u8]) -> std::result::Result<Vec<()>, LiveError> {
+            let before = self.read();
+            self.y.apply(update)?;
+            Ok(if self.read() == before { Vec::new() } else { vec![()] })
+        }
+        fn state(&self) -> Vec<u8> {
+            self.y.state()
+        }
+        fn undo(&mut self) -> Option<Vec<u8>> {
+            self.y.undo()
+        }
+        fn redo(&mut self) -> Option<Vec<u8>> {
+            self.y.redo()
+        }
+        fn damaged(&self) -> bool {
+            self.y.damaged()
+        }
+    }
+
+    fn joined(space: u32) -> ServerMsg {
+        ServerMsg::Joined {
+            doc: "d".to_owned(),
+            peer: format!("p{space}"),
+            seq: 0,
+            space,
+            roster: Vec::new(),
+            locks: Vec::new(),
+            replay_until: None,
+            fallback: false,
+            text_cap: None,
+            heartbeat: false,
+            history_lost: false,
+        }
+    }
+
+    /// Two links on another schema: an edit made on one, ordered by the relay, lands on the
+    /// other as that schema's own change.
+    #[test]
+    fn another_schema_rides_the_same_link() {
+        let (ha, hb) = (Hub0::default(), Hub0::default());
+        let mut a: Live<Hub0, Note> = Live::with_replica(ha.clone(), "d");
+        let mut b: Live<Hub0, Note> = Live::with_replica(hb.clone(), "d");
+        a.seed("hi").unwrap();
+        b.seed("hi").unwrap();
+        ha.0.borrow_mut().1.push(joined(1));
+        hb.0.borrow_mut().1.push(joined(2));
+        a.pump();
+        b.pump();
+        assert!(a.ready_to_type());
+        a.edit(|n| n.append(" there")).unwrap();
+        let sent = std::mem::take(&mut ha.0.borrow_mut().0);
+        let Some(ClientMsg::Submit { command, params, local, .. }) = sent.into_iter().next() else { panic!("nothing was sent") };
+        let op = ServerMsg::Op { doc: "d".to_owned(), seq: 1, origin: "p1".to_owned(), local: Some(local), command, params, scope: None };
+        hb.0.borrow_mut().1.push(op);
+        let work = b.pump();
+        assert!(work.iter().any(|w| matches!(w, Work::Doc { changes } if !changes.is_empty())), "{work:?}");
+        assert_eq!(b.doc().map(Note::read), a.doc().map(Note::read));
+        assert_ne!(b.doc().map(Note::read).as_deref(), Some("hi"), "the edit did not land");
     }
 }
