@@ -159,6 +159,19 @@ pub fn decode(payload: &str) -> Result<ServerMsg> {
     serde_json::from_str(payload).map_err(|e| crate::error::Error::malformed("server", e.to_string()))
 }
 
+/// The slowest link a transfer is given time for, in bytes a second.
+///
+/// A deadline that ignores the size of what is moving counts a large transfer on a slow link
+/// as a dead link, and the reconnect then sends the same transfer again into the same deadline.
+/// Every transfer deadline is a fixed part plus [`transfer_time`] of its bytes at this rate.
+pub const SLOW_LINK_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// How long `bytes` take to move at [`SLOW_LINK_BYTES_PER_SEC`].
+pub fn transfer_time(bytes: usize) -> std::time::Duration {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(bytes.saturating_mul(1000) / SLOW_LINK_BYTES_PER_SEC)
+}
+
 /// The event name and body for one client message.
 ///
 /// The relay keys handlers on the event name and reads the document from the peer's token, so the

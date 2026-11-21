@@ -125,10 +125,13 @@ impl LivePeer {
     }
 
     /// Checkpoint and wait for the relay to order it. Whether it was accepted.
+    /// Checkpoint and wait for the answer: 5 s plus the snapshot's transfer time on a slow
+    /// link, as the hub and the checkpoint timeout allow it.
     pub async fn save(&mut self) -> bool {
-        self.live.checkpoint().expect("a checkpoint goes out");
+        let state = self.live.checkpoint().expect("a checkpoint goes out");
+        let window = std::time::Duration::from_secs(5) + craft_collab::transfer_time(state.len().div_ceil(3) * 4);
         let from = self.work.len();
-        self.until(std::time::Duration::from_secs(5), |_, work| {
+        self.until(window, |_, work| {
             work[from..].iter().any(|w| {
                 matches!(
                     w,

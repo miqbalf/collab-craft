@@ -20,7 +20,7 @@ and token minting every time.
 | A Redis-compatible server | per-document sequence, scope locks, sessions | Valkey or Redis. Must not evict: see below |
 | An OIDC provider | signing people in | Tested against Authentik and Keycloak |
 | A cloud provider | where documents live | Nextcloud today. See *Providers* |
-| A reverse proxy | TLS | Optional, but the OIDC redirect wants https |
+| A reverse proxy | TLS | Optional, but the OIDC redirect wants https. Must pass WebSocket upgrades: see below |
 
 Nothing else. The service writes nothing to disk and keeps no database of its
 own.
@@ -29,6 +29,14 @@ own.
 silently reorders every edit in that document. Clients then hold their edits,
 waiting for numbers that never arrive. Run it with
 `--maxmemory-policy noeviction`. The bus overlay below already does.
+
+**Proxies must pass WebSocket upgrades.** Native clients (`NativeHub`) connect
+to the relay's Socket.IO endpoint over WebSocket only, with no long-polling
+fallback. Every proxy between a client and the relay has to forward the
+`Upgrade: websocket` handshake on `<base>/socket.io/`, and keep idle
+connections open longer than the relay's 25 s ping. With nginx, that means
+`proxy_http_version 1.1` plus the `Upgrade` and `Connection` headers. A proxy
+that only allows polling leaves native clients unable to connect.
 
 ## Deploying
 

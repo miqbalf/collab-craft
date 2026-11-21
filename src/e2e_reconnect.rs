@@ -31,18 +31,23 @@ async fn start() -> Option<Harness> {
 /// The relay, with engine.io pinging every `ping` and giving up after as long again, so a
 /// test controls when a dead socket is reaped.
 async fn start_pinging(ping: Option<Duration>) -> Option<Harness> {
+    start_capped(ping, crate::room::TEXT_BYTES).await
+}
+
+/// The relay with `text_cap` for every room and the transport sized from it.
+async fn start_capped(ping: Option<Duration>, text_cap: usize) -> Option<Harness> {
     let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
     let mut bus = Bus::connect(&valkey).await.expect("valkey");
     bus.check_writable().await.expect("writable");
     let relay = Arc::new(Relay {
-        text_cap: crate::room::TEXT_BYTES,
+        text_cap,
         service_uid: "craft_office".to_owned(),
         secret: SECRET.to_vec(),
         bus: Mutex::new(bus),
         rooms: Mutex::new(Default::default()),
         gates: Default::default(),
     });
-    let mut builder = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES);
+    let mut builder = crate::sized(SocketIo::builder(), text_cap);
     if let Some(ping) = ping {
         builder = builder.ping_interval(ping).ping_timeout(ping);
     }
@@ -152,6 +157,106 @@ async fn proxy(to: SocketAddr, down_for: Duration) -> Proxy {
         }
     });
     Proxy { url: format!("http://{addr}"), cut, accepted }
+}
+
+/// A TCP forwarder to the relay that moves at most `rate` bytes a second each way, as a slow
+/// link does. Counts the connections it accepted.
+async fn throttled(to: SocketAddr, rate: usize) -> (String, Arc<AtomicU64>) {
+    async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, rate: usize) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if to.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs_f64(n as f64 / rate as f64)).await;
+        }
+        let _ = to.shutdown().await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicU64::new(0));
+    let counted = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(to).await else { return };
+                let (in_read, in_write) = inbound.into_split();
+                let (out_read, out_write) = outbound.into_split();
+                tokio::join!(pump(in_read, out_write, rate), pump(out_read, in_write, rate));
+            });
+        }
+    });
+    (format!("http://{addr}"), accepted)
+}
+
+/// A ticket for the document service, the one peer that may checkpoint.
+fn saver(room: &str) -> String {
+    token::sign_at(SECRET, room, "craft_office", "alice", true, "alice", now()).unwrap()
+}
+
+/// About 256 KiB a second: a slow uplink, where a few MiB take longer than any fixed deadline.
+const SLOW_LINK: usize = 256 * 1024;
+
+/// A text whose checkpoint snapshot is about 3.5 MiB on the wire: some 14 s on [`SLOW_LINK`],
+/// past the hub's fixed 10 s deadlines, and under the relay's 20 s engine.io ping timeout,
+/// which bounds how long any one frame may take in either direction.
+fn large_file() -> String {
+    "ab".repeat(1_300_000)
+}
+
+/// A checkpoint of a few MiB over a slow link: the emit and the checkpoint get time for their
+/// bytes, so the snapshot is acknowledged on the first connection and the link never counts
+/// as dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_large_checkpoint_on_a_slow_link_is_acked_without_a_reconnect() {
+    let Some(h) = start_capped(None, 8 * 1024 * 1024).await else { return };
+    let (url, accepted) = throttled(relay_addr(&h), SLOW_LINK).await;
+    let room = unique_room("slow-save");
+    let mut a = LivePeer::open(&url, &saver(&room), &format!("doc:{room}"), &large_file()).await;
+    let started = tokio::time::Instant::now();
+    assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
+    assert!(started.elapsed() > Duration::from_secs(10), "the link was not slow: {:?}", started.elapsed());
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "the hub reconnected");
+    assert!(a.live.hub().connected());
+    a.until(Duration::from_secs(12), |_, _| false).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "the hub reconnected after the checkpoint");
+    assert!(a.live.hub().connected());
+}
+
+/// A join whose catch-up is a few MiB over a slow link: the heartbeat's acknowledgement waits
+/// behind it, and the link still counts as alive, so the joiner settles on its first
+/// connection instead of looping on reconnects that each restart the same catch-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_large_catch_up_on_a_slow_link_settles_without_a_reconnect() {
+    let Some(h) = start_capped(None, 8 * 1024 * 1024).await else { return };
+    let room = unique_room("slow-join");
+    let doc = format!("doc:{room}");
+    let file = large_file();
+    let mut a = LivePeer::open(&h.url, &saver(&room), &doc, &file).await;
+    a.insert(0, ">");
+    a.until(Duration::from_millis(300), |_, _| false).await;
+    assert!(a.save().await, "the checkpoint was not acknowledged: {:?}", a.work);
+
+    let (url, accepted) = throttled(relay_addr(&h), SLOW_LINK).await;
+    let mut b = LivePeer::connect(&url, &ticket(&room, "bob", now()), &doc).await;
+    let started = tokio::time::Instant::now();
+    let arrived = b.until(Duration::from_secs(60), |_, work| work.iter().any(|w| matches!(w, Work::SeedWanted { .. }))).await;
+    assert!(arrived, "the catch-up never arrived: {:?}", b.work);
+    assert!(started.elapsed() > Duration::from_secs(10), "the link was not slow: {:?}", started.elapsed());
+    b.live.seed(&crate::test_text::para(&file)).expect("restores");
+    assert!(b.text() == a.text(), "the joiner did not converge");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "the joiner reconnected");
+    b.until(Duration::from_secs(12), |_, _| false).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "the joiner reconnected after settling");
+    assert!(b.live.hub().connected());
 }
 
 /// A TCP forwarder that, once `hole` is notified, stops forwarding on the connections it has

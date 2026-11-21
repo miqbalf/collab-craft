@@ -132,8 +132,9 @@ pub enum Work {
     ///   (it could not order the edit, or no retained snapshot follows the reported sequence);
     /// * the save report never left this client;
     /// * no answer came within the checkpoint timeout (10 s unless
-    ///   [`Live::set_checkpoint_timeout`] says otherwise). A relay too old to acknowledge a
-    ///   save never answers, so against one every checkpoint ends here.
+    ///   [`Live::set_checkpoint_timeout`] says otherwise) plus the snapshot's own transfer
+    ///   time at [`crate::SLOW_LINK_BYTES_PER_SEC`]. A relay too old to acknowledge a save
+    ///   never answers, so against one every checkpoint ends here.
     CheckpointRaced,
     /// The relay refused the checkpoint for a reason a retry does not change: this peer may
     /// only read, or the snapshot is larger than the relay carries. `reason` is the relay's
@@ -180,6 +181,9 @@ struct PendingCheckpoint {
     ordered: Option<u64>,
     /// When it was sent, on [`now_ms`]. `None` where there is no clock.
     sent_at: Option<f64>,
+    /// The time its own bytes take on a slow link ([`crate::transfer_time`]), on top of the
+    /// checkpoint timeout: a large snapshot on a slow link is not an unanswered one.
+    allowance: Duration,
 }
 
 impl PendingCheckpoint {
@@ -187,6 +191,11 @@ impl PendingCheckpoint {
     fn saved_through(&self) -> Option<u64> {
         self.ordered.map(|seq| seq.saturating_sub(1))
     }
+}
+
+/// A submit's `params` in wire bytes, as the relay measures them.
+fn measure(params: &serde_json::Value) -> u64 {
+    serde_json::to_vec(params).map_or(u64::MAX, |v| v.len() as u64)
 }
 
 /// Milliseconds on a clock that only moves forward.
@@ -478,20 +487,23 @@ impl<H: Hub> Live<H> {
         }
         let state = self.sound_doc()?.state();
         let params = serde_json::to_value(TextPayload::snapshot(&state)).map_err(|e| Error::malformed("client", e.to_string()))?;
-        if let Some(bytes) = self.over_cap(&params) {
+        let bytes = measure(&params);
+        if self.text_cap.is_some_and(|cap| bytes > cap) {
             return Err(Error::Refused(format!("that checkpoint is {bytes} bytes, too large to retain for joining editors")));
         }
+        let allowance = crate::transfer_time(usize::try_from(bytes).unwrap_or(usize::MAX));
         let msg = self.wire.submit_crdt(CRDT_TEXT, params);
         let ClientMsg::Submit { local, .. } = &msg else {
             return Err(Error::malformed("client", "a checkpoint must be a submit"));
         };
-        self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms() });
+        self.checkpoint = Some(PendingCheckpoint { local: *local, raced: false, ordered: None, sent_at: now_ms(), allowance });
         self.hub.send(msg)?;
         Ok(state)
     }
 
     /// How long a checkpoint waits for its ordering and the relay's acknowledgement before it
-    /// is reported as [`Work::CheckpointRaced`]. [`CHECKPOINT_TIMEOUT`] by default.
+    /// is reported as [`Work::CheckpointRaced`], on top of the snapshot's own transfer time at
+    /// [`crate::SLOW_LINK_BYTES_PER_SEC`]. [`CHECKPOINT_TIMEOUT`] by default.
     ///
     /// Measured from the submit, and checked at the end of each [`pump`](Live::pump), after
     /// that pump's messages: an answer that arrived in time is never beaten by the timer, and
@@ -658,9 +670,9 @@ impl<H: Hub> Live<H> {
 
     /// Give up on a checkpoint that got no answer in time.
     fn time_out_checkpoint(&mut self, work: &mut Vec<Work>) {
-        let Some(sent_at) = self.checkpoint.as_ref().and_then(|p| p.sent_at) else { return };
+        let Some((sent_at, allowance)) = self.checkpoint.as_ref().and_then(|p| p.sent_at.map(|at| (at, p.allowance))) else { return };
         let Some(now) = now_ms() else { return };
-        if now - sent_at >= self.checkpoint_timeout.as_secs_f64() * 1000.0 {
+        if now - sent_at >= (self.checkpoint_timeout + allowance).as_secs_f64() * 1000.0 {
             self.lose_checkpoint(work, "no answer came in time");
         }
     }
@@ -672,7 +684,7 @@ impl<H: Hub> Live<H> {
     /// the cap plus a margin for the message around the params, so a submit within the cap is
     /// never dropped at the socket.
     fn over_cap(&self, params: &serde_json::Value) -> Option<u64> {
-        let bytes = serde_json::to_vec(params).map_or(u64::MAX, |v| v.len() as u64);
+        let bytes = measure(params);
         self.text_cap.is_some_and(|cap| bytes > cap).then_some(bytes)
     }
 
@@ -913,7 +925,7 @@ impl<H: Hub> Live<H> {
         if self.checkpoint.as_ref().is_none_or(|p| p.local != local) {
             return;
         }
-        let (raced, sent_at) = self.checkpoint.take().map_or((false, None), |p| (p.raced, p.sent_at));
+        let (raced, sent_at, allowance) = self.checkpoint.take().map_or((false, None, Duration::ZERO), |p| (p.raced, p.sent_at, p.allowance));
         if raced {
             log::info!("collab: a remote edit landed before checkpoint {seq}; it was not reported as saved");
             work.push(Work::CheckpointRaced);
@@ -923,7 +935,7 @@ impl<H: Hub> Live<H> {
         match self.hub.send(saved) {
             // Not done yet: only the relay's acknowledgement moves the baseline.
             // The timeout keeps running from the submit.
-            Ok(()) => self.checkpoint = Some(PendingCheckpoint { local, raced: false, ordered: Some(seq), sent_at }),
+            Ok(()) => self.checkpoint = Some(PendingCheckpoint { local, raced: false, ordered: Some(seq), sent_at, allowance }),
             Err(e) => {
                 log::warn!("collab: checkpoint {seq} was ordered but the save report never left: {e}");
                 work.push(Work::CheckpointRaced);

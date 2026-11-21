@@ -1199,13 +1199,31 @@ fn a_checkpoint_with_no_answer_times_out_as_raced() {
     live.seed(&sample()).unwrap();
     hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
     live.pump();
-    live.checkpoint().unwrap();
+    let state = live.checkpoint().unwrap();
     assert!(live.pump().is_empty(), "the default timeout has not passed");
     live.set_checkpoint_timeout(std::time::Duration::ZERO);
+    // The snapshot's own transfer time still applies, so this waits that out.
+    std::thread::sleep(craft_collab::transfer_time(state.len() * 2 + 1024));
     let work = live.pump();
     assert!(matches!(work.as_slice(), [Work::CheckpointRaced]), "{work:?}");
     live.checkpoint().unwrap();
     assert_eq!(craft_collab::CHECKPOINT_TIMEOUT, std::time::Duration::from_secs(10));
+}
+
+/// Reconnect round 6: a checkpoint's deadline grows with its snapshot, at the slow-link rate,
+/// so a large one on a slow link is not reported as unanswered while it is still moving.
+#[test]
+fn a_large_checkpoint_is_given_its_transfer_time() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&[craft_collab::SeedBlock { id: 0, text: "ab".repeat(64 * 1024), attrs: Default::default(), runs: Vec::new() }]).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.set_checkpoint_timeout(std::time::Duration::ZERO);
+    let state = live.checkpoint().unwrap();
+    assert!(craft_collab::transfer_time(state.len()) >= std::time::Duration::from_secs(2), "{} bytes", state.len());
+    assert!(live.pump().is_empty(), "timed out before its 128 KiB could move at the slow-link rate");
+    assert_eq!(craft_collab::transfer_time(64 * 1024), std::time::Duration::from_secs(1));
 }
 
 /// 5: the relay can broadcast a live op to a socket before telling it that it joined. The op
