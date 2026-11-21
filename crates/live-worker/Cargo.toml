@@ -1,0 +1,33 @@
+[package]
+name = "craft-live-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The document service of live co-editing for any Craft app: the notify endpoint, room tasks, service tickets, checkpoint-then-write saves with If-Match, conflict copies and heartbeats, behind a small trait each app implements"
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-collab = { workspace = true, features = ["native-hub"] }
+craft-live = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+# Conflict copy names: the wall clock as `YYYY-MM-DD HHMM` (AGENTS.md: no hand-rolled calendar).
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
+getrandom = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+# The notify endpoint: one small HTTP/1 route.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Served by hand on hyper's HTTP/1 connection builder, for its header-read timeout and no
+# keep-alive (axum::serve sets neither).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# The Nextcloud file API. native-tls, as the socket client already builds.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }

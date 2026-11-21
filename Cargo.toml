@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/nextcloud", "crates/webdav", "crates/collab", "crates/cloud-client", "crates/share-backend"]
+members = [".", "crates/nextcloud", "crates/webdav", "crates/collab", "crates/live", "crates/live-worker", "crates/cloud-client", "crates/share-backend"]
 
 # What the moved crates inherit. They were written against a workspace root
 # and they keep working against this one.
@@ -31,6 +31,7 @@ craft-cloud = { git = "https://github.com/wdunn001/craft-libs", rev = "1a3cbfd72
 craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "1a3cbfd724bf28ccbe51a1f45f19022f131f15bb" }
 craft-esign = { git = "https://github.com/wdunn001/craft-libs", rev = "1a3cbfd724bf28ccbe51a1f45f19022f131f15bb" }
 craft-collab = { path = "crates/collab" }
+craft-live = { path = "crates/live" }
 craft-cloud-client = { path = "crates/cloud-client" }
 craft-nextcloud = { path = "crates/nextcloud" }
 craft-webdav = { path = "crates/webdav" }

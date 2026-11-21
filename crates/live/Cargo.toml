@@ -1,0 +1,21 @@
+[package]
+name = "craft-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The live session state machine every Craft app shares: status, catch-up and saver timers, the document service's saved, notice and ended messages, carets and the saver side, over any craft-collab replica"
+
+[lints]
+workspace = true
+
+[features]
+# `testing`: an in-memory relay, so a host's tests can join a real `LiveEditing` with no server.
+# Dev-dependencies only, never in a release build.
+test-util = []
+
+[dependencies]
+craft-collab = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
