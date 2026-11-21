@@ -83,8 +83,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use craft_collab::{ClientMsg, Hub, Live, LiveError, Replica, ServerMsg, Work};
+use craft_collab::{ClientMsg, Hub, Live, LiveError, LockEvent, Replica, ServerMsg, Work};
 use serde_json::{Value, json};
+
+pub mod ordered;
 
 /// An in-memory relay for host tests; feature `test-util`, never in a release build.
 #[cfg(any(test, feature = "test-util"))]
@@ -285,6 +287,10 @@ struct Seen {
     stale: bool,
     /// A join was just seen: the submits sent before the next poll are the resend.
     resending: bool,
+    /// What the relay said about lock scopes since the app last took it, oldest first. Read
+    /// here, in the order the messages arrive, so a join empties exactly what came before it
+    /// (the old link's answers), however the poll batches them.
+    lock_events: Vec<LockEvent>,
 }
 
 impl Seen {
@@ -321,7 +327,17 @@ impl Seen {
             self.confirmed = self.confirmed.max(Some(*seq));
         }
         match m {
+            ServerMsg::LockGranted { scope, seq, .. } => self.lock_events.push(LockEvent::Granted { scope: scope.clone(), seq: *seq }),
+            ServerMsg::LockDenied { scope, holder, .. } => self.lock_events.push(LockEvent::Denied { scope: scope.clone(), holder: holder.clone() }),
+            ServerMsg::LockReleased { scope, .. } => self.lock_events.push(LockEvent::Released { scope: scope.clone() }),
+            // This peer's own take is not somebody else's.
+            ServerMsg::PresenceLock { scope, holder, .. } if self.me.as_ref() != Some(holder) => {
+                self.lock_events.push(LockEvent::HeldByOther { scope: scope.clone(), holder: holder.clone() });
+            }
             ServerMsg::Joined { peer, seq, space, replay_until, fallback, .. } => {
+                // The relay released this peer's locks with the old link and told nobody here:
+                // every lock answer heard before this join is stale.
+                self.lock_events.clear();
                 // What was sent before is never ordered under these counters now: `Live` sends
                 // it again, merged, as it handles the join.
                 if !self.pending.is_empty() {
@@ -605,6 +621,33 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         self.live.applied()
     }
 
+    /// Ask the relay for `scope`; the answer comes back through [`take_lock_events`](Self::take_lock_events).
+    pub fn lock(&mut self, scope: &str) -> craft_collab::Result<()> {
+        self.live.lock(scope)
+    }
+
+    /// Give `scope` back. Do it only once [`local_settled`](Self::local_settled): a lock released
+    /// ahead of the holder's own edit lets the next holder run on stale state.
+    pub fn unlock(&mut self, scope: &str) -> craft_collab::Result<()> {
+        self.live.unlock(scope)
+    }
+
+    /// What the relay said about locks since the last call, oldest first. A rejoin drops every
+    /// answer that came before it, taken or not yet taken, even within one poll: the relay
+    /// released this peer's locks with the old link, so a grant from it is never handed out.
+    /// What came after the join is kept. Feed these to `Ordered::on_lock`, then call
+    /// `Ordered::rejoined` if the link rejoined; the order does not matter for correctness.
+    pub fn take_lock_events(&mut self) -> Vec<LockEvent> {
+        std::mem::take(&mut lock(&self.seen).lock_events)
+    }
+
+    /// Every local edit has been ordered by the relay: none still in the engine's queue, none
+    /// sent and unanswered, none refused for now or waiting to be sent again after a rejoin.
+    /// Tracked by update, so a resend under a new counter does not leave the old one counted.
+    pub fn local_settled(&self) -> bool {
+        lock(&self.shared).queue.is_empty() && self.live.unconfirmed_edits() == 0 && !lock(&self.seen).stale
+    }
+
     /// Whether the host may take edits now: live, connected, with an edit ticket.
     pub fn editable(&self) -> bool {
         matches!(self.status, LiveStatus::Live { .. }) && self.access == Access::Edit && self.live.connected() && self.live.ready_to_type()
@@ -756,7 +799,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
-            // Lock events are for an app that takes locks (the structure lock, task C3).
+            // Lock answers are read off the wire in `Seen`, in order with the joins.
             Work::Lock(_) => {}
             // The relay lost the room's history. A replica that held a settled state goes on
             // (the saver checkpoints it at once, see `take_history_lost`); one that held nothing

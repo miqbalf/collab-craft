@@ -482,6 +482,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         Ok(changes)
     }
 
+    /// How many local edit updates the relay has not ordered yet, counting one the relay refused
+    /// for now and one waiting to be sent again after a rejoin. Tracked by update, not by wire
+    /// counter: a resend takes a new counter, and the old one is gone.
+    pub fn unconfirmed_edits(&self) -> usize {
+        self.unconfirmed.len()
+    }
+
     /// The highest relay sequence applied to the replica in order. An op that arrived ahead of
     /// a gap is held, not counted, until the ops before it have been applied.
     pub fn applied(&self) -> u64 {
