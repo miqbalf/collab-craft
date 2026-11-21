@@ -2065,8 +2065,8 @@ mod fixwave {
     }
 
     /// C1: a room made past history it does not hold (the relay restarted, or the room was
-    /// dropped after its grace period) says so, and gives a fresh joiner nothing to lay over the
-    /// file, even once edits were made in it. A replica resuming inside its history is replayed
+    /// dropped after its grace period) says so. A joiner before it gets the room's own edits as
+    /// fallback text, never as a starting point to lay over the file. A replica resuming inside its history is replayed
     /// as before. The first snapshot ordered in the room is what a fresh joiner then starts
     /// from, and the save after it ends the loss.
     #[test]
@@ -2079,8 +2079,12 @@ mod fixwave {
         assert_eq!(fresh, crate::CatchUp { seq: 40, replay: Vec::new(), texts: Vec::new(), history_lost: true });
 
         r.submit(41, crdt("doc", json!(["AA=="]), false)).unwrap();
+        // N1: the room's own edits go out as the fallback text, so a replica that held the
+        // document merges them. They are not a starting point: no snapshot, and the joiner is
+        // told the history is lost, so a fresh replica waiting for the snapshot drops them.
         let fresh = crate::catch_up(&r, r.saved_seq());
-        assert!(fresh.history_lost && fresh.texts.is_empty() && fresh.replay.is_empty(), "edits since are not a starting point: {fresh:?}");
+        assert!(fresh.history_lost && fresh.replay.is_empty(), "{fresh:?}");
+        assert_eq!(fresh.texts, vec![("doc".to_owned(), vec![json!("AA==")], true, false)], "the room's own edits, not a snapshot");
         assert_eq!(fresh.seq, 41);
         let resumed = crate::catch_up(&r, 40);
         assert!(resumed.history_lost, "a resuming replica is told too, so a saver checkpoints");
@@ -2159,5 +2163,48 @@ mod fixwave {
         let reconnect: craft_collab::ServerMsg =
             craft_collab::decode(&serde_json::json!({"t": "error", "doc": "d", "detail": "x", "code": "retry"}).to_string()).unwrap();
         assert_eq!(reconnect.refuses_connection(), None, "a transient refusal of the connection is reconnected past");
+    }
+}
+
+/// Minor 11: no `RUST_LOG` value lets the transport crates trace at `debug`.
+mod log_cap {
+    use tracing::Level;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn transport_debug(rust_log: &str) -> bool {
+        let subscriber = tracing_subscriber::registry().with(crate::log_filter(rust_log).expect("parses"));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("handshake");
+            let _in = span.enter();
+            tracing::event_enabled!(target: "socketioxide::client", Level::DEBUG)
+                || tracing::event_enabled!(target: "engineioxide::socket", Level::DEBUG)
+                || tracing::event_enabled!(target: "socketioxide", Level::DEBUG)
+        })
+    }
+
+    #[test]
+    fn no_rust_log_value_lifts_the_transport_cap() {
+        for rust_log in [
+            "",
+            "debug",
+            "trace",
+            "socketioxide=debug",
+            "engineioxide=trace",
+            "socketioxide::client=debug",
+            "engineioxide::socket=trace,debug",
+            "[handshake]=debug",
+            "socket=debug",
+        ] {
+            assert!(!transport_debug(rust_log), "RUST_LOG={rust_log:?} lifted the cap");
+        }
+    }
+
+    #[test]
+    fn other_directives_still_apply() {
+        let subscriber = tracing_subscriber::registry().with(crate::log_filter("tower_http=debug").expect("parses"));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::event_enabled!(target: "tower_http::trace", Level::DEBUG));
+            assert!(tracing::event_enabled!(target: "socketioxide", Level::INFO));
+        });
     }
 }

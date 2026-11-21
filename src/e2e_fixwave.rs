@@ -125,6 +125,54 @@ async fn e2e_a_relay_restart_loses_the_history_and_the_saver_recovers_it() {
     recover_from_a_lost_history(&h, &room, &doc, w, &file).await;
 }
 
+/// N1: after a restart and before any snapshot, a replica that held the document and rejoins
+/// late still gets what the room ordered since the restart. Alice (settled) is back first and
+/// types; bob (settled, his link down a while longer) rejoins after that and must converge
+/// with her, as the fallback text brought a late rejoiner before the restart was detected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_survivor_rejoining_late_after_a_restart_gets_the_rooms_own_edits() {
+    let Some(h) = start().await else { return };
+    let room = unique_room("late-survivor");
+    let doc = format!("doc:{room}");
+    let p = crate::e2e_reconnect::proxy(relay_addr(&h), Duration::from_secs(3)).await;
+    let mut a = LivePeer::open(&h.url, &ticket(&room, "alice", now()), &doc, "hello").await;
+    let mut b = LivePeer::open(&p.url, &ticket(&room, "bob", now()), &doc, "hello").await;
+    a.insert(5, " world");
+    assert!(until_both(&mut a, &mut b, Duration::from_secs(10), |a, b| a.text() == "hello world" && b.text() == a.text()).await);
+
+    // The restart: every room gone, every socket closed, and bob's link down for 3 s.
+    h.relay.rooms.lock().await.clear();
+    p.cut.notify_one();
+    h.io.disconnect().await.expect("the relay closes every socket");
+    let bob_joins = p.accepted.load(Ordering::SeqCst);
+
+    assert!(a.until(Duration::from_secs(10), |live, work| lost(work) && live.ready_to_type()).await, "{:?}", a.work);
+    assert!(!a.live.awaiting_snapshot());
+    let before = seq_of(&h, &room).await;
+    a.insert(0, ">");
+    assert!(a.until(Duration::from_secs(5), move |live, _| live.applied() > before).await, "alice's edit was not ordered");
+    assert_eq!(p.accepted.load(Ordering::SeqCst), bob_joins, "bob rejoined before alice typed; the test proves nothing");
+    assert_eq!(history_lost_in_room(&h, &room).await, Some(true), "no snapshot yet");
+
+    assert!(b.until(Duration::from_secs(20), |_, work| lost(work)).await, "bob was not told: {:?}", b.work);
+    assert!(!b.live.awaiting_snapshot(), "bob held the document before");
+    assert!(
+        until_both(&mut a, &mut b, Duration::from_secs(10), |a, b| b.text() == a.text()).await,
+        "bob missed the room's own edits: alice {:?}, bob {:?}",
+        a.text(),
+        b.text()
+    );
+    assert_eq!(b.text(), ">hello world");
+    b.insert(0, "[b]");
+    assert!(
+        until_both(&mut a, &mut b, Duration::from_secs(10), |a, b| a.text() == b.text() && a.text().starts_with("[b]")).await,
+        "alice {:?}, bob {:?}",
+        a.text(),
+        b.text()
+    );
+}
+
 /// C1: the room is dropped after its grace period while its only peer is away. The same loss,
 /// without a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

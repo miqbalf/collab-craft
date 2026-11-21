@@ -439,18 +439,37 @@ struct ErrorMsg {
 /// own room keys so one can be cleared without touching the other.
 const PREFIX_SERVICE: &str = "collabcraft:svc";
 
+/// Crates whose `debug` traces carry the handshake, and so the ticket. Always held at `info`.
+const CAPPED_LOG_TARGETS: [&str; 2] = ["socketioxide", "engineioxide"];
+
+/// The log filter for a `RUST_LOG` value. The transport crates are held at `info` whatever it
+/// says: at `debug` they trace handshakes, and a handshake's auth carries the ticket. A
+/// directive naming one of them or a module inside one, or filtering by span (which can enable
+/// events of any target inside that span), is dropped before the caps are added, so no
+/// directive can be more specific than the cap.
+fn log_filter(rust_log: &str) -> Result<tracing_subscriber::EnvFilter, tracing_subscriber::filter::ParseError> {
+    let kept: Vec<&str> = rust_log
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.contains('['))
+        .filter(|d| {
+            let target = d.split('=').next().unwrap_or_default();
+            !CAPPED_LOG_TARGETS.iter().any(|capped| target.starts_with(capped))
+        })
+        .collect();
+    let mut filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+        .parse_lossy(kept.join(","))
+        .add_directive("collabcraft_relay=info".parse()?);
+    for capped in CAPPED_LOG_TARGETS {
+        filter = filter.add_directive(format!("{capped}=info").parse()?);
+    }
+    Ok(filter)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        // The transport crates are held at info whatever RUST_LOG says: at debug they trace
-        // handshakes, and a handshake's auth carries the ticket.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("collabcraft_relay=info".parse()?)
-                .add_directive("socketioxide=info".parse()?)
-                .add_directive("engineioxide=info".parse()?),
-        )
-        .init();
+    tracing_subscriber::fmt().with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default())?).init();
 
     let secret = std::env::var("COLLABCRAFT_SECRET").map_err(|_| {
         "COLLABCRAFT_SECRET is not set. It must match the collabcraft app's relay_secret, \
@@ -932,29 +951,42 @@ struct CatchUp {
 /// A baseline before this room's own history (the relay restarted, or the room was dropped
 /// after its grace period) is different: what this room retained builds on ops it no longer
 /// has, so it cannot be laid over the file. Such a joiner starts from a snapshot ordered in
-/// this room when there is one, and otherwise gets nothing and is told the history is lost.
+/// this room when there is one, and otherwise gets the room's own retained text as the
+/// fallback and is told the history is lost: a replica that held the document merges it, and a
+/// fresh one waits for the snapshot.
 ///
 /// Scopes that would tell a joiner nothing (complete and empty, as a save leaves them) are not
 /// sent, so they do not take a message each.
 fn catch_up(room: &Room, baseline: u64) -> CatchUp {
     let history_lost = room.history_lost();
     if baseline < room.inherited() && room.saved_seq() < room.inherited() {
-        let texts = room.texts_from_snapshot().into_iter().map(|(scope, ops)| (scope, ops, true, true)).collect();
+        // With no snapshot yet, the room's own ops go out as the ordinary fallback text. A
+        // replica that held the document before merges them (they build on what it has); a
+        // fresh one waiting for the snapshot drops them.
+        let texts = if history_lost {
+            retained_texts(room)
+        } else {
+            room.texts_from_snapshot().into_iter().map(|(scope, ops)| (scope, ops, true, true)).collect()
+        };
         return CatchUp { seq: room.seq(), replay: Vec::new(), texts, history_lost };
     }
     match room.since(baseline) {
         Some(replay) => CatchUp { seq: baseline, replay, texts: Vec::new(), history_lost },
-        None => {
-            let mut texts: Vec<(String, Vec<serde_json::Value>, bool, bool)> = room
-                .texts()
-                .iter()
-                .filter(|(_, log)| !log.is_idle())
-                .map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete(), log.starts_with_snapshot()))
-                .collect();
-            texts.sort_by(|a, b| a.0.cmp(&b.0));
-            CatchUp { seq: room.seq(), replay: Vec::new(), texts, history_lost }
-        }
+        None => CatchUp { seq: room.seq(), replay: Vec::new(), texts: retained_texts(room), history_lost },
     }
+}
+
+/// The room's retained text per scope, as the fallback catch-up sends it, without the scopes
+/// that would tell a joiner nothing.
+fn retained_texts(room: &Room) -> Vec<(String, Vec<serde_json::Value>, bool, bool)> {
+    let mut texts: Vec<(String, Vec<serde_json::Value>, bool, bool)> = room
+        .texts()
+        .iter()
+        .filter(|(_, log)| !log.is_idle())
+        .map(|(scope, log)| (scope.clone(), log.ops().to_vec(), log.complete(), log.starts_with_snapshot()))
+        .collect();
+    texts.sort_by(|a, b| a.0.cmp(&b.0));
+    texts
 }
 
 async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): State<Arc<Relay>>) {

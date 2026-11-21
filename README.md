@@ -322,8 +322,10 @@ Phase 1 of live co-editing ships with these. Each is a decision, not an oversigh
   120 s (`ROOM_GRACE`), then dropped. After a relay restart, or once a room was dropped, the
   relay marks every join to it `history_lost` until somebody checkpoints: a replica that held
   nothing before refuses edits and waits for a snapshot, and the document service's saver
-  checkpoints at once if it still holds the document. If no replica that held it is still
-  running, the unsaved edits since the last save are gone and the file is reopened. Persisting
+  checkpoints at once if it still holds the document. A replica that held the document and
+  rejoins before that snapshot still gets the room's own edits since the restart. The unsaved
+  edits are lost if the saver did not survive. Editors' windows still hold them; they go Broken
+  and can download a copy. Persisting
   the snapshot and the tail in Valkey is the real fix, for a later phase.
 - **The service identity is a ticket `uid`.** The relay trusts any ticket whose `uid` is
   `COLLABCRAFT_SERVICE_UID` (default `craft_office`) to checkpoint and to report saves. The
@@ -343,12 +345,24 @@ Phase 1 of live co-editing ships with these. Each is a decision, not an oversigh
 - **A join copies the retained text under the relay-wide rooms lock.** Bounded by the room's text
   budget, but a join to a room near it briefly delays other rooms' bookkeeping.
 - **Transport crates are held at `info` logging.** At `debug` socketioxide and engineioxide trace
-  handshakes, which carry the ticket, so the relay caps both at `info` whatever `RUST_LOG` says.
-  A build that removes that cap must not run at `debug` in production.
+  handshakes, which carry the ticket, so the relay caps both at `info` whatever `RUST_LOG` says:
+  a `RUST_LOG` directive naming either crate or a module inside one, or filtering by span, is
+  dropped before the cap is added (`log_filter` in `src/main.rs`, with tests). A build that
+  removes that cap must not run at `debug` in production.
 - **A peer that vanished is reaped at the ping timeout.** engine.io pings every 25 s and waits
   90 s for the answer, so that a pong queued behind a large checkpoint on a slow uplink still
   arrives. A socket whose TCP connection died without a close is noticed by the relay only then.
 - **One user holds at most 16 connections to one document**, and a document at most 256.
+- **Single relay process only.** Room state is per process, so several relay processes behind
+  one Valkey are unsupported, and `history_lost` misfires there.
+- **A sequence number burned in Valkey leaves a gap.** When `INCR` succeeded but its reply timed
+  out, nothing is ordered at that number. Peers stall until `MAX_PENDING` and are told to reopen.
+- **A room dropped while its grant is still alive gives the next reopen `history_lost`.** When
+  the room was dropped after the 120 s grace (the worker crashed, everyone left), the fresh
+  editor and worker go Broken after 20 s. The file is complete, so nothing is lost, but the user
+  must reopen once the app's stale job closes the grant.
+- **A refused socket can leave an empty room that no grace timer drops.** A small leak, bounded
+  by the rooms such sockets name.
 - **A joiner at baseline 0 keeps its file seed even if seq 1 is a snapshot.** A first
   checkpoint on an untouched room is ordered at seq 1 and reported as `Saved{0}`, which leaves
   the join baseline at 0, the same as "never saved". Services should checkpoint twice on an
