@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use craft_live::testing::MemRelay;
 use craft_live_worker::{Clock, DocumentService, FileError, Flow, Room, Secret, pinned_source, serve_grant, worker_signature};
-use fake::{AckHub, FakeNextcloud, FakeService, Window, files_for, sha_hex};
+use fake::{FakeNextcloud, FakeService, Window, files_for, sha_hex};
 
 const FILE_BYTES: &[u8] = b"file bytes A";
 const BASE_BYTES: &[u8] = b"base bytes B";
@@ -33,7 +33,7 @@ fn clock() -> Arc<TestClock> {
 /// Open a room on `service`, add an editor who types, and step until the worker has written.
 async fn open_and_save(nc: &FakeNextcloud, service: Arc<FakeService>) -> Vec<(String, Vec<u8>)> {
     let relay = MemRelay::new();
-    let hub = AckHub::new(relay.connect(craft_live_worker::SERVICE_UID, "service", true));
+    let hub = relay.connect(craft_live_worker::SERVICE_UID, "service", true);
     let clock = clock();
     let files = files_for(nc);
     let mut room = Room::open_with(service.clone(), hub, files, clock.clone()).await.expect("room opens");

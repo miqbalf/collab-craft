@@ -595,6 +595,33 @@ fn a_submit_refused_for_now_settles_once_its_resend_is_ordered() {
     assert_eq!(b.line(1), "uno", "the resend was ordered");
 }
 
+/// A submit refused for now leaves no stale count behind: once its resend is ordered and a save
+/// covers it, the window reports its edits saved, with no rejoin needed.
+#[test]
+fn edits_saved_after_a_submit_refused_for_now() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut s = Window::join(&relay, SERVICE_UID, Access::Edit);
+    settle(&mut [&mut a, &mut s]);
+    relay.refuse_next_submits(1);
+    a.set(1, "uno");
+    a.pump();
+    assert!(!a.le.local_settled(), "refused, so not ordered");
+    let mut settled = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        settle(&mut [&mut a, &mut s]);
+        if a.le.local_settled() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the resend was never ordered");
+    s.le.announce_saved(relay.seq(), "e1").unwrap();
+    settle(&mut [&mut a, &mut s]);
+    assert!(a.le.edits_saved(), "the refused counter still counts as an unsaved edit");
+}
+
 /// The relay's order for the run's edit has been read but the edit is still in the engine's
 /// queue (not flushed): not settled, whatever the order the app calls things in.
 #[test]

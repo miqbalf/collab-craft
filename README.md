@@ -312,6 +312,30 @@ is without waiting for them to move. It needs no edit permission, because
 somebody watching a design should still be able to say where they are looking.
 Nothing ephemeral is ordered, replayed or journaled.
 
+## Live API notes: scope locks and the pinned base (M1)
+
+Public items added to the Rust crates, all additive (an older relay or client ignores them):
+
+- **Wire.** `lock_granted` carries `seq`, the room's sequence when the lock was granted. A
+  missing `seq` parses as `None`. The relay no longer records a grant for a peer that left while
+  it waited.
+- **`craft-collab`.** `Effect::LockHeld { scope, seq }` (was `LockHeld { scope }`) and
+  `Effect::LockBusy { scope, holder }`, raised with `RemoteLocks` when somebody else just took
+  a scope. `Live::unconfirmed_edits()` counts edit updates the relay has not
+  ordered yet, a resent update counted once. `LockEvent` (`Granted`, `Denied`, `Released`,
+  `HeldByOther`) is exported.
+- **`craft-live`.** `LiveEditing::lock(scope)`, `unlock(scope)`, `take_lock_events()` and
+  `local_settled()`. The `ordered` module: `Ordered<P>` runs one queued item at a time under one
+  scope (`request`, `on_lock`, `poll`, `finish`, `rejoined`), `Polled` (`Nothing`, `Run`, `GaveUp`,
+  `LockLost { scope }`), `Action` and `GIVE_UP_MS`. `edits_saved()` now reads the
+  replica's unconfirmed count, so a submit refused for now no longer reads as unsaved after its
+  resend is ordered. `testing::MemRelay` acknowledges `Saved` with `SavedAck`, as the real relay
+  does.
+- **`craft-live-worker`.** `DocumentService::pinned_base()` and `pinned_source()`: a pinned
+  service opens a room from the base the Nextcloud app pinned for the grant
+  (`X-Craft-Base-Sha256` is checked), keeping the file's name and ETag so the first write stays
+  `If-Match` on the file. A missing or mismatched base closes the room.
+
 ## Known limits
 
 Phase 1 of live co-editing ships with these. Each is a decision, not an oversight.

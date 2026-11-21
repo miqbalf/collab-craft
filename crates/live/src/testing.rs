@@ -327,6 +327,10 @@ impl Relay {
                     }
                 }
             }
+            // The real relay answers a save report to the reporter alone.
+            ClientMsg::Saved { doc, seq } => {
+                conn.inbox.push_back(ServerMsg::SavedAck { doc, seq });
+            }
             // The whole room hears the release, the releaser too, as the real relay does. A peer
             // that does not hold the scope releases nothing.
             ClientMsg::Unlock { scope, .. } if self.locks.iter().any(|(s, h)| *s == scope && *h == at) => {

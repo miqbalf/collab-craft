@@ -10,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use craft_collab::{BlockChange, ClientMsg, Hub, LiveDoc, SeedBlock, ServerMsg};
+use craft_collab::{BlockChange, Hub, LiveDoc, SeedBlock};
 use craft_live::testing::{MemHub, MemRelay, ROOM as RELAY_ROOM};
 use craft_live::{Access, Change, Landed, LiveApp, LiveEditing, LiveKind, LocalError};
 use craft_live_worker::{DocumentService, LiveDocument, Nextcloud, RoomFiles, Secret};
@@ -317,38 +317,5 @@ impl DocumentService for FakeService {
     }
     fn pinned_base(&self) -> bool {
         self.pinned
-    }
-}
-
-/// The service's link: the in-memory relay does not acknowledge save reports (the real relay
-/// does), so this one does, which is what lets a checkpoint finish.
-pub struct AckHub {
-    inner: MemHub,
-    answers: Vec<ServerMsg>,
-}
-
-impl AckHub {
-    pub fn new(inner: MemHub) -> AckHub {
-        AckHub { inner, answers: Vec::new() }
-    }
-}
-
-impl Hub for AckHub {
-    fn send(&mut self, msg: ClientMsg) -> craft_collab::Result<()> {
-        if let ClientMsg::Saved { doc, seq } = &msg {
-            self.answers.push(ServerMsg::SavedAck { doc: doc.clone(), seq: *seq });
-        }
-        self.inner.send(msg)
-    }
-    fn poll(&mut self) -> Vec<ServerMsg> {
-        let mut out = self.inner.poll();
-        out.append(&mut self.answers);
-        out
-    }
-    fn connected(&self) -> bool {
-        self.inner.connected()
-    }
-    fn set_token(&mut self, token: String) {
-        self.inner.set_token(token);
     }
 }

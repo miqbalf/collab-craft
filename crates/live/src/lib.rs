@@ -301,9 +301,11 @@ impl Seen {
     }
 
     /// Whether a save through `saved` holds every edit this replica made: each one the relay
-    /// ordered is at or before it, and none is waiting to be ordered or sent again.
-    fn covered(&self, saved: Option<u64>) -> bool {
-        !self.stale && self.pending.is_empty() && self.confirmed.is_none_or(|c| saved.is_some_and(|s| c <= s))
+    /// ordered is at or before it, and none is waiting to be ordered or sent again. `unconfirmed`
+    /// is the replica's count of edit updates the relay has not ordered: tracked by update, so a
+    /// submit refused for now and sent again under a new counter is counted once.
+    fn covered(&self, saved: Option<u64>, unconfirmed: usize) -> bool {
+        !self.stale && unconfirmed == 0 && self.confirmed.is_none_or(|c| saved.is_some_and(|s| c <= s))
     }
 
     /// An edit submit went out.
@@ -669,7 +671,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// sent again, and none was kept back from the room. False means the document has edits
     /// only this window holds, which reopening the file would lose.
     pub fn edits_saved(&self) -> bool {
-        !self.lost && lock(&self.seen).covered(self.saved.as_ref().map(|(seq, _)| *seq))
+        !self.lost && lock(&self.seen).covered(self.saved.as_ref().map(|(seq, _)| *seq), self.live.unconfirmed_edits())
     }
 
     /// Lines for the user since the last call, in plain English (untranslated).
