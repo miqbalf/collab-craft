@@ -1577,3 +1577,30 @@ fn a_resend_past_the_cap_goes_in_pieces() {
     }
     assert_eq!(other.block(1).unwrap().text, live.doc().unwrap().block(1).unwrap().text);
 }
+
+#[test]
+fn applied_counts_only_ops_in_order() {
+    let alice_hub = FakeHub::default();
+    let bob_hub = FakeHub::default();
+    let mut alice = Live::new(alice_hub.clone(), "d");
+    let mut bob = Live::new(bob_hub.clone(), "d");
+    alice.seed(&sample()).unwrap();
+    bob.seed(&sample()).unwrap();
+    alice_hub.0.borrow_mut().inbox.push(joined("alice", 1));
+    bob_hub.0.borrow_mut().inbox.push(joined("bob", 2));
+    alice.pump();
+    bob.pump();
+    let mut edits = Vec::new();
+    for at in [0, 1] {
+        alice.edit(|d| d.insert_text(4, at, "x", &Map::new())).unwrap();
+        let Some(ClientMsg::Submit { params, .. }) = alice_hub.0.borrow_mut().sent.pop() else { panic!("no submit") };
+        edits.push(params);
+    }
+    // The relay broadcast them out of order: 2 first, alone.
+    bob_hub.0.borrow_mut().inbox.push(op(2, "alice", None, edits[1].clone()));
+    bob.pump();
+    assert_eq!(bob.applied(), 0, "op 2 is held until op 1 is in");
+    bob_hub.0.borrow_mut().inbox.push(op(1, "alice", None, edits[0].clone()));
+    bob.pump();
+    assert_eq!(bob.applied(), 2);
+}
