@@ -246,6 +246,9 @@ pub enum ServerMsg {
     LockGranted {
         doc: DocId,
         scope: Scope,
+        /// The room's sequence when the lock was granted. Absent from an older relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     /// Refused, with whoever holds it so the UI can say who.
     LockDenied {

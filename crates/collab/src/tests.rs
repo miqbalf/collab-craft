@@ -312,10 +312,25 @@ fn a_snapshot_replaces_everything_and_resets() {
 #[test]
 fn a_granted_lock_is_held() {
     let mut s = session();
-    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned() });
-    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned() }]);
+    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
+    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: None }]);
     assert!(s.holds("B2"));
     assert!(s.may_edit("B2"));
+}
+
+#[test]
+fn a_grant_carries_the_room_seq_into_the_effect() {
+    let mut s = session();
+    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: Some(7) });
+    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: Some(7) }]);
+}
+
+#[test]
+fn lock_granted_without_seq_still_parses() {
+    let m = decode(&format!(r#"{{"t":"lock_granted","doc":"{DOC}","scope":"B2"}}"#)).expect("decodes");
+    assert_eq!(m, ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
+    let text = encode_server(&m);
+    assert!(!text.contains("seq"), "an absent seq is omitted: {text}");
 }
 
 #[test]
@@ -331,7 +346,7 @@ fn a_denied_lock_records_the_holder() {
 #[test]
 fn releasing_a_lock_drops_it_locally_at_once() {
     let mut s = session();
-    s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned() });
+    s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
     let msg = s.release_lock("B2");
     assert!(!s.holds("B2"), "a release cannot be refused, so it applies immediately");
     assert_eq!(msg, ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned() });
@@ -405,7 +420,7 @@ fn server_messages_round_trip() {
     let msgs = vec![
         joined(3),
         op(4, "bob", Some(1), "B2"),
-        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned() },
+        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None },
         ServerMsg::LockDenied { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "bob".to_owned() },
         ServerMsg::LockReleased { doc: DOC.to_owned(), scope: "B2".to_owned() },
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
@@ -503,7 +518,7 @@ fn every_event_name_carries_exactly_one_server_message() {
     let msgs = vec![
         joined(0),
         op(1, "other", None, "B2"),
-        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned() },
+        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None },
         ServerMsg::LockDenied { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::LockReleased { doc: DOC.to_owned(), scope: "B2".to_owned() },
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
@@ -567,4 +582,8 @@ fn a_relay_url_names_its_socket_io_path() {
     assert_eq!(Endpoint::of("https://office.example/craft").url(), "https://office.example/craft/socket.io/");
     assert_eq!(Endpoint::of("http://host/craft?x=1").url(), "http://host/craft/socket.io/?x=1");
     assert_eq!(Endpoint::of("http://host").url(), "http://host/socket.io/");
+}
+
+fn encode_server(m: &ServerMsg) -> String {
+    serde_json::to_string(m).expect("encodes")
 }

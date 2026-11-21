@@ -756,6 +756,8 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
+            // Lock events are for an app that takes locks (the structure lock, task C3).
+            Work::Lock(_) => {}
             // The relay lost the room's history. A replica that held a settled state goes on
             // (the saver checkpoints it at once, see `take_history_lost`); one that held nothing
             // waits for the snapshot (`Live::awaiting_snapshot`), see `update_status`.
