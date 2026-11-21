@@ -414,6 +414,12 @@ impl<H: Hub> Live<H> {
         Ok(changes)
     }
 
+    /// The highest relay sequence applied to the replica in order. An op that arrived ahead of
+    /// a gap is held, not counted, until the ops before it have been applied.
+    pub fn applied(&self) -> u64 {
+        self.wire.applied()
+    }
+
     /// Whether the relay has granted an id space and the document is loaded and sound.
     /// Editing is refused until all three hold.
     pub fn ready_to_type(&self) -> bool {
