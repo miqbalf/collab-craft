@@ -25,6 +25,12 @@ struct Harness {
 }
 
 async fn start() -> Option<Harness> {
+    start_pinging(None).await
+}
+
+/// The relay, with engine.io pinging every `ping` and giving up after as long again, so a
+/// test controls when a dead socket is reaped.
+async fn start_pinging(ping: Option<Duration>) -> Option<Harness> {
     let valkey = std::env::var("REVIEW_VALKEY_URL").ok()?;
     let mut bus = Bus::connect(&valkey).await.expect("valkey");
     bus.check_writable().await.expect("writable");
@@ -36,7 +42,11 @@ async fn start() -> Option<Harness> {
         rooms: Mutex::new(Default::default()),
         gates: Default::default(),
     });
-    let (layer, io) = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES).with_state(relay.clone()).build_layer();
+    let mut builder = crate::sized(SocketIo::builder(), crate::room::TEXT_BYTES);
+    if let Some(ping) = ping {
+        builder = builder.ping_interval(ping).ping_timeout(ping);
+    }
+    let (layer, io) = builder.with_state(relay.clone()).build_layer();
     io.ns("/", on_connect);
     let app = axum::Router::new().layer(layer);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -66,6 +76,23 @@ async fn link_is(peer: &mut LivePeer, up: bool) -> bool {
 
 fn shows(live: &Live<NativeHub>, text: &str) -> bool {
     live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == text)
+}
+
+/// Poll both peers until `done` holds for them, as an app pumps every frame. A link counts as
+/// up on the relay's CONNECT, and the Joined that makes a replica send its unconfirmed edits
+/// again may still be in its inbox then: only a replica that is polled handles it.
+async fn until_both(a: &mut LivePeer, b: &mut LivePeer, d: Duration, done: impl Fn(&LivePeer, &LivePeer) -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + d;
+    loop {
+        a.until(Duration::from_millis(25), |_, _| false).await;
+        b.until(Duration::from_millis(25), |_, _| false).await;
+        if done(a, b) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 async fn seq_of(h: &Harness, room: &str) -> u64 {
@@ -194,6 +221,43 @@ async fn e2e_a_half_open_link_is_noticed_and_reconnects() {
     assert!(a.until(Duration::from_secs(10), |live, _| shows(live, ">hello!")).await, "alice has {:?}", a.text());
 }
 
+/// The socket a half-open link left behind is reaped only after the hub has reconnected. Its
+/// close must not take the peer off the roster (a room whose roster empties is saved and
+/// closed), nor tell the others the peer left; and the peer still edits and receives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_stale_socket_closing_late_leaves_the_peer_in_the_room() {
+    let Some(h) = start_pinging(Some(Duration::from_secs(12))).await else { return };
+    let (url, hole) = black_hole(relay_addr(&h)).await;
+    let room = unique_room("stale-socket");
+    let doc = format!("doc:{room}");
+    let mut a = LivePeer::open(&url, &ticket(&room, "alice", now()), &doc, "hello").await;
+    let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
+    assert!(b.until(Duration::from_secs(5), |live, _| live.roster.iter().any(|(p, _)| p == "alice")).await);
+
+    hole.notify_one();
+    assert!(a.until(Duration::from_secs(20), |live, _| !live.hub().connected()).await, "the half-open link was never noticed");
+    assert!(link_is(&mut a, true).await, "alice never came back");
+    // The relay now holds alice twice: the new socket, and the old one until it is reaped.
+    // Reaped after two pings of 12 s, so after alice's hub noticed and reconnected (at most
+    // 15 s): that is the order a half-open link takes in a deployment as well.
+    let reaped = tokio::time::Instant::now() + Duration::from_secs(40);
+    while h.io.sockets().len() > 2 && tokio::time::Instant::now() < reaped {
+        b.until(Duration::from_millis(100), |_, _| false).await;
+        assert!(b.live.roster.iter().any(|(p, _)| p == "alice"), "bob was told alice left");
+    }
+    assert_eq!(h.io.sockets().len(), 2, "the stale socket was reaped");
+    b.until(Duration::from_millis(500), |_, _| false).await;
+    assert!(b.live.roster.iter().any(|(p, _)| p == "alice"), "bob was told alice left");
+    let peers: Vec<String> = h.relay.rooms.lock().await.get(&room).map(|r| r.peers().iter().map(|p| p.peer.clone()).collect()).unwrap_or_default();
+    assert!(peers.contains(&"alice".to_owned()), "the relay dropped alice: {peers:?}");
+
+    a.insert(5, "!");
+    assert!(b.until(Duration::from_secs(10), |live, _| shows(live, "hello!")).await, "bob has {:?}", b.text());
+    b.insert(0, ">");
+    assert!(a.until(Duration::from_secs(10), |live, _| shows(live, ">hello!")).await, "alice has {:?}", a.text());
+}
+
 fn relay_addr(h: &Harness) -> SocketAddr {
     h.url.trim_start_matches("http://").parse().unwrap()
 }
@@ -219,7 +283,7 @@ async fn e2e_a_dropped_link_reconnects_and_the_outage_edit_lands_once() {
     assert!(link_is(&mut a, false).await, "alice never saw the link drop");
     a.insert(5, "!");
     assert!(link_is(&mut a, true).await, "alice never came back");
-    assert!(b.until(Duration::from_secs(10), |live, _| shows(live, "hello!")).await, "bob has {:?}", b.text());
+    assert!(until_both(&mut a, &mut b, Duration::from_secs(10), |_, b| shows(&b.live, "hello!")).await, "bob has {:?}", b.text());
     assert!(a.until(Duration::from_secs(5), |live, _| shows(live, "hello!")).await, "alice has {:?}", a.text());
     a.until(Duration::from_millis(500), |_, _| false).await;
     assert_eq!(seq_of(&h, &room).await - before, 1, "the outage edit was ordered exactly once");
@@ -251,9 +315,7 @@ async fn e2e_a_hub_closed_by_the_relay_reconnects_and_converges() {
     assert_eq!(h.io.sockets().len(), 2, "both hubs reconnected");
     assert!(link_is(&mut a, true).await && link_is(&mut b, true).await);
     b.insert(6, "?");
-    for peer in [&mut a, &mut b] {
-        peer.until(Duration::from_secs(10), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text.chars().count() == 8)).await;
-    }
+    until_both(&mut a, &mut b, Duration::from_secs(10), |a, b| a.text().chars().count() == 8 && b.text().chars().count() == 8).await;
     assert!(a.text() == b.text() && (a.text() == ">hello?!" || a.text() == ">hello!?"), "alice {:?}, bob {:?}", a.text(), b.text());
 }
 
@@ -289,8 +351,19 @@ async fn e2e_a_refused_ticket_stops_reconnecting_until_a_new_one() {
     a.insert(5, "!");
 
     a.live.hub_mut().set_token(ticket(&room, "alice", now()));
+    let from = a.work.len();
     assert!(link_is(&mut a, true).await, "a fresh ticket did not bring the link back");
-    assert!(b.until(Duration::from_secs(10), |live, _| shows(live, "hello!")).await, "bob has {:?}", b.text());
+    let arrived = until_both(&mut a, &mut b, Duration::from_secs(10), |_, b| shows(&b.live, "hello!")).await;
+    assert!(
+        arrived,
+        "bob has {:?} (connected {}); alice has {:?}, relay seq {}, sockets {}, alice's work since the new ticket: {:?}",
+        b.text(),
+        b.live.hub().connected(),
+        a.text(),
+        seq_of(&h, &room).await,
+        h.io.sockets().len(),
+        &a.work[from..]
+    );
 }
 
 /// A hub dropped during an outage ends its task: nothing joins on its behalf once the link

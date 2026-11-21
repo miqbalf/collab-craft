@@ -715,7 +715,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let joined = {
         let room = relay.room(&mut rooms, &room_key);
         room.observe_seq(retained_seq);
-        match room.join(Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit() }) {
+        match room.join_as(Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit() }, &socket.id.to_string()) {
             Ok(()) => {
                 for (scope, holder) in &locks {
                     room.record_holder(scope.clone(), holder.clone());
@@ -1250,10 +1250,17 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
     }
     let room_name = claims.room();
 
-    let (dropped, roster, empty) = {
+    let (dropped, gone, roster, empty) = {
         let mut rooms = relay.rooms.lock().await;
         let Some(room) = rooms.get_mut(&claims.rm) else { return };
-        let dropped = room.leave(&claims.pid);
+        // Keyed by this socket: a socket the peer has already replaced (a half-open link that
+        // only now timed out) leaves nothing and tells nobody, so the roster never loses a
+        // peer who is still connected, and a room is never closed with editors in it.
+        let Some(left) = room.leave_as(&claims.pid, &socket.id.to_string()) else {
+            tracing::debug!(peer = %claims.pid, room = %claims.rm, "a replaced socket closed");
+            return;
+        };
+        let (dropped, gone) = (left.dropped, left.gone);
         let roster = room.peers().to_vec();
         let empty = room.is_empty();
         if empty {
@@ -1263,7 +1270,7 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
             rooms.remove(&claims.rm);
             relay.forget_gate(&claims.rm);
         }
-        (dropped, roster, empty)
+        (dropped, gone, roster, empty)
     };
 
     // Releasing on disconnect is what makes a lock safe to take at all. One
@@ -1283,7 +1290,7 @@ async fn on_disconnect(socket: SocketRef, State(relay): State<Arc<Relay>>) {
         emit_live(socket.to(room_name.clone()), "lock_released", &serde_json::json!({ "doc": room_name, "scope": scope }));
     }
 
-    if !empty {
+    if gone && !empty {
         emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
     }
 

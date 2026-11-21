@@ -8,7 +8,7 @@
 //! No IO. The socket layer calls these methods and emits whatever comes back,
 //! so every rule below is testable without a connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -148,6 +148,15 @@ impl Refusal {
     }
 }
 
+/// What [`Room::leave_as`] released.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Left {
+    /// The scopes the peer held, released.
+    pub dropped: Vec<String>,
+    /// The peer's last connection left, so it is off the roster.
+    pub gone: bool,
+}
+
 /// Retained CRDT operations for one scope.
 #[derive(Default)]
 pub struct TextLog {
@@ -281,8 +290,13 @@ pub struct Room {
     /// A client that reconnects reuses its token, so the same peer id opens a
     /// second socket before the first is reaped. Keyed on the peer id rather
     /// than the socket, a peer stays in the room while any connection holds it,
-    /// and the old socket's disconnect cannot evict the live one.
-    conns: HashMap<String, usize>,
+    /// and the old socket's disconnect cannot evict the live one. Each connection is named
+    /// (the relay uses the socket id), so a leave from a connection the room does not hold
+    /// for that peer, a stale one or a repeated one, changes nothing.
+    conns: HashMap<String, HashSet<String>>,
+    /// Names [`Room::join`] makes up for callers that do not name the connection.
+    #[cfg(test)]
+    unnamed: u64,
     /// scope -> holder.
     locks: HashMap<String, String>,
     /// Bytes of `params` currently held in [`Room::history`].
@@ -369,12 +383,20 @@ impl Room {
     /// is reaped. That counts as a second connection rather than a replacement,
     /// so the peer survives the old socket's later disconnect. The roster entry
     /// is refreshed to the newest connection's display and edit right.
+    #[cfg(test)]
     pub fn join(&mut self, peer: Peer) -> Result<(), Refusal> {
+        self.unnamed += 1;
+        let conn = format!("#{}", self.unnamed);
+        self.join_as(peer, &conn)
+    }
+
+    /// [`Room::join`] by the connection named `conn`, which [`Room::leave_as`] names again.
+    pub fn join_as(&mut self, peer: Peer, conn: &str) -> Result<(), Refusal> {
         let already = self.peers.iter().any(|p| p.peer == peer.peer);
         if !already && self.peers.len() >= MAX_PEERS {
             return Err(Refusal::Full);
         }
-        *self.conns.entry(peer.peer.clone()).or_insert(0) += 1;
+        self.conns.entry(peer.peer.clone()).or_default().insert(conn.to_owned());
         self.peers.retain(|p| p.peer != peer.peer);
         self.peers.push(peer);
         Ok(())
@@ -452,18 +474,35 @@ impl Room {
     /// its ephemeral state and its locks are released only when the last
     /// connection leaves. An old socket's disconnect decrements the count and
     /// returns nothing.
+    #[cfg(test)]
     pub fn leave(&mut self, peer_id: &str) -> Vec<String> {
-        match self.conns.get_mut(peer_id) {
-            Some(count) if *count > 1 => {
-                *count -= 1;
-                return Vec::new();
-            }
-            Some(_) => {
-                self.conns.remove(peer_id);
-            }
-            // No tracked connection. Fall through and clean up defensively.
-            None => {}
+        let conn = self.conns.get(peer_id).and_then(|conns| conns.iter().next().cloned());
+        match conn {
+            Some(conn) => self.leave_as(peer_id, &conn).map(|left| left.dropped).unwrap_or_default(),
+            None => self.release(peer_id),
         }
+    }
+
+    /// Drop the connection `conn` of `peer_id`.
+    ///
+    /// `None` when the room holds no such connection for that peer: a socket that was
+    /// replaced and only now timed out, or one that already left. Nothing changes then, and
+    /// nobody should be told the peer left. Otherwise what was released, and whether the
+    /// peer is gone from the room (its last connection left).
+    pub fn leave_as(&mut self, peer_id: &str, conn: &str) -> Option<Left> {
+        let conns = self.conns.get_mut(peer_id)?;
+        if !conns.remove(conn) {
+            return None;
+        }
+        if !conns.is_empty() {
+            return Some(Left { dropped: Vec::new(), gone: false });
+        }
+        self.conns.remove(peer_id);
+        Some(Left { dropped: self.release(peer_id), gone: true })
+    }
+
+    /// Remove a peer and everything it held. Returns the scopes it held.
+    fn release(&mut self, peer_id: &str) -> Vec<String> {
         self.peers.retain(|p| p.peer != peer_id);
         // Their camera and selection go with them. A marker left behind would show somebody
         // looking at a part they are no longer in.
@@ -717,6 +756,25 @@ mod tests {
 
     fn peer(id: &str) -> Peer {
         Peer { peer: id.to_owned(), display: id.to_owned(), may_edit: true }
+    }
+
+    /// A replaced socket that closes late (a half-open link that only now timed out) leaves
+    /// nothing: the peer stays on the roster with its lock, and a leave the room does not hold
+    /// is a no-op however often it comes.
+    #[test]
+    fn a_replaced_connection_leaving_changes_nothing() {
+        let mut r = Room::default();
+        r.join_as(peer("alice"), "old").expect("joins");
+        r.record_holder("B1".to_owned(), "alice".to_owned());
+        r.join_as(peer("alice"), "new").expect("rejoins");
+        assert_eq!(r.leave_as("alice", "old"), Some(Left { dropped: Vec::new(), gone: false }));
+        assert_eq!(r.leave_as("alice", "old"), None, "a second leave of the same socket");
+        assert_eq!(r.leave_as("alice", "never"), None, "a socket the room never held");
+        assert_eq!(r.leave_as("bob", "x"), None, "a peer the room never held");
+        assert!(r.peers().iter().any(|p| p.peer == "alice") && !r.is_empty());
+        assert_eq!(r.holder_of("B1"), Some("alice"));
+        assert_eq!(r.leave_as("alice", "new"), Some(Left { dropped: vec!["B1".to_owned()], gone: true }));
+        assert!(r.is_empty());
     }
 
     #[test]

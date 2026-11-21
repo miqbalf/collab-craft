@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rust_socketio::asynchronous::{Client, ClientBuilder};
-use rust_socketio::{Event, Payload};
+use rust_socketio::{Event, Payload, TransportType};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
@@ -209,7 +209,10 @@ impl Link {
     fn builder(&self, generation: u64) -> ClientBuilder {
         // rust_socketio takes a non-root URL path as the transport path, so it is given the
         // derived one: `https://host/craft` connects to `https://host/craft/socket.io/`.
-        let mut builder = ClientBuilder::new(self.url.clone()).reconnect(false);
+        // Straight to WebSocket. The default starts on long-polling and upgrades, and an emit
+        // made during that upgrade can return Ok and never reach the relay; right after a
+        // rejoin, when the unconfirmed edits go out, that lost them.
+        let mut builder = ClientBuilder::new(self.url.clone()).reconnect(false).transport_type(TransportType::Websocket);
 
         // "error" is in the list because the relay reports its own refusals
         // that way, and an app needs to show them rather than have them
@@ -315,6 +318,8 @@ impl Link {
         let mut queued: VecDeque<ClientMsg> = VecDeque::new();
         let mut backoff = Backoff::default();
         let mut refused = false;
+        // A Joined that arrived before its client was in hand.
+        let mut early_join: Option<(u64, bool)> = None;
         // When the next connection attempt is due, while there is no socket.
         let mut retry: Option<tokio::time::Instant> = None;
         let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -333,6 +338,12 @@ impl Link {
                     match control {
                         Control::Joined(generation, acks) if self.shared.current(generation) => {
                             backoff.reset();
+                            if conn.is_none() {
+                                // The relay's Joined can arrive before `connect()` has returned
+                                // the client it came on. Kept for that client, or every send on
+                                // it would be held for good.
+                                early_join = Some((generation, acks));
+                            }
                             if let Some(c) = conn.as_mut() {
                                 c.joined = true;
                                 c.acks = acks;
@@ -429,7 +440,12 @@ impl Link {
                         attempt = tokio::time::timeout(EMIT_TIMEOUT, self.builder(generation).auth(auth).connect()) => attempt,
                     };
                     match attempt {
-                        Ok(Ok(client)) => conn = Some(Connection { client, generation, token, joined: false, acks: false, beat: None, beats: 0 }),
+                        Ok(Ok(client)) => {
+                            conn = Some(Connection { client, generation, token, joined: false, acks: false, beat: None, beats: 0 });
+                            if let Some((_, acks)) = early_join.take().filter(|(joined, _)| *joined == generation) {
+                                let _ = self.control.send(Control::Joined(generation, acks));
+                            }
+                        }
                         failed => {
                             let wait = backoff.next();
                             let why = match failed {
