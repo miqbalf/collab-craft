@@ -342,6 +342,8 @@ pub struct Live<H, R: Replica = LiveDoc> {
     unconfirmed: std::collections::BTreeMap<u64, Vec<u8>>,
     /// The bytes in [`Live::unconfirmed`], bounded by [`MAX_UNCONFIRMED_BYTES`].
     unconfirmed_bytes: usize,
+    /// Edits that were unconfirmed when the replica broke: the room will never order them.
+    abandoned: usize,
     /// Submits in [`Live::unconfirmed`] the relay refused for now (a transient failure), to be
     /// sent again at [`Live::retry_at`].
     retrying: std::collections::BTreeSet<u64>,
@@ -399,6 +401,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             told_incomplete: false,
             unconfirmed: std::collections::BTreeMap::new(),
             unconfirmed_bytes: 0,
+            abandoned: 0,
             retrying: std::collections::BTreeSet::new(),
             retry_at: None,
             retry_wait: RETRY_FIRST,
@@ -484,9 +487,10 @@ impl<H: Hub, R: Replica> Live<H, R> {
 
     /// How many local edit updates the relay has not ordered yet, counting one the relay refused
     /// for now and one waiting to be sent again after a rejoin. Tracked by update, not by wire
-    /// counter: a resend takes a new counter, and the old one is gone.
+    /// counter: a resend takes a new counter, and the old one is gone. Edits dropped when the
+    /// replica broke still count: the room never got them.
     pub fn unconfirmed_edits(&self) -> usize {
-        self.unconfirmed.len()
+        self.unconfirmed.len() + self.abandoned
     }
 
     /// The highest relay sequence applied to the replica in order. An op that arrived ahead of
@@ -724,6 +728,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
         log::warn!("collab: {why}");
         self.broken = true;
         self.snapshot = None;
+        self.abandoned += self.unconfirmed.len();
         self.unconfirmed.clear();
         self.unconfirmed_bytes = 0;
         self.retrying.clear();

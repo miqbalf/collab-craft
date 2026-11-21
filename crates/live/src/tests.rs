@@ -622,6 +622,22 @@ fn edits_saved_after_a_submit_refused_for_now() {
     assert!(a.le.edits_saved(), "the refused counter still counts as an unsaved edit");
 }
 
+/// An edit the relay refused for good breaks the link and was never ordered: the window still
+/// holds an edit the file does not, so it is not saved (the dropped update stays counted).
+#[test]
+fn an_edit_refused_for_good_is_not_saved() {
+    let relay = MemRelay::new();
+    let hub = relay.connect("alice", "alice", false);
+    let le = LiveEditing::start(hub, ROOM, seed().as_slice(), Access::Edit).unwrap();
+    let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() };
+    let mut a = Window { engine, le };
+    settle(&mut [&mut a]);
+    a.set(1, "uno");
+    settle(&mut [&mut a]);
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "{:?}", a.le.status());
+    assert!(!a.le.edits_saved(), "the refused edit is not in the file");
+}
+
 /// The relay's order for the run's edit has been read but the edit is still in the engine's
 /// queue (not flushed): not settled, whatever the order the app calls things in.
 #[test]
