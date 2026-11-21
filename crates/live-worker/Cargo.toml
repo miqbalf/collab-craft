@@ -31,3 +31,8 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 # The Nextcloud file API. native-tls, as the socket client already builds.
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+craft-live = { workspace = true, features = ["test-util"] }

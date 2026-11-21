@@ -65,7 +65,7 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 
 /// The ephemeral kinds the worker tells the editors something with (`{text}`) and ends their
@@ -115,6 +115,10 @@ pub trait DocumentService: Send + Sync + 'static {
     /// Save cadence: (quiet ms, max unsaved ms).
     fn cadence(&self) -> (u64, u64) {
         (QUIET_MS, MAX_UNSAVED_MS)
+    }
+    /// Open rooms from the base the Nextcloud app pinned for the grant, not from the file.
+    fn pinned_base(&self) -> bool {
+        false
     }
 }
 
@@ -389,6 +393,8 @@ pub enum FileError {
     Forbidden,
     /// `423`: Nextcloud holds a lock on the file or folder.
     Locked,
+    /// The pinned base did not match the hash the app gave with it (or came without one).
+    BaseMismatch,
     Http(String),
 }
 
@@ -399,6 +405,7 @@ impl fmt::Display for FileError {
             FileError::Exists => f.write_str("that name is taken"),
             FileError::Forbidden => f.write_str("the server refused it (403)"),
             FileError::Locked => f.write_str("the file or its folder is locked"),
+            FileError::BaseMismatch => f.write_str("the pinned base does not match its hash"),
             FileError::Http(e) => f.write_str(e),
         }
     }
@@ -474,6 +481,18 @@ impl RoomFiles {
         let name = file_name_of(header("Content-Disposition").as_deref()).ok_or_else(|| FileError::Http("the file came without its name".into()))?;
         let bytes = resp.bytes().await.map_err(|e| FileError::Http(e.without_url().to_string()))?.to_vec();
         Ok(FileGot { bytes, name, etag })
+    }
+
+    /// The pinned base and its sha256 (hex, from `X-Craft-Base-Sha256`), checked against the bytes.
+    pub async fn base(&self) -> Result<(Vec<u8>, String), FileError> {
+        let resp = self.send(self.nc.http.get(self.url("base", ""))).await?;
+        let claimed = resp.headers().get("X-Craft-Base-Sha256").and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
+        let bytes = resp.bytes().await.map_err(|e| FileError::Http(e.without_url().to_string()))?.to_vec();
+        let actual = hex(&Sha256::digest(&bytes));
+        match claimed {
+            Some(c) if c == actual => Ok((bytes, actual)),
+            _ => Err(FileError::BaseMismatch),
+        }
     }
 
     /// Write the file over the version `etag`; the new ETag.
@@ -668,6 +687,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// Read the file and join the room on `hub` as the service peer.
     pub async fn open_with(service: Arc<S>, hub: H, files: RoomFiles, clock: Arc<dyn Clock>) -> Result<Room<H, S>, OpenError> {
         let got = files.get().await.map_err(OpenError::File)?;
+        let got = pinned_source(service.as_ref(), &files, got).await.map_err(OpenError::File)?;
         Room::start_with(service, hub, files, got, clock)
     }
 
@@ -1401,6 +1421,26 @@ impl HubTicket {
     }
 }
 
+/// The bytes a room is opened with. A service that is not pinned opens from the file as read.
+/// A pinned one opens from the base the app pinned for the grant (checked against its hash),
+/// with the file's name and ETag kept, so the first write is still `If-Match` on the file. When
+/// the base is missing or does not match, the room is closed (releasing the app's lock) and the
+/// error says why; it names no ticket, signature or URL.
+pub async fn pinned_source<S: DocumentService>(service: &S, files: &RoomFiles, got: FileGot) -> Result<FileGot, FileError> {
+    if !service.pinned_base() {
+        return Ok(got);
+    }
+    match files.base().await {
+        Ok((bytes, _)) => Ok(FileGot { bytes, ..got }),
+        Err(e) => {
+            if let Err(c) = files.close().await {
+                say(files.room(), format_args!("closing the room failed: {c}"));
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Serve one granted room until it closes or its grant ends: read the file and heartbeat first,
 /// so a grant that is not live (a replayed old notify) never reaches the relay; then join
 /// through `connect` (given a fresh service ticket), heartbeating while it is tried, and step
@@ -1420,6 +1460,10 @@ where
     if let Err(e) = files.heartbeat().await {
         return say(&room, format_args!("not served: the room did not take a heartbeat ({e})"));
     }
+    let got = match pinned_source(service.as_ref(), &files, got).await {
+        Ok(got) => got,
+        Err(e) => return say(&room, format_args!("not served: the pinned base could not be used ({e}); the room was closed")),
+    };
     let mut ticket = match HubTicket::new(relay_secret, &room, clock.as_ref()) {
         Ok(t) => t,
         Err(e) => return say(&room, format_args!("ticket: {e}")),
