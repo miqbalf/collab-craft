@@ -64,13 +64,17 @@ pub enum BusError {
 pub enum LockOutcome {
     /// Granted, with the grant's fencing token: higher than every token granted for this scope
     /// before, re-grants to the same holder included.
-    Granted { token: u64 },
-    Held { holder: String },
+    Granted {
+        token: u64,
+    },
+    Held {
+        holder: String,
+    },
 }
 
 /// What a fenced release ([`Bus::release_fenced`]) found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Released {
+pub enum ReleaseOutcome {
     /// The lease was this peer's under this token, and is gone now.
     Released,
     /// Somebody holds the scope, but not this peer under this token (another peer, or this
@@ -368,7 +372,7 @@ impl Bus {
     /// A stale unlock (from a run whose lease lapsed and was granted again, to somebody else or
     /// to this peer under a newer token) must not release the newer holder's lock, which a
     /// compare on the peer alone would.
-    pub async fn release_fenced(&mut self, room: &str, scope: &str, peer: &str, token: u64) -> Result<Released, BusError> {
+    pub async fn release_fenced(&mut self, room: &str, scope: &str, peer: &str, token: u64) -> Result<ReleaseOutcome, BusError> {
         const SCRIPT: &str = r#"
             local holder = redis.call('GET', KEYS[1])
             if not holder then
@@ -392,9 +396,9 @@ impl Bus {
             Err(e) => return Err(e.into()),
         };
         Ok(match outcome {
-            -1 => Released::Absent,
-            0 => Released::NotYours,
-            _ => Released::Released,
+            -1 => ReleaseOutcome::Absent,
+            0 => ReleaseOutcome::NotYours,
+            _ => ReleaseOutcome::Released,
         })
     }
 

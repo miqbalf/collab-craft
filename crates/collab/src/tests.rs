@@ -598,10 +598,7 @@ fn encode_server(m: &ServerMsg) -> String {
 fn a_fenced_grant_carries_its_token_and_lease() {
     let m = receive("lock_granted", json!({ "doc": DOC, "scope": "grid/struct", "seq": 4, "token": 9, "lease_ms": 60000 })).expect("reads");
     let mut s = session();
-    assert_eq!(
-        s.handle(m),
-        vec![Effect::LockHeld { scope: "grid/struct".to_owned(), seq: Some(4), token: Some(9), lease_ms: Some(60_000) }]
-    );
+    assert_eq!(s.handle(m), vec![Effect::LockHeld { scope: "grid/struct".to_owned(), seq: Some(4), token: Some(9), lease_ms: Some(60_000) }]);
 }
 
 #[test]
@@ -639,8 +636,12 @@ fn a_lost_lock_and_a_fenced_refusal_reach_the_caller_alone() {
     assert_eq!(s.handle(lost), vec![Effect::LockLost { scope: "grid/struct".to_owned(), token: 3 }]);
     assert!(!s.holds("grid/struct"));
     // A fenced refusal is the caller's to explain: no notice of its own.
-    let refused =
-        ServerMsg::Error { doc: DOC.to_owned(), detail: "you no longer hold grid/struct".to_owned(), local: Some(4), code: Some(crate::FENCED.to_owned()) };
+    let refused = ServerMsg::Error {
+        doc: DOC.to_owned(),
+        detail: "you no longer hold grid/struct".to_owned(),
+        local: Some(4),
+        code: Some(crate::FENCED.to_owned()),
+    };
     assert!(refused.refuses_connection().is_none(), "a fenced refusal read as a refused connection");
     assert_eq!(
         s.handle(refused),

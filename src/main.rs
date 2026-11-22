@@ -84,7 +84,7 @@ use socketioxide::SocketIo;
 use socketioxide::extract::{Data, SocketRef, State};
 use tokio::sync::Mutex;
 
-use bus::{Bus, LockOutcome, Released};
+use bus::{Bus, LockOutcome, ReleaseOutcome};
 use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, is_crdt_command};
 
 /// Bytes one opaque frame may carry, base64 included.
@@ -1351,10 +1351,8 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
             // `token` fences the holder's ordered edits (see `on_submit`); `lease_ms` is how long
             // the lease lasts unrefreshed, so the holder knows when to refresh it.
             let lease_ms = u64::try_from(lease.as_millis()).unwrap_or(u64::MAX);
-            let _ = socket.emit(
-                "lock_granted",
-                &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq, "token": token, "lease_ms": lease_ms }),
-            );
+            let _ = socket
+                .emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq, "token": token, "lease_ms": lease_ms }));
             emit_live(
                 socket.to(room_name.clone()),
                 "presence_lock",
@@ -1388,9 +1386,9 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<UnlockMsg>, State(relay): 
             // Fenced: only the grant named. A stale unlock for a scope this peer holds again
             // under a newer token releases nothing, on the bus or in the mirror.
             Some(token) => match bus.release_fenced(&claims.rm, &msg.scope, &claims.pid, token).await {
-                Ok(Released::Released) => true,
-                Ok(Released::Absent) => false,
-                Ok(Released::NotYours) | Err(_) => return,
+                Ok(ReleaseOutcome::Released) => true,
+                Ok(ReleaseOutcome::Absent) => false,
+                Ok(ReleaseOutcome::NotYours) | Err(_) => return,
             },
             None => bus.release(&claims.rm, &msg.scope, &claims.pid).await.unwrap_or(false),
         }

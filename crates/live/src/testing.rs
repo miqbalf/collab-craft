@@ -385,7 +385,9 @@ impl Relay {
             // The whole room hears the release, the releaser too, as the real relay does. A peer
             // that does not hold the scope, or holds it under another grant than the token
             // names, releases nothing.
-            ClientMsg::Unlock { scope, token, .. } if self.locks.iter().any(|(s, h, t)| *s == scope && *h == at && token.is_none_or(|token| token == *t)) => {
+            ClientMsg::Unlock { scope, token, .. }
+                if self.locks.iter().any(|(s, h, t)| *s == scope && *h == at && token.is_none_or(|token| token == *t)) =>
+            {
                 self.locks.retain(|(s, _, _)| *s != scope);
                 self.broadcast(&ServerMsg::LockReleased { doc: ROOM.into(), scope }, None);
             }

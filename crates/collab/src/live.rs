@@ -1554,7 +1554,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 log::info!("collab: {detail}");
                 self.notices.push(detail);
             }
-            Effect::SubmitRefused { local, code, .. } if code.as_deref() == Some(FENCED) && self.fence.as_ref().is_some_and(|f| f.pending.contains(&local)) => {
+            Effect::SubmitRefused { local, code, .. }
+                if code.as_deref() == Some(FENCED) && self.fence.as_ref().is_some_and(|f| f.pending.contains(&local)) =>
+            {
                 // An edit made under the lock, refused because the lock is no longer this
                 // grant's. Never ordered and never will be: out of the replica it goes, with
                 // every other edit under the lock the relay did not order.
