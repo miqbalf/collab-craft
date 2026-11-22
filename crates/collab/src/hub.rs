@@ -44,12 +44,20 @@ pub trait Hub {
     }
 
     /// The replica on this link mints in id `space` and keeps it across reconnects. Every
-    /// rejoin names it (handshake `space`), so the relay raises its space counter past it and
-    /// never grants it to another connection, even after the counter went backwards. No-op by
-    /// default: a hub that cannot carry it leaves that guarantee to the counter alone.
-    fn set_space(&mut self, space: u32) {
-        let _ = space;
-    }
+    /// rejoin must name it (handshake `space`): the relay raises its space counter to at least
+    /// that before it grants a space, so no other connection is granted it after the counter
+    /// went backwards and the relay lost what it granted (a restart together with a Valkey
+    /// flush). While the relay process runs, it also keeps its own floor of every space it
+    /// granted, which covers a counter that lost only its latest grants.
+    ///
+    /// Required, with no default, so that a wrapper hub (one that boxes or taps another) cannot
+    /// drop it silently: forward it to the inner hub. A hub with no handshake to carry it in
+    /// writes an empty body, and leaves the guarantee to the relay's own floor.
+    ///
+    /// **Not covered** even with it: the relay restarts *and* Valkey loses recent grants, and a
+    /// newcomer joins before the holder of a lost space rejoins. That case depends on how
+    /// Valkey persists and is not fixed in M1.
+    fn set_space(&mut self, space: u32);
 }
 
 /// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back

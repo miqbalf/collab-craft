@@ -238,6 +238,11 @@ pub const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
 /// in about 16 s on a slow link ([`crate::SLOW_LINK_BYTES_PER_SEC`]).
 pub const OFFLINE_MAX_BYTES: usize = 1024 * 1024;
 
+/// The detail of the `Error::Malformed` a local edit is refused with past twice the bound
+/// ([`Live::edit`], [`Live::edit_all`]), so a caller can tell this refusal (nothing changed; try
+/// again once the waiting edits are sent) from a broken or damaged replica.
+pub const PAST_BOUND: &str = "too many edits are waiting for the other editors; nothing was changed";
+
 /// The most local edits (separate updates) a replica holds unconfirmed, online or offline. About
 /// half an hour of typing at one edit per keystroke; it bounds the per-edit bookkeeping and the
 /// merge on the reconnect.
@@ -728,7 +733,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// the bound, a local edit is refused before it touches the replica.
     fn backstop(&self) -> Result<()> {
         if self.past_bound(2) {
-            return Err(Error::malformed("client", "too many edits are waiting for the other editors; nothing was changed"));
+            return Err(Error::malformed("client", PAST_BOUND));
         }
         Ok(())
     }
@@ -805,6 +810,24 @@ impl<H: Hub, R: Replica> Live<H, R> {
         F: FnOnce(&mut R) -> std::result::Result<Vec<Vec<u8>>, LiveError>,
     {
         self.backstop()?;
+        self.edit_unbounded(edit)
+    }
+
+    /// [`Live::edit_all`] without the bound, for what the app writes in answer to remote changes
+    /// (text it recovered or forwarded). That is not a user command, and skipping it would lose
+    /// the answer, so the bound on local edits does not apply. Still refused when the replica is
+    /// broken, damaged or not loaded.
+    pub fn answer_all<F>(&mut self, edit: F) -> Result<bool>
+    where
+        F: FnOnce(&mut R) -> std::result::Result<Vec<Vec<u8>>, LiveError>,
+    {
+        self.edit_unbounded(edit)
+    }
+
+    fn edit_unbounded<F>(&mut self, edit: F) -> Result<bool>
+    where
+        F: FnOnce(&mut R) -> std::result::Result<Vec<Vec<u8>>, LiveError>,
+    {
         let doc = self.sound_doc()?;
         let updates = edit(doc).map_err(refusal)?;
         let mut sent = true;
@@ -1864,8 +1887,10 @@ impl<H: Hub, R: Replica> Live<H, R> {
             Effect::Space { space } => {
                 if self.space.is_some_and(|own| own != space) && !std::mem::take(&mut self.adopt_space) {
                     // A rejoin's new space. This replica keeps its own: the rejoin named it
-                    // (`Hub::set_space`), so the relay raised its counter past it and grants it
-                    // to nobody else. A new client id would rebuild the replica and start its
+                    // (`Hub::set_space`), so the relay raised its counter past it, and the relay
+                    // also floors the counter at the highest space it granted. Not covered: a
+                    // relay restart together with lost Valkey grants (see `Hub::set_space`).
+                    // A new client id would rebuild the replica and start its
                     // undo history again, so a command made before (or while the link was down)
                     // could no longer be undone as one step.
                     log::debug!("collab: keeping id space {own:?} across the rejoin", own = self.space);
@@ -1873,7 +1898,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 }
                 self.adopt_space = false;
                 self.space = Some(space);
-                // Every rejoin names it from now on, so the relay never grants it again.
+                // Every rejoin names it from now on, so the relay raises its counter past it.
                 self.hub.set_space(space);
                 if let Some(doc) = self.doc.as_mut()
                     && let Err(e) = doc.set_client(space)
@@ -2132,6 +2157,7 @@ mod tests {
         fn connected(&self) -> bool {
             true
         }
+        fn set_space(&mut self, _: u32) {}
     }
 
     fn joined_msg() -> ServerMsg {

@@ -23,7 +23,9 @@
 //! op history is bounded in process and never written here, and both key
 //! families carry a TTL.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
@@ -99,6 +101,11 @@ pub struct Bus {
     /// working again. For the tests of what a transient failure does.
     #[cfg(test)]
     pub fail_next_seq: u32,
+    /// room -> the highest id space this relay granted or saw kept there, and when. The floor
+    /// [`Bus::next_space`] adds to the counter, so a counter that lost its latest `INCR`s
+    /// (an `everysec` AOF crash window, a lagging failover) never grants one again while this
+    /// process runs. Shared by clones, as the connection is.
+    spaces: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
 }
 
 /// How long one bus command may take before it fails.
@@ -132,6 +139,7 @@ impl Bus {
             lock_ttl: LOCK_TTL,
             #[cfg(test)]
             fail_next_seq: 0,
+            spaces: Arc::default(),
         })
     }
 
@@ -209,24 +217,34 @@ impl Bus {
         Ok(v.unwrap_or(0))
     }
 
-    /// The next CRDT id space for a document, above `floor`.
+    /// The next CRDT id space for a document, above `kept`.
     ///
     /// One `INCR` per connection, from the same instance that hands out sequences, so two
     /// relays cannot grant the same space and a restart cannot hand out one twice. A client
     /// deriving its own space from its peer id could collide with another peer's, and the two
     /// would then mint the same character ids and drop each other's text.
     ///
-    /// `floor` is the space a rejoining replica already mints in (0 for none): it keeps that
-    /// space across reconnects. In the same script, the counter is first raised to at least
-    /// `floor`, so neither this grant nor any later one can equal a space a reconnected replica
-    /// still uses, even after the counter went backwards (a flush, an `everysec` AOF crash
-    /// window, a failover to a replica that lagged). A floor past [`MAX_SPACE_FLOOR`] is not
-    /// honoured, so a client cannot run the counter towards its wrap. A counter that is not a
-    /// number is left alone, and the `INCR` refuses it as before.
+    /// The counter can go backwards: a flush, a crash inside the `everysec` AOF window, a
+    /// failover to a replica that lagged. The last two lose exactly the latest grants, whose
+    /// holders are still connected and keep their space across rejoins. So in the same script
+    /// as the `INCR`, the counter is first raised to a floor, the higher of
+    ///
+    /// * `kept`, the space a rejoining replica already mints in (0 for none), and
+    /// * the highest space this relay process granted in the room, or saw kept there.
+    ///
+    /// While this process runs, no grant can then equal a space a live replica holds. **Not
+    /// covered:** the relay process restarts *and* Valkey loses recent grants. A newcomer may
+    /// then be granted a space whose holder has not rejoined yet; the holder's rejoin raises the
+    /// floor from then on, but the two already share the space. That case depends on how Valkey
+    /// persists (an owner decision) and is not fixed in M1.
+    ///
+    /// A `kept` past [`MAX_SPACE_FLOOR`] is not honoured, so a client cannot run the counter
+    /// towards its wrap. A counter that is not a number is left alone, and the `INCR` refuses it
+    /// as before.
     ///
     /// Space 0 is never granted. That space belongs to the text already in the file, which is
     /// how two peers loading the same string reach the same identities.
-    pub async fn next_space(&mut self, room: &str, floor: u32) -> Result<u32, BusError> {
+    pub async fn next_space(&mut self, room: &str, kept: u32) -> Result<u32, BusError> {
         const SCRIPT: &str = r#"
             local floor = tonumber(ARGV[1])
             local raw = redis.call('GET', KEYS[1])
@@ -240,7 +258,8 @@ impl Bus {
             return granted
         "#;
         let key = format!("{PREFIX}:doc:{}:space", encode_key(room));
-        let floor = if floor > MAX_SPACE_FLOOR { 0 } else { floor };
+        let kept = if kept > MAX_SPACE_FLOOR { 0 } else { kept };
+        let floor = kept.max(self.highest_space(room));
         let next: u64 = match redis::Script::new(SCRIPT).key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async(&mut self.conn).await {
             Ok(v) => v,
             Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
@@ -249,14 +268,47 @@ impl Bus {
         // Wrapped rather than refused. The counter would have to pass four billion
         // connections to one document, and a wrapped space collides only with a peer from
         // that many connections ago.
-        Ok(((next - 1) % u64::from(u32::MAX)) as u32 + 1)
+        let granted = ((next - 1) % u64::from(u32::MAX)) as u32 + 1;
+        self.note_space(room, granted.max(kept));
+        Ok(granted)
     }
 
-    /// Forget the room's space counter, as a Valkey flush does, for a test of the floor.
+    /// The highest space this process granted in `room`, or saw kept there (0 for none).
+    fn highest_space(&self, room: &str) -> u32 {
+        self.spaces.lock().map_or(0, |spaces| spaces.get(room).map_or(0, |(space, _)| *space))
+    }
+
+    /// Remember `space` as granted or kept in `room`. Rooms untouched for longer than the
+    /// counter lives ([`SEQ_TTL`]) are forgotten, as the counter is, so the map holds about one
+    /// entry per room used within that time.
+    fn note_space(&self, room: &str, space: u32) {
+        let Ok(mut spaces) = self.spaces.lock() else { return };
+        let now = Instant::now();
+        if spaces.len() >= 4096 && !spaces.contains_key(room) {
+            spaces.retain(|_, (_, at)| now.duration_since(*at) < SEQ_TTL);
+        }
+        let entry = spaces.entry(room.to_owned()).or_insert((0, now));
+        *entry = (entry.0.max(space), now);
+    }
+
+    /// Set the room's space counter back to `to` (0 deletes it), as a lost write or a flush
+    /// does, for a test of the floor.
     #[cfg(test)]
-    pub async fn forget_spaces(&mut self, room: &str) {
+    pub async fn rewind_spaces(&mut self, room: &str, to: u32) {
         let key = format!("{PREFIX}:doc:{}:space", encode_key(room));
-        let _: Result<i64, _> = self.conn.del(&key).await;
+        if to == 0 {
+            let _: Result<i64, _> = self.conn.del(&key).await;
+        } else {
+            let _: Result<(), _> = self.conn.set(&key, to).await;
+        }
+    }
+
+    /// Forget what this process granted, as a relay restart does, for a test of the floor.
+    #[cfg(test)]
+    pub fn forget_granted_spaces(&mut self) {
+        if let Ok(mut spaces) = self.spaces.lock() {
+            spaces.clear();
+        }
     }
 
     /// How long a lease lasts without a refresh.

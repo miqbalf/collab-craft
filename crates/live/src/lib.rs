@@ -572,8 +572,10 @@ pub struct LiveEditing<H: Hub, K: LiveKind> {
     saver_missing: bool,
     /// The ordered run whose edit was refused because the link was down, told as lost once.
     lost_offline: Option<(String, u64)>,
-    /// A [`Work::Unmerged`] reached the app in this pump.
-    handed_unmerged: bool,
+    /// The app was handed the unconfirmed edits ([`LiveApp::unmerged`]) while this many were
+    /// waiting. A later break with the same count waiting is taken to be the same edits and does
+    /// not hand them over a second time; cleared once nothing is waiting.
+    handed_unmerged: Option<usize>,
 }
 
 impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
@@ -611,7 +613,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             saver_wait: None,
             saver_missing: false,
             lost_offline: None,
-            handed_unmerged: false,
+            handed_unmerged: None,
         })
     }
 
@@ -624,7 +626,6 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// and say who else is here.
     pub fn pump(&mut self, app: &mut impl LiveApp<K>) -> Vec<Peer<K::Pos>> {
         let was_broken = self.broken.is_some();
-        self.handed_unmerged = false;
         self.flush(app);
         let works = self.live.pump();
         self.give_back_dropped_grants();
@@ -937,16 +938,20 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// The link broke in this pump for a reason of this side's own (the service ended or closed
     /// the session, the catch-up never came, an edit could not be sent) while local edits were
     /// still waiting for the room: hand them to the app ([`LiveApp::unmerged`]), as `Live` does
-    /// for the drops it makes, unless it already did in this pump.
+    /// for the drops it makes, unless it already handed over these same edits (in this pump or
+    /// an earlier one).
     fn hand_unmerged_on_break(&mut self, app: &mut impl LiveApp<K>) {
         let edits = self.live.unconfirmed_edits();
-        if self.broken.is_none() || self.handed_unmerged || edits == 0 {
+        if edits == 0 {
+            self.handed_unmerged = None;
+        }
+        if self.broken.is_none() || self.handed_unmerged == Some(edits) || edits == 0 {
             return;
         }
         if let Some(doc) = self.live.doc() {
             log::warn!("live: the link ended with {edits} local edits the room does not have; handing them to the app");
             app.unmerged(&doc.state(), edits);
-            self.handed_unmerged = true;
+            self.handed_unmerged = Some(edits);
         }
     }
 
@@ -1000,7 +1005,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::Lock(_) => {}
             // Local edits only this replica holds are about to be dropped: the app saves them.
             Work::Unmerged { state, edits } => {
-                self.handed_unmerged = true;
+                self.handed_unmerged = Some(self.live.unconfirmed_edits());
                 log::warn!("live: {edits} local edits the room does not have are about to be dropped; handing them to the app");
                 app.unmerged(&state, edits);
             }
@@ -1024,14 +1029,15 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// Remote edits `Live` already merged: the app's answer inside the replica, then the engine.
     fn take_remote(&mut self, app: &mut impl LiveApp<K>, changes: Vec<Change<K>>) {
         let fallback = changes.clone();
-        let changes = match edit_live(&mut self.live, |d| app.received(d, changes)) {
-            Some((changes, sent)) => {
+        // An answer, not a user command: never held to the bound on local edits.
+        let changes = match edit_live(&mut self.live, Bound::Answer, |d| app.received(d, changes)) {
+            Ok((changes, sent)) => {
                 if !sent {
                     self.unsent();
                 }
                 changes
             }
-            None => fallback,
+            Err(_) => fallback,
         };
         self.apply(app, &changes);
     }
@@ -1077,12 +1083,12 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             self.notices.push(why);
             return;
         }
-        let result = edit_live(&mut self.live, |d| match app.local(d, &group) {
+        let result = edit_live(&mut self.live, Bound::Local, |d| match app.local(d, &group) {
             Ok(updates) => (Ok(updates.len()), updates),
             Err(e) => (Err(e), Vec::new()),
         });
         match result {
-            Some((Ok(count), sent)) => {
+            Ok((Ok(count), sent)) => {
                 if !sent {
                     self.unsent();
                 }
@@ -1101,16 +1107,24 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
                 }
                 self.follow_carets(&*app);
             }
-            Some((Err(LocalError::Refused(why)), _)) => {
+            Ok((Err(LocalError::Refused(why)), _)) => {
                 self.put_back(app, group);
                 self.notices.push(why);
             }
-            Some((Err(LocalError::Failed(e)), _)) => {
+            Ok((Err(LocalError::Failed(e)), _)) => {
                 log::warn!("live: the shared document refused an edit: {e}");
                 self.resync(app);
                 self.notices.push(PARTIAL.to_owned());
             }
-            None => {
+            // The link dropped (or the buffer filled) between `editable()` and the edit, so the
+            // stricter offline bound applies now: a refusal like the one `editable()` makes.
+            Err(Skipped::PastBound) => {
+                self.put_back(app, group);
+                let why = if self.editable() { BUFFER_FULL.to_owned() } else { self.not_editable() };
+                self.lose_run_offline(&why);
+                self.notices.push(why);
+            }
+            Err(Skipped::Broken) => {
                 self.put_back(app, group);
                 self.break_with(BROKEN);
             }
@@ -1410,16 +1424,29 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
 }
 
 /// Make an edit on the replica with `f`, which returns its result and the updates it made,
-/// and send those as one command (`Live::edit_all`). `None` when the replica takes no edit
-/// (broken, damaged, or past the buffer's hard stop); otherwise whether every update went out.
-fn edit_live<H: Hub, R: Replica, T>(live: &mut Live<Tap<H>, R>, f: impl FnOnce(&mut R) -> (T, Vec<Vec<u8>>)) -> Option<(T, bool)> {
+/// and send those as one command (`Live::edit_all`, or `Live::answer_all` for an answer to
+/// remote changes). `Err` when `f` never ran, and why; otherwise whether every update went out.
+fn edit_live<H: Hub, R: Replica, T>(
+    live: &mut Live<Tap<H>, R>,
+    bound: Bound,
+    f: impl FnOnce(&mut R) -> (T, Vec<Vec<u8>>),
+) -> Result<(T, bool), Skipped> {
     let mut out = None;
-    let sent = live.edit_all(|d| {
+    let run = |d: &mut R| {
         let (r, updates) = f(d);
         out = Some(r);
         Ok(updates)
-    });
-    let r = out?;
+    };
+    let sent = match bound {
+        Bound::Local => live.edit_all(run),
+        Bound::Answer => live.answer_all(run),
+    };
+    let Some(r) = out else {
+        return Err(match sent {
+            Err(craft_collab::Error::Malformed { detail, .. }) if detail == craft_collab::PAST_BOUND => Skipped::PastBound,
+            _ => Skipped::Broken,
+        });
+    };
     let sent = match sent {
         Ok(sent) => sent,
         Err(e) => {
@@ -1427,7 +1454,25 @@ fn edit_live<H: Hub, R: Replica, T>(live: &mut Live<Tap<H>, R>, f: impl FnOnce(&
             false
         }
     };
-    Some((r, sent))
+    Ok((r, sent))
+}
+
+/// Whether [`edit_live`] holds an edit to the bound on local edits.
+#[derive(Clone, Copy)]
+enum Bound {
+    /// A user command: refused past twice the bound ([`Live::edit_all`]).
+    Local,
+    /// The app's answer to remote changes: never refused for the bound ([`Live::answer_all`]).
+    Answer,
+}
+
+/// Why [`edit_live`] did not run the edit.
+#[derive(Debug, PartialEq, Eq)]
+enum Skipped {
+    /// Past twice the bound: nothing changed, the command can be tried again.
+    PastBound,
+    /// The replica is broken, damaged or not loaded.
+    Broken,
 }
 
 /// A notice from the link as a sentence.

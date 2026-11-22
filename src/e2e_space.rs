@@ -40,8 +40,9 @@ async fn join(url: &str, room: &str, pid: &str, space: Option<u32>) -> (Client, 
     (client, granted)
 }
 
-/// The space counter is lost (a flush) while the room lives on. A replica that rejoins names
-/// the space it keeps, and from then on nobody is granted that space or one below it.
+/// The space counter is lost (a flush) and the relay restarts, so it remembers nothing it
+/// granted. A replica that rejoins names the space it keeps, and from then on nobody is granted
+/// that space or one below it.
 #[tokio::test]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn a_rejoin_raises_the_space_counter_past_the_space_it_keeps() {
@@ -51,7 +52,11 @@ async fn a_rejoin_raises_the_space_counter_past_the_space_it_keeps() {
     let (_b, _) = join(&h.url, &room, "bob", None).await;
     let (_c, kept) = join(&h.url, &room, "carol", None).await;
     assert!(kept > first);
-    h.relay.bus.lock().await.forget_spaces(&room).await;
+    {
+        let mut bus = h.relay.bus.lock().await;
+        bus.rewind_spaces(&room, 0).await;
+        bus.forget_granted_spaces();
+    }
     // Carol's replica rejoins keeping `kept`; then a newcomer joins.
     let (_c2, rejoined) = join(&h.url, &room, "carol", Some(kept)).await;
     let (_d, newcomer) = join(&h.url, &room, "dave", None).await;
@@ -60,4 +65,31 @@ async fn a_rejoin_raises_the_space_counter_past_the_space_it_keeps() {
     // A floor no real replica holds is not honoured: the counter does not jump towards its wrap.
     let (_e, after) = join(&h.url, &room, "eve", Some(u32::MAX)).await;
     assert!(after > newcomer && after < MAX_SPACE_FLOOR, "a huge floor moved the counter to {after}");
+}
+
+/// The counter loses its latest grant (a crash inside the `everysec` AOF window, a failover to a
+/// replica that lagged) while the relay runs and the holder stays connected, so it does not
+/// rejoin. A newcomer is still never granted the holder's space.
+#[tokio::test]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_lost_grant_is_never_granted_again_while_the_relay_runs() {
+    let Some(h) = start().await else { return };
+    let room = unique_room("space-lost-grant");
+    let (_a, first) = join(&h.url, &room, "alice", None).await;
+    let (_b, held) = join(&h.url, &room, "bob", None).await;
+    assert!(held > first);
+    h.relay.bus.lock().await.rewind_spaces(&room, held - 1).await;
+    let (_c, newcomer) = join(&h.url, &room, "carol", None).await;
+    assert!(newcomer > held, "a newcomer was granted {newcomer}; bob still holds {held}");
+}
+
+/// A `space` that is not a `u32` (a buggy client) is ignored, and the handshake still decodes.
+#[test]
+fn a_malformed_space_does_not_refuse_the_handshake() {
+    for bad in [json!(-1), json!(1.5), json!(u64::from(u32::MAX) + 1), json!("7"), Value::Null] {
+        let h: crate::Handshake = serde_json::from_value(json!({ "token": "t", "space": bad })).expect("decodes");
+        assert_eq!(h.space, None, "{bad}");
+    }
+    let h: crate::Handshake = serde_json::from_value(json!({ "token": "t", "space": 7 })).expect("decodes");
+    assert_eq!(h.space, Some(7));
 }

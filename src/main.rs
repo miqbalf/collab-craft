@@ -282,9 +282,16 @@ struct Handshake {
     schema: Option<String>,
     /// The id space a rejoining replica already mints in (it keeps it across reconnects). The
     /// space counter is raised to at least this before the grant ([`Bus::next_space`]), so no
-    /// later connection is granted it. Absent on a fresh load and from older clients.
-    #[serde(default)]
+    /// later connection is granted it. Absent on a fresh load and from older clients. A value
+    /// that is not a `u32` is ignored rather than refusing the connection.
+    #[serde(default, deserialize_with = "lenient_space")]
     space: Option<u32>,
+}
+
+/// [`Handshake::space`]: any JSON value, kept only when it is a `u32`.
+fn lenient_space<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_u64().and_then(|n| u32::try_from(n).ok()))
 }
 
 /// The longest replica schema name a handshake may carry.

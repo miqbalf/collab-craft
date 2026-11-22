@@ -35,6 +35,8 @@ struct Engine {
     doc: Doc,
     /// The unmerged states handed over, and the resets, in the order they came.
     seen: Vec<Noted>,
+    /// Text the engine writes into line 2 in answer to the next remote change.
+    answer: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,8 +69,9 @@ impl LiveApp<Lines> for Engine {
         self.doc = before;
         Ok(())
     }
-    fn received(&mut self, _: &mut LiveDoc, changes: Vec<BlockChange>) -> (Vec<BlockChange>, Vec<Vec<u8>>) {
-        (changes, Vec::new())
+    fn received(&mut self, replica: &mut LiveDoc, changes: Vec<BlockChange>) -> (Vec<BlockChange>, Vec<Vec<u8>>) {
+        let answer = self.answer.take().and_then(|text| replica.insert_text(2, 0, &text, &Map::new()).ok());
+        (changes, answer.into_iter().collect())
     }
     fn apply(&mut self, replica: &LiveDoc, _: &[Change<Lines>]) -> Result<(), String> {
         self.resync(replica)
@@ -116,7 +119,7 @@ impl Window {
     fn join(relay: &MemRelay, uid: &str, access: Access) -> Window {
         let hub = relay.connect(uid, uid, access == Access::Edit);
         let le = LiveEditing::start(hub, ROOM, seed().as_slice(), access).unwrap();
-        let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
+        let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), ..Engine::default() };
         Window { engine, le }
     }
 
@@ -305,7 +308,7 @@ fn a_late_catch_up_is_told_then_given_up() {
     let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
     let read = now.clone();
     late.set_clock(Box::new(move || *read.lock().unwrap()));
-    let mut engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
+    let mut engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), ..Engine::default() };
     relay.cut_replay(&hub);
     late.pump(&mut engine);
     assert_eq!(late.status(), &LiveStatus::Connecting);
@@ -646,7 +649,7 @@ fn an_edit_refused_for_good_is_not_saved() {
     let relay = MemRelay::new();
     let hub = relay.connect("alice", "alice", false);
     let le = LiveEditing::start(hub, ROOM, seed().as_slice(), Access::Edit).unwrap();
-    let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
+    let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), ..Engine::default() };
     let mut a = Window { engine, le };
     settle(&mut [&mut a]);
     a.set(1, "uno");
@@ -1796,4 +1799,67 @@ fn a_session_ended_on_the_rejoin_hands_over_the_offline_edits() {
     });
     let copy = copy.expect("the offline edits were not handed over");
     assert_eq!(LiveDoc::from_state(&copy).unwrap().block(1).unwrap().text, "typed offline");
+}
+
+// C9 fix round 2.
+
+/// N-I1: the link drops with more than twice the offline bound unconfirmed (a large paste still
+/// in flight), and a remote change read before the drop lands. The app's answer to it is not a
+/// user command: it reaches the replica, never skipped for the bound.
+#[test]
+fn an_answer_to_a_remote_change_is_never_held_to_the_bound() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    b.set(1, "bee");
+    relay.refuse_next_submits(usize::MAX);
+    let big = "p".repeat(3 * craft_collab::OFFLINE_MAX_BYTES);
+    a.set(2, &big);
+    assert!(a.le.live().unconfirmed_edits() > 0);
+    relay.drop_link_after_read(a.le.hub());
+    a.engine.answer = Some("answered ".to_owned());
+    a.pump();
+    assert!(a.engine.answer.is_none(), "the remote change never reached the app");
+    let text = a.le.live().doc().and_then(|d| d.block(2)).map(|b| b.text).unwrap_or_default();
+    assert!(text.starts_with("answered "), "the answer was skipped: {:?}", &text[..text.len().min(20)]);
+}
+
+/// N-I1: the link drops between `editable()` and the edit, with more than twice the offline bound
+/// waiting. The command is put back with a notice, as `editable()` would have refused it; the
+/// session never breaks. Tried at every point of the share.
+#[test]
+fn a_link_dropping_inside_a_share_puts_the_command_back() {
+    let big = "p".repeat(3 * craft_collab::OFFLINE_MAX_BYTES);
+    let mut put_back = 0;
+    for checks in 0..40 {
+        let relay = MemRelay::new();
+        let mut a = Window::join(&relay, "alice", Access::Edit);
+        settle(&mut [&mut a]);
+        relay.refuse_next_submits(usize::MAX);
+        a.set(2, &big);
+        a.le.take_notices();
+        relay.drop_link_after_checks(a.le.hub(), checks);
+        a.set(1, "late");
+        let notices = a.le.take_notices();
+        a.pump();
+        assert!(!matches!(a.le.status(), LiveStatus::Broken(_)), "broke at check {checks}: {notices:?}");
+        if a.line(1) == "one" {
+            put_back += 1;
+            assert!(!notices.is_empty(), "put back without a word at check {checks}");
+        }
+    }
+    assert!(put_back > 0);
+}
+
+/// N-M2: the `SendLock` a `Lost` answered was refused locally (the link was down); the rejoin
+/// asks again.
+#[test]
+fn a_failed_ask_is_asked_again_on_the_rejoin() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    q.on_lock(&fenced(1, 7), 1.0);
+    assert_eq!(q.on_lock(&lost(7), 2.0), vec![Action::SendUnlock, Action::SendLock]);
+    q.ask_failed();
+    assert_eq!(q.rejoined(3.0), vec![Action::SendLock], "the item would wait for a request that never went out");
 }

@@ -35,6 +35,11 @@ struct Conn {
     send_fails: bool,
     /// The id space its replica keeps, named on every rejoin ([`Hub::set_space`]).
     space: u32,
+    /// The link dropped after the hub read its inbox: what was already read is still handed
+    /// over once, as a native hub's reader does with messages it took before the drop.
+    read_ahead: bool,
+    /// The link drops once [`Hub::connected`] has answered this many more times.
+    drops_after: Option<usize>,
 }
 
 #[derive(Default)]
@@ -86,6 +91,8 @@ impl MemRelay {
             tokens: Vec::new(),
             send_fails: false,
             space: 0,
+            read_ahead: false,
+            drops_after: None,
         });
         r.join(at);
         MemHub { relay: self.clone(), at }
@@ -101,6 +108,25 @@ impl MemRelay {
         r.release_locks_of(hub.at);
         let presence = ServerMsg::Presence { doc: ROOM.into(), roster: r.roster() };
         r.broadcast(&presence, None);
+    }
+
+    /// The link of `hub` drops after the hub already read what was waiting for it: the next
+    /// poll still hands that over, while [`Hub::connected`] already says false.
+    pub fn drop_link_after_read(&self, hub: &MemHub) {
+        let kept = self.0.borrow_mut().conns.get_mut(hub.at).map(|c| std::mem::take(&mut c.inbox)).unwrap_or_default();
+        self.drop_link(hub);
+        if let Some(c) = self.0.borrow_mut().conns.get_mut(hub.at) {
+            c.inbox = kept;
+            c.read_ahead = true;
+        }
+    }
+
+    /// The link of `hub` drops after [`Hub::connected`] has answered `checks` more times, so in
+    /// the middle of whatever the client is doing (a native hub's flag flips on another thread).
+    pub fn drop_link_after_checks(&self, hub: &MemHub, checks: usize) {
+        if let Some(c) = self.0.borrow_mut().conns.get_mut(hub.at) {
+            c.drops_after = Some(checks);
+        }
     }
 
     /// The next `count` submits are refused for now (the relay's bus did not answer): the client
@@ -163,8 +189,10 @@ impl MemRelay {
         }
     }
 
-    /// The space counter goes back to 0, as a Valkey flush loses it while the room's history
-    /// stays: later joins are granted 1, 2, … again, unless a rejoin names a higher floor.
+    /// The space counter goes back to 0, as a relay restart together with a Valkey flush loses
+    /// it while the room's history stays: later joins are granted 1, 2, … again, unless a rejoin
+    /// names a higher floor. (A running relay also floors the counter at the highest space it
+    /// granted, so a flush alone does not do this.)
     pub fn forget_spaces(&self) {
         self.0.borrow_mut().next_space = 0;
     }
@@ -219,13 +247,29 @@ impl Hub for MemHub {
 
     fn poll(&mut self) -> Vec<ServerMsg> {
         let mut r = self.relay.0.borrow_mut();
-        match r.conns.get_mut(self.at) {
-            Some(c) if c.connected => c.inbox.drain(..).collect(),
-            _ => Vec::new(),
-        }
+        let Some(c) = r.conns.get_mut(self.at) else { return Vec::new() };
+        if c.connected || std::mem::take(&mut c.read_ahead) { c.inbox.drain(..).collect() } else { Vec::new() }
     }
 
     fn connected(&self) -> bool {
+        let due = {
+            let mut r = self.relay.0.borrow_mut();
+            let Some(c) = r.conns.get_mut(self.at) else { return false };
+            match c.drops_after {
+                Some(0) => {
+                    c.drops_after = None;
+                    true
+                }
+                Some(n) => {
+                    c.drops_after = Some(n - 1);
+                    false
+                }
+                None => false,
+            }
+        };
+        if due {
+            self.relay.drop_link_after_read(self);
+        }
         self.relay.0.borrow().conns.get(self.at).is_some_and(|c| c.connected)
     }
 

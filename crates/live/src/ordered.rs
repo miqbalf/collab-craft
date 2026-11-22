@@ -243,10 +243,20 @@ impl<P> Ordered<P> {
         }
     }
 
+    /// The [`Action::SendLock`] just returned did not go out (the app's lock call failed, as
+    /// `LiveEditing::lock` does while the link is down). A later [`rejoined`](Self::rejoined)
+    /// then asks again instead of counting on it.
+    pub fn ask_failed(&mut self) {
+        self.asked = false;
+    }
+
     /// The link rejoined: drop the grant (the relay released it), keep the item, ask again. A
     /// fenced grant is given back first ([`Action::SendUnlock`], then [`Action::SendLock`]).
     /// When the lock events taken with this rejoin already asked again (a `Lost` or a
-    /// `Released` since the last [`poll`](Self::poll)), it does not ask a second time.
+    /// `Released` since the last [`poll`](Self::poll)), it does not ask a second time. That
+    /// assumes the [`Action::SendLock`] those events returned went out: when the app's lock call
+    /// failed (refused while the link was down), it says so with
+    /// [`ask_failed`](Self::ask_failed) before this, and the rejoin asks again.
     /// The wait for the lock starts over. Feed the lock events taken before the rejoin to
     /// [`on_lock`](Self::on_lock) first (`LiveEditing` already drops the old link's events, so
     /// the order cannot revive a stale grant).

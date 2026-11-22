@@ -568,6 +568,7 @@ impl Hub for FakeHub {
     fn connected(&self) -> bool {
         true
     }
+    fn set_space(&mut self, _: u32) {}
 }
 
 fn joined(peer: &str, space: u32) -> ServerMsg {

@@ -289,9 +289,13 @@ Two rules keep the character identities honest. Every scope allocates from its
 own counters, so the ids a paragraph receives cannot move when another paragraph
 is loaded first. The relay grants each connection its own id space in the join
 payload, and a client mints nothing before that arrives. A replica keeps the first space it was
-granted across reconnects (nobody else is ever granted it), so its own items, its undo history and
-the edits it made while the link was down carry on unchanged; it takes a new one only when the
-room lost its history.
+granted across reconnects, so its own items, its undo history and the edits it made while the
+link was down carry on unchanged; it takes a new one only when the room lost its history. Each
+rejoin names the kept space, and the relay raises its Valkey space counter to at least that and to
+the highest space it granted itself, in the same step as the grant. So no other connection is
+granted a kept space, even after the counter went backwards. One case is not covered: the relay
+process restarts and Valkey lost recent grants, and a newcomer joins before the holder of a lost
+space rejoins; the two then share a client id. That depends on Valkey's persistence settings.
 
 A peer joining a live session cannot reach the room's text by reading the file,
 because the file is behind every edit made since it was written. The relay
@@ -406,11 +410,14 @@ Phase 1 of live co-editing ships with these. Each is a decision, not an oversigh
   `COLLABCRAFT_SERVICE_UID` (default `craft_office`) to checkpoint and to report saves. The
   Nextcloud app refuses to mint a ticket for a real user with that uid; a separate signed claim
   would be stronger and is left for later.
-- **The id space counter has no floor.** It lives in Valkey with a 30-day TTL refreshed on every
-  connection. If it is lost (a flush, a different database) while the sequence survives, spaces
-  start again at 1 and a new connection can share a space with a replica still open from before
-  (a replica keeps its space across reconnects, unless the join says the room lost its history).
-  Reopening every window after a Valkey flush avoids it.
+- **The id space counter is only as durable as Valkey.** It lives in Valkey with a 30-day TTL
+  refreshed on every connection. If it goes backwards (a flush, a crash inside the `everysec` AOF
+  window, a failover to a lagging replica), the relay still never grants a space it granted
+  itself while its process runs, nor one that a rejoining replica names as kept. If the relay
+  process restarts *and* Valkey lost recent grants, a newcomer that joins before the holder of a
+  lost space rejoins can share that space with it (a replica keeps its space across reconnects,
+  unless the join says the room lost its history). How Valkey persists decides this; reopening
+  every window after such an outage avoids it.
 - **A crafted yrs update can abort a wasm build.** Native builds catch a yrs panic and mark the
   replica damaged. A browser build targets `wasm32`, where a panic aborts and cannot be
   caught, so a hostile update from a peer with edit rights can stop that tab; the peer already
