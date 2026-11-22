@@ -63,11 +63,13 @@ pub struct Ordered<P> {
     since: f64,
     /// A `Released` came while the request was unanswered: the next `Denied` is stale.
     released_early: bool,
+    /// The replica broke: its edits will never be ordered, so nothing is left to wait for.
+    broken: bool,
 }
 
 impl<P> Ordered<P> {
     pub fn new(scope: impl Into<String>) -> Self {
-        Ordered { scope: scope.into(), item: None, state: State::Idle, since: 0.0, released_early: false }
+        Ordered { scope: scope.into(), item: None, state: State::Idle, since: 0.0, released_early: false, broken: false }
     }
 
     pub fn scope(&self) -> &str {
@@ -171,8 +173,25 @@ impl<P> Ordered<P> {
     /// The run's edits were flushed: unlock once `settled` (call every frame until it does).
     pub fn finish(&mut self, settled: bool) -> Vec<Action> {
         match self.state {
-            State::Running { held, .. } if settled => {
+            State::Running { held, .. } if settled || self.broken => {
                 self.state = State::Idle;
+                if held { vec![Action::SendUnlock] } else { Vec::new() }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The replica broke (`LiveEditing::status` turned `Broken`): the run's edits will never be
+    /// ordered. A run in progress ends as [`Polled::LockLost`] (told once by [`poll`](Self::poll)),
+    /// [`finish`](Self::finish) no longer waits for `settled`, and the returned
+    /// [`Action::SendUnlock`] (send it if the link is up; the relay's lease is the backstop)
+    /// gives the scope back, which is harmless: nobody can run on stale structure because of
+    /// an edit that is never ordered.
+    pub fn replica_broken(&mut self) -> Vec<Action> {
+        self.broken = true;
+        match self.state {
+            State::Running { held, .. } => {
+                self.state = State::Running { held: false, told: false };
                 if held { vec![Action::SendUnlock] } else { Vec::new() }
             }
             _ => Vec::new(),

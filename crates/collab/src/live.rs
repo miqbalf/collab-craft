@@ -1217,7 +1217,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
             }
             Effect::Replace { document, seq } => {
                 self.lose_checkpoint(work, "the relay replaced the document");
-                // Edits made against what is being replaced cannot be reconciled with it.
+                // Edits made against what is being replaced cannot be reconciled with it, and
+                // the room never ordered them: they stay counted, so they never read as saved.
+                self.abandoned += self.unconfirmed.len();
                 self.unconfirmed.clear();
                 self.unconfirmed_bytes = 0;
                 self.retrying.clear();

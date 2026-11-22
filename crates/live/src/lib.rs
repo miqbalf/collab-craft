@@ -322,6 +322,14 @@ impl Seen {
     }
 
     fn saw(&mut self, m: &ServerMsg) {
+        // A submit refused for now is sent again under a new counter (`Live` keeps the update
+        // and counts it once), so its old counter leaves `pending` here: kept, it would make a
+        // later rejoin with nothing to resend read as owing a resend for good.
+        if let ServerMsg::Error { local: Some(local), detail, code, .. } = m
+            && (code.as_deref() == Some(craft_collab::RETRY) || !craft_collab::refusal_is_permanent(detail))
+        {
+            self.pending.remove(local);
+        }
         if let ServerMsg::Op { seq, origin, local: Some(local), .. } = m
             && self.me.as_ref() == Some(origin)
             && self.pending.remove(local)

@@ -638,6 +638,71 @@ fn an_edit_refused_for_good_is_not_saved() {
     assert!(!a.le.edits_saved(), "the refused edit is not in the file");
 }
 
+/// A refused-for-now submit's old counter must not make a later rejoin, with nothing to resend,
+/// leave the window owing a resend for good.
+#[test]
+fn a_rejoin_after_a_refused_for_now_submit_leaves_nothing_owed() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut s = Window::join(&relay, SERVICE_UID, Access::Edit);
+    settle(&mut [&mut a, &mut s]);
+    relay.refuse_next_submits(1);
+    a.set(1, "uno");
+    a.pump();
+    let mut settled = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        settle(&mut [&mut a, &mut s]);
+        if a.le.local_settled() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the resend was never ordered");
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut s]);
+    s.le.announce_saved(relay.seq(), "e1").unwrap();
+    settle(&mut [&mut a, &mut s]);
+    assert!(a.le.local_settled(), "a resend is owed that nobody holds");
+    assert!(a.le.edits_saved(), "the old counter still reads as an unsaved edit");
+}
+
+/// An edit the relay's snapshot replaces was never ordered: it must not read as saved.
+#[test]
+fn an_edit_dropped_by_a_snapshot_is_not_saved() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut s = Window::join(&relay, SERVICE_UID, Access::Edit);
+    settle(&mut [&mut a, &mut s]);
+    s.le.announce_saved(relay.seq(), "e0").unwrap();
+    settle(&mut [&mut a, &mut s]);
+    relay.refuse_next_submits(5);
+    a.set(1, "uno");
+    a.pump();
+    assert!(!a.le.local_settled(), "the edit is refused, so unordered when the snapshot comes");
+    relay.fall_behind(a.le.hub());
+    a.pump();
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "{:?}", a.le.status());
+    assert!(!a.le.edits_saved(), "the dropped edit reads as saved");
+}
+
+/// A run whose replica breaks ends as LockLost, owes an unlock sent best effort, and does not
+/// wait for `local_settled`.
+#[test]
+fn a_run_on_a_broken_replica_reports_lock_lost_and_does_not_wait() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 0.0).unwrap();
+    q.on_lock(&granted(1), 1.0);
+    assert_eq!(q.poll(1, 2.0), Polled::Run("insert"));
+    assert!(q.finish(false).is_empty(), "waits while the replica is sound");
+    assert_eq!(q.replica_broken(), vec![Action::SendUnlock]);
+    assert_eq!(q.poll(1, 3.0), Polled::LockLost { scope: SCOPE.to_owned() });
+    assert!(q.finish(false).is_empty(), "no unlock owed twice");
+    assert_eq!(q.poll(1, 4.0), Polled::Nothing);
+    assert!(q.request("next", 5.0).is_ok(), "the run ended without local_settled");
+}
+
 /// The relay's order for the run's edit has been read but the edit is still in the engine's
 /// queue (not flushed): not settled, whatever the order the app calls things in.
 #[test]

@@ -314,7 +314,7 @@ Nothing ephemeral is ordered, replayed or journaled.
 
 ## Live API notes: scope locks and the pinned base (M1)
 
-Public items added to the Rust crates, all additive (an older relay or client ignores them):
+Public items added to the Rust crates, additive on the wire (an older relay or client ignores them); in Rust, `Effect::LockHeld` gained a field and `Effect` gained `LockBusy`, so exhaustive matches need updating:
 
 - **Wire.** `lock_granted` carries `seq`, the room's sequence when the lock was granted. A
   missing `seq` parses as `None`. The relay no longer records a grant for a peer that left while
@@ -322,12 +322,14 @@ Public items added to the Rust crates, all additive (an older relay or client ig
 - **`craft-collab`.** `Effect::LockHeld { scope, seq }` (was `LockHeld { scope }`) and
   `Effect::LockBusy { scope, holder }`, raised with `RemoteLocks` when somebody else just took
   a scope. `Live::unconfirmed_edits()` counts edit updates the relay has not
-  ordered yet, a resent update counted once. `LockEvent` (`Granted`, `Denied`, `Released`,
+  ordered yet, a resent update counted once, and edits dropped when the replica broke or a relay
+  snapshot replaced it stay counted. `LockEvent` (`Granted`, `Denied`, `Released`,
   `HeldByOther`) is exported.
 - **`craft-live`.** `LiveEditing::lock(scope)`, `unlock(scope)`, `take_lock_events()` and
   `local_settled()`. The `ordered` module: `Ordered<P>` runs one queued item at a time under one
   scope (`request`, `on_lock`, `poll`, `finish`, `rejoined`), `Polled` (`Nothing`, `Run`, `GaveUp`,
-  `LockLost { scope }`), `Action` and `GIVE_UP_MS`. `edits_saved()` now reads the
+  `LockLost { scope }`), `Action` and `GIVE_UP_MS`. `Ordered::replica_broken()` ends a run whose replica broke as
+  `LockLost` and returns the best-effort `SendUnlock` (the relay's lease is the backstop). `edits_saved()` now reads the
   replica's unconfirmed count, so a submit refused for now no longer reads as unsaved after its
   resend is ordered. `testing::MemRelay` acknowledges `Saved` with `SavedAck`, as the real relay
   does.
