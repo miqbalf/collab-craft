@@ -8,6 +8,13 @@
 //! an item names, and refuses any clock past [`MAX_CLOCK`] (2^31: no honest client writes that
 //! many characters, and anything below it cannot wrap a `u32`).
 //!
+//! It is also the resource cap in front of yrs's decoder (y-crdt #675/#750: a few bytes that
+//! claim billions of clients, blocks or values abort the process on allocation, which no
+//! `catch_unwind` catches). Every count is a loop here that must consume bytes on each turn, so
+//! a count the bytes cannot back fails at the end of the input, before yrs sizes anything by it;
+//! `Any` values nest at most 64 deep, client ids stay below 2^53 (#743), and the weak-link type
+//! (#733) and JSON content (#720's content ref 18) are refused.
+//!
 //! That only protects a replica if yrs parses the bytes into the same blocks. yrs ignores bytes
 //! after its delete set, so where the two readers disagree on one field, the rest of an update
 //! can mean one thing here and another to yrs. Two defences:
