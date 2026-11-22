@@ -394,21 +394,17 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
 /// range runs past `u32::MAX`. For a relay to check an op before it orders it, so a crafted
 /// update never reaches a browser replica, where a yrs panic aborts the page.
 ///
-/// Runs under `catch_unwind`, so a panic while decoding is a refusal. This is a check of
+/// Refused: bytes that do not decode, a clock, block end or id past 2^31 (anything below that
+/// cannot wrap a `u32`), a client's blocks adding up past it, a client with two sections, and
+/// anything the byte reader does not understand (see the `walk` module). A client whose only
+/// blocks have length 0 passes. Runs under `catch_unwind`, so a panic while decoding is a refusal. This is a check of
 /// the update on its own; whether it fits a document's history is only known to a replica.
 #[must_use]
 pub fn update_is_sound(bytes: &[u8]) -> bool {
     std::panic::catch_unwind(|| {
-        let Ok(update) = Update::decode_v1(bytes) else {
-            return false;
-        };
-        let ranges_ok = |set: &yrs::IdSet| set.iter().all(|(_, ranges)| ranges.iter().all(|r| r.start <= r.end));
-        // A block whose clock + len overflows is dropped from `insertions` (wrapped), so every
-        // client with blocks must still list a range starting at its first block.
-        let (starts, inserted) = (update.state_vector_lower(), update.insertions(true));
-        ranges_ok(update.delete_set())
-            && ranges_ok(&inserted)
-            && starts.iter().all(|(client, start)| inserted.get(client).is_some_and(|r| r.iter().next().is_some_and(|(r, _)| r.start == *start)))
+        // The walk reads the bytes itself, because nothing yrs exposes can see a clock that
+        // wrapped; yrs's decode then has to agree that the update is well formed.
+        crate::walk::blocks_in_range(bytes).is_some() && Update::decode_v1(bytes).is_ok()
     })
     .unwrap_or(false)
 }
@@ -956,6 +952,119 @@ mod tests {
         assert!(update_is_sound(&state));
         assert!(rest.iter().all(|u| update_is_sound(u)));
         assert!(update_is_sound(&[0, 0]), "the empty update");
+    }
+
+    /// The byte walk and yrs agree on how many clocks each client's blocks span, for documents
+    /// that use every content type yrs writes here: text with attributes and embeds, maps and
+    /// arrays of nested values, deletes, and full states.
+    #[test]
+    fn the_walk_agrees_with_yrs_on_rich_documents() {
+        use yrs::types::Attrs;
+        use yrs::{Any, Array, Map};
+        let doc = build_doc(7);
+        let text = doc.get_or_insert_text("t");
+        let map = doc.get_or_insert_map("m");
+        let arr = doc.get_or_insert_array("a");
+        let mut updates = Vec::new();
+        let mut keep = |doc: &Doc, from: &StateVector| updates.push(doc.transact().encode_diff_v1(from));
+        let bold: Attrs = [("b".into(), Any::Bool(true))].into_iter().collect();
+        let nested = Any::Map(Arc::new(std::collections::HashMap::from([
+            ("n".to_owned(), Any::Number(Number::Int(-3))),
+            ("f".to_owned(), Any::Number(Number::Float(1.5))),
+            ("s".to_owned(), Any::from("h\u{e9}llo \u{1f600}")),
+            ("l".to_owned(), Any::Array(Arc::from(vec![Any::Null, Any::Undefined, Any::Bool(false), Any::from(vec![1u8, 2])]))),
+        ])));
+        type Step = Box<dyn Fn(&mut yrs::TransactionMut)>;
+        let steps: Vec<Step> = vec![
+            Box::new({
+                let (text, bold) = (text.clone(), bold.clone());
+                move |t| {
+                    text.insert_with_attributes(t, 0, "na\u{ef}ve \u{1f600} text", bold.clone());
+                    text.insert_embed(t, 2, Any::from("img"));
+                }
+            }),
+            Box::new({
+                let (map, nested) = (map.clone(), nested.clone());
+                move |t| {
+                    map.insert(t, "k", nested.clone());
+                    map.insert(t, "k", 5);
+                    map.insert(t, "sub", yrs::MapPrelim::from([("x", 1)]));
+                }
+            }),
+            Box::new({
+                let (arr, nested) = (arr.clone(), nested.clone());
+                move |t| {
+                    arr.insert(t, 0, nested.clone());
+                    arr.insert(t, 1, yrs::TextPrelim::new("in array"));
+                    arr.insert(t, 2, yrs::ArrayPrelim::from([1, 2, 3]));
+                }
+            }),
+            Box::new({
+                let text = text.clone();
+                move |t| {
+                    text.remove_range(t, 1, 4);
+                    text.format(t, 0, 3, [("i".into(), Any::Bool(true))].into_iter().collect());
+                }
+            }),
+            Box::new({
+                let arr = arr.clone();
+                move |t| arr.remove_range(t, 0, 1)
+            }),
+        ];
+        for step in &steps {
+            let from = doc.transact().state_vector();
+            step(&mut doc.transact_mut());
+            keep(&doc, &from);
+        }
+        updates.push(doc.transact().encode_state_as_update_v1(&StateVector::default()));
+        for (i, u) in updates.iter().enumerate() {
+            let spans = crate::walk::blocks_in_range(u).unwrap_or_else(|| panic!("update {i} refused"));
+            let yrs_update = Update::decode_v1(u).unwrap();
+            let inserted = yrs_update.insertions(true);
+            for (client, ranges) in inserted.iter() {
+                let total: u64 = ranges.iter().map(|r| u64::from(r.end - r.start)).sum();
+                assert_eq!(spans.get(&client.get()), Some(&total), "update {i} client {client:?}");
+            }
+            assert!(update_is_sound(u), "update {i}");
+        }
+    }
+
+    /// Byte patterns that make a block's clock wrap past the first block of a section, which
+    /// yrs's own id ranges drop without a trace, and a client given two sections.
+    #[test]
+    fn overflow_after_the_first_block_is_refused() {
+        let item = [0x04, 1, 1, b't', 1, b'a'];
+        let huge = [0xf8, 0xff, 0xff, 0xff, 0x0f];
+        // GC block of 0xFFFFFFF8 clocks, then a string item.
+        let mut gc = vec![1, 2, 1, 0, 0x00];
+        gc.extend(huge);
+        gc.extend(item);
+        gc.push(0);
+        // The same with a Skip block.
+        let mut skip = vec![1, 2, 1, 0, 0x0a];
+        skip.extend(huge);
+        skip.extend(item);
+        skip.push(0);
+        // A second section for client 1.
+        let mut twice = vec![2, 1, 1, 0];
+        twice.extend(item);
+        twice.extend([1, 1, 0]);
+        twice.extend(item);
+        twice.push(0);
+        // Small blocks that add up past the ceiling: GC of 2^31 - 1, then two clocks more.
+        let mut add_up = vec![1, 3, 1, 0, 0x00, 0xff, 0xff, 0xff, 0xff, 0x07];
+        add_up.extend(item);
+        add_up.extend(item);
+        add_up.push(0);
+        for (name, bytes) in [("gc", &gc), ("skip", &skip), ("twice", &twice), ("add up", &add_up)] {
+            assert!(Update::decode_v1(bytes).is_ok() || name == "gc" || name == "skip", "{name} should reach the walk as bytes yrs takes");
+            assert!(!update_is_sound(bytes), "{name} passed");
+        }
+        // The honest shapes of the same bytes pass.
+        let mut fine = vec![1, 2, 1, 0, 0x00, 5];
+        fine.extend(item);
+        fine.push(0);
+        assert!(update_is_sound(&fine));
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.

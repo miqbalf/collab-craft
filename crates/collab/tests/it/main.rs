@@ -1897,3 +1897,27 @@ fn an_invalid_refusal_is_permanent() {
     }
     assert_eq!(hub.0.borrow().sent.len(), sent, "nothing was sent again");
 }
+
+/// Every update a `LiveDoc` makes (inserts, attributes, formatting, splits, merges, block edits,
+/// undo) and its full state pass the relay's soundness check.
+#[test]
+fn livedoc_updates_pass_the_soundness_check() {
+    let mut a = replica(&sample(), 1);
+    let bold = attrs(json!({"b": true, "color": {"r": 1, "g": [2, 3.5, null]}}));
+    let mut updates = vec![
+        a.insert_text(2, 3, "héllo 😀", &bold).unwrap(),
+        a.format(2, 0, 4, &attrs(json!({"i": true}))).unwrap(),
+        a.set_attrs(1, &attrs(json!({"style": "Heading2", "n": 2, "f": 0.5, "nested": {"k": [1, "two"]}}))).unwrap(),
+        a.delete_text(4, 2, 5).unwrap(),
+        a.split(4, 3, 50).unwrap(),
+        a.merge(50, 4).unwrap_or_default(),
+        a.insert_block(1, &plain(60, "new block")).unwrap(),
+        a.remove_block(3).unwrap(),
+    ];
+    updates.extend(a.undo());
+    updates.extend(a.redo());
+    updates.push(a.state());
+    for (i, u) in updates.iter().enumerate() {
+        assert!(craft_collab::update_is_sound(u), "update {i} refused");
+    }
+}

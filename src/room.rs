@@ -325,8 +325,13 @@ pub fn crdt_ops_sound(command: &str, params: &serde_json::Value) -> bool {
     if !is_crdt_command(command) {
         return true;
     }
-    let Some(ops) = params.get("ops").and_then(serde_json::Value::as_array) else {
+    // An `ops` that is not a list is refused too: a client cannot read it either, but the
+    // relay would order and retain it.
+    let Some(ops) = params.get("ops") else {
         return true;
+    };
+    let Some(ops) = ops.as_array() else {
+        return false;
     };
     ops.iter().all(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()).is_some_and(|bytes| craft_collab::update_is_sound(&bytes)))
 }
@@ -1008,6 +1013,24 @@ mod tests {
         assert!(!ok("crdt.text", serde_json::json!([wire(&[0, 1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0x0f, 2])])), "delete range overflows");
         assert!(ok("cell.set", serde_json::json!(["!!"])), "not a crdt command");
         assert!(crdt_ops_sound("crdt.text", &serde_json::json!({ "scope": "doc" })), "no ops list");
+        for odd in [serde_json::json!("x"), serde_json::json!({ "a": 1 }), serde_json::json!(7), serde_json::Value::Null] {
+            assert!(!crdt_ops_sound("crdt.text", &serde_json::json!({ "scope": "doc", "ops": odd })), "ops that is not a list: {odd}");
+        }
+        // The three byte patterns whose clocks wrap after a section's first block.
+        let item = [0x04, 1, 1, b't', 1, b'a'];
+        let mut gc = vec![1, 2, 1, 0, 0x00, 0xf8, 0xff, 0xff, 0xff, 0x0f];
+        gc.extend(item);
+        gc.push(0);
+        let mut skip = gc.clone();
+        skip[4] = 0x0a;
+        let mut twice = vec![2, 1, 1, 0];
+        twice.extend(item);
+        twice.extend([1, 1, 0]);
+        twice.extend(item);
+        twice.push(0);
+        for bytes in [gc, skip, twice] {
+            assert!(!ok("crdt.text", serde_json::json!([wire(&bytes)])));
+        }
     }
 
     fn crdt_sub(peer: &str, scope: &str) -> Submission {

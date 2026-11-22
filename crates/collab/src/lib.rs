@@ -47,6 +47,7 @@ pub mod proto;
 pub mod replica;
 mod session;
 mod token;
+mod walk;
 mod ydoc;
 
 /// A [`Hub`] over `rust_socketio`, for native apps.

@@ -254,7 +254,15 @@ async fn e2e_many_scopes_do_not_make_a_room_unjoinable() {
     // More scopes than the old cap's catch-up fit the socket's buffer (2560 packets), each
     // large enough that a slow link cannot drain them as fast as a join queues them.
     let scopes = 4000u64;
-    let op = "A".repeat(1360);
+    // A valid yrs update of about the size of one frame's worth of text: one string item of
+    // 1000 characters (the relay refuses ops that are not valid updates).
+    let op = {
+        use base64::Engine as _;
+        let mut bytes = vec![1, 1, 1, 0, 0x04, 1, 1, b't', 0xe8, 0x07];
+        bytes.extend(std::iter::repeat_n(b'a', 1000));
+        bytes.push(0);
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
     let before = seq_of(&h, &room).await;
     for i in 0..scopes {
         let params = serde_json::json!({ "scope": format!("s{i}"), "ops": [op] });
