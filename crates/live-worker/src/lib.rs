@@ -22,10 +22,11 @@
 //!    leaves. The close says how long the room has been empty (`?idle=` seconds); the app
 //!    refuses it (`409`) when it handed out an edit ticket into the room since. A refused close,
 //!    like a new notify for a room being served (another window got a ticket into this room,
-//!    whether or not an editor was in it then), marks a window as expected: until an editor
-//!    joins after the mark, or [`ALONE_MS`] has passed, the empty-room close does not run. So a
-//!    window the worker was told about never lands in a room the worker left, however slowly
-//!    it loads (up to [`ALONE_MS`]).
+//!    whether or not an editor was in it then), or one that comes while a close went
+//!    unanswered, marks a window as expected: until an editor joins after the mark (each join
+//!    takes the oldest mark), or [`ALONE_MS`] has passed, the empty-room close does not run. So
+//!    a window the worker was told about never lands in a room the worker left, however slowly
+//!    it loads (up to [`ALONE_MS`]). Notifies that come within one turn count as one window.
 //!
 //! Right after its first join has caught up, the worker checkpoints the room once, so an editor
 //! that joins later restores the room's document from that snapshot instead of seeding from a
@@ -36,6 +37,10 @@
 //! When the file changed outside the session (`412`), the version found there is copied aside
 //! as `"{stem} (conflict {YYYY-MM-DD HHMM}).{ext}"` (` 2` … ` 9` added when the name is
 //! taken), the editors get a `notice`, and the room goes on saving over that version's ETag.
+//! A write whose answer never came (a timeout, a dropped connection, a 5xx) may still have landed:
+//! when the file found on a `412` holds exactly those bytes (or the ones being written now), it
+//! is the worker's own write, not a change made outside, and the room goes on from it without a
+//! copy.
 //! A write that keeps failing for another reason is given up after [`SAVE_GIVE_UP_MS`].
 //!
 //! When saving stops for good, and before the worker leaves a room, it sends the editors `ended`
@@ -136,8 +141,11 @@ pub const HEARTBEAT_MS: u64 = 30_000;
 pub const EMPTY_GRACE_MS: u64 = 10_000;
 /// Turns live before the first join counts as caught up (half a second at [`TICK`]).
 const SETTLE_STEPS: u32 = 5;
-/// A room no editor ever joined is given up after this long.
+/// A room no editor ever joined is given up after this long; an announced window is waited for
+/// this long.
 pub const ALONE_MS: u64 = 120_000;
+/// Announced windows kept at once (the oldest is dropped past it).
+const EXPECTED_MAX: usize = 64;
 /// How long a service ticket is good for.
 pub const TICKET_SECS: i64 = 600;
 /// A ticket this old is replaced, so a reconnect never offers one close to expiry.
@@ -680,14 +688,18 @@ pub struct Room<H: Hub, S: DocumentService> {
     checkpoint_now: bool,
     /// When the first of the writes failing in a row (not conflicts) failed.
     put_failing_since: Option<u64>,
+    /// The bytes of the newest write whose answer never came (a timeout, a dropped connection, a
+    /// 5xx from a proxy): the server may hold them all the same. Cleared by the next write that
+    /// is answered.
+    unanswered: Option<Vec<u8>>,
     beat: Beat,
     opened_at: u64,
     seen_editor: bool,
     empty_since: Option<u64>,
-    /// A window was announced (a notify, or a close refused as reopened) at this time and has
-    /// not joined yet: the room is not closed for being empty meanwhile. Cleared when an editor
-    /// joins after it, or after [`ALONE_MS`].
-    expected: Option<u64>,
+    /// The windows announced (a notify, or a close refused as reopened) that have not joined
+    /// yet, by when, oldest first: the room is not closed for being empty while there is one.
+    /// Each editor joining takes the oldest; each is dropped [`ALONE_MS`] after it came.
+    expected: Vec<u64>,
     /// The editors in the room at the last turn, to see one join.
     editors_before: usize,
 }
@@ -755,11 +767,12 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             first_checkpoint: false,
             checkpoint_now: false,
             put_failing_since: None,
+            unanswered: None,
             beat,
             opened_at: now,
             seen_editor: false,
             empty_since: None,
-            expected: None,
+            expected: Vec::new(),
             editors_before: 0,
         })
     }
@@ -835,14 +848,12 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             return Flow::Done;
         }
 
-        if let Some(at) = self.expected
-            && (editors > self.editors_before || now.saturating_sub(at) >= ALONE_MS)
-        {
-            self.expected = None;
-        }
+        self.expected.retain(|at| now.saturating_sub(*at) < ALONE_MS);
+        let joined = editors.saturating_sub(self.editors_before).min(self.expected.len());
+        self.expected.drain(..joined);
         self.editors_before = editors;
         if editors == 0 {
-            if self.expected.is_some() {
+            if !self.expected.is_empty() {
                 self.empty_since = None;
             } else if self.seen_editor || now.saturating_sub(self.opened_at) >= ALONE_MS {
                 self.empty_since.get_or_insert(now);
@@ -878,6 +889,13 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                         self.expect_window(now);
                         return Flow::Continue;
                     }
+                    // A ticket into the room came while the close was unanswered (a slow server):
+                    // its window is served, as after a refused close.
+                    Err(e) if self.files.renotified() => {
+                        say(&self.doc_id, format_args!("closing the room failed: {e}; a window is on its way, serving it on"));
+                        self.expect_window(now);
+                        return Flow::Continue;
+                    }
                     Err(e) => {
                         say(&self.doc_id, format_args!("closing the room failed: {e}; leaving it open"));
                         false
@@ -894,7 +912,10 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// window is on its way. Until an editor joins after now, or [`ALONE_MS`] has passed, the
     /// room is not closed for being empty.
     fn expect_window(&mut self, now: u64) {
-        self.expected = Some(now);
+        if self.expected.len() >= EXPECTED_MAX {
+            self.expected.remove(0);
+        }
+        self.expected.push(now);
         self.empty_since = None;
     }
 
@@ -1079,7 +1100,8 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// PUT over the known version. When it changed outside, copy that version aside, write over
     /// it, and only then tell the editors where it was kept.
     async fn put(&mut self, bytes: Vec<u8>) -> Result<String, WriteFail> {
-        let outcome = match self.files.put(bytes.clone(), &self.etag).await {
+        let etag = self.etag.clone();
+        let outcome = match self.put_over(bytes.clone(), &etag).await {
             Err(FileError::Stale) => self.keep_outside(bytes).await,
             // The write that follows a conflict copy is part of keeping the outside version.
             Err(e) if !self.untold_copies.is_empty() => Err(ConflictFail::from(e)),
@@ -1110,9 +1132,37 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         Err(WriteFail::Stop(if copies.is_empty() { why } else { format!("{why}; the outside version was kept as {}", copies.join(", ")) }))
     }
 
-    /// The outside version copied aside and the session written over it: the new ETag.
+    /// Write `bytes` over the version `etag`. A write with no answer (not one the server
+    /// refused) may have landed all the same: its bytes are kept, so a `412` after it can tell
+    /// the worker's own write from a change made outside.
+    async fn put_over(&mut self, bytes: Vec<u8>, etag: &str) -> Result<String, FileError> {
+        let sent = bytes.clone();
+        let result = self.files.put(bytes, etag).await;
+        match &result {
+            Ok(_) => self.unanswered = None,
+            Err(FileError::Http(_)) => self.unanswered = Some(sent),
+            // Refused: nothing written this time (an earlier unanswered write may still have been).
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// The file changed since the version the worker wrote over (`412`). When it holds what the
+    /// worker wrote itself (a write whose answer never came, or these very bytes), the worker
+    /// goes on from it. Otherwise the outside version is copied aside and the session written
+    /// over it. The new ETag.
     async fn keep_outside(&mut self, bytes: Vec<u8>) -> Result<String, ConflictFail> {
         let outside = self.files.get().await.map_err(ConflictFail::from)?;
+        if outside.bytes == bytes || self.unanswered.as_ref() == Some(&outside.bytes) {
+            say(&self.doc_id, "the file holds the session's own version (a save whose answer never came); no copy, going on from it");
+            self.unanswered = None;
+            self.etag = outside.etag;
+            if outside.bytes == bytes {
+                return Ok(self.etag.clone());
+            }
+            let etag = self.etag.clone();
+            return self.put_over(bytes, &etag).await.map_err(ConflictFail::from);
+        }
         // The file may have been renamed since it was first read: the copy is named after it as
         // it is now. Still a file the service saves, or the format it is written in would change.
         if outside.name != self.file_name && self.service.accepts(&outside.name) {
@@ -1122,7 +1172,8 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         say(&self.doc_id, "the file changed outside the session; that version was copied aside");
         self.untold_copies.push(name);
         self.etag = outside.etag;
-        self.files.put(bytes, &self.etag).await.map_err(ConflictFail::from)
+        let etag = self.etag.clone();
+        self.put_over(bytes, &etag).await.map_err(ConflictFail::from)
     }
 
     /// A write went through: tell the editors of the conflict copies made for it.
