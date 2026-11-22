@@ -19,7 +19,11 @@
 //!    file's ETag. Then every editor is told (`saved {seq, etag}`).
 //! 4. heartbeats the room every [`HEARTBEAT_MS`], and once no editor has been in the room for
 //!    [`EMPTY_GRACE_MS`], saves a last time, closes the room (which releases the app lock) and
-//!    leaves.
+//!    leaves. The close says how long the room has been empty (`?idle=` seconds); the app
+//!    refuses it (`409`) when it handed out an edit ticket into the room since. A refused close,
+//!    like a new notify for a room being served (a reopen: the app's ticket joined this room),
+//!    means a window is on its way: the worker keeps serving the room and waits for it as for a
+//!    new grant's first editor ([`ALONE_MS`]). So a reopen never lands in a room the worker left.
 //!
 //! Right after its first join has caught up, the worker checkpoints the room once, so an editor
 //! that joins later restores the room's document from that snapshot instead of seeding from a
@@ -499,9 +503,33 @@ impl RoomFiles {
         self.send(self.nc.http.post(self.url("room", "/heartbeat"))).await.map(drop)
     }
 
-    pub async fn close(&self) -> Result<(), FileError> {
-        self.send(self.nc.http.post(self.url("room", "/close"))).await.map(drop)
+    /// Close the room, which has had no editor for `idle_secs`. [`Closed::Reopened`] when the app
+    /// refused it because it handed out an edit ticket into the room since (`409`).
+    pub async fn close(&self, idle_secs: u64) -> Result<Closed, FileError> {
+        match self.send(self.nc.http.post(self.url("room", &format!("/close?idle={idle_secs}")))).await {
+            Ok(_) => Ok(Closed::Closed),
+            Err(FileError::Exists) => Ok(Closed::Reopened),
+            Err(e) => Err(e),
+        }
     }
+
+    /// Whether a notify for this room came since the last call (the app handed out another
+    /// ticket into it).
+    pub fn renotified(&mut self) -> bool {
+        let changed = self.token.has_changed().unwrap_or(false);
+        if changed {
+            self.token.borrow_and_update();
+        }
+        changed
+    }
+}
+
+/// What the app said to a room's close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    Closed,
+    /// Refused: an edit ticket into the room was handed out since it emptied.
+    Reopened,
 }
 
 fn bare_etag(e: &str) -> String {
@@ -755,6 +783,9 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// heartbeat, start a save when one is due, and close the room once it has stayed empty.
     pub async fn step(&mut self) -> Flow {
         let now = self.clock.now_ms();
+        if self.files.renotified() {
+            self.expect_editor(now);
+        }
         let editors = self.doc.pump();
         for n in self.doc.live_mut().take_notices() {
             say(&self.doc_id, format_args!("live: {n}"));
@@ -813,10 +844,16 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                 }
                 // Only a room the app closed is marked closed: one it still holds may get a
                 // worker again (its stale job re-notifies), and an editor rejoining it waits.
-                let closed = match self.files.close().await {
-                    Ok(()) => {
+                let idle_secs = now.saturating_sub(self.empty_since.unwrap_or(now)) / 1000;
+                let closed = match self.files.close(idle_secs).await {
+                    Ok(Closed::Closed) => {
                         say(&self.doc_id, "no editors left; room closed");
                         true
+                    }
+                    Ok(Closed::Reopened) => {
+                        say(&self.doc_id, "reopened while empty; serving it on");
+                        self.expect_editor(now);
+                        return Flow::Continue;
                     }
                     Err(e) => {
                         say(&self.doc_id, format_args!("closing the room failed: {e}; leaving it open"));
@@ -828,6 +865,15 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             }
         }
         Flow::Continue
+    }
+
+    /// A ticket into this room was handed out (a notify came, or the app refused the close): an
+    /// editor is on its way. Wait for it as for a new grant's first editor, and only close the
+    /// room once it has been empty again.
+    fn expect_editor(&mut self, now: u64) {
+        self.opened_at = now;
+        self.seen_editor = false;
+        self.empty_since = None;
     }
 
     /// Mark the document dirty when its body is no longer the one the file holds, however it
