@@ -70,6 +70,8 @@ todo = "warn"
 
 [dependencies]
 axum = "0.8"
+# Only for `update_is_sound`, to check a yrs op before it is ordered (see `room::crdt_ops_sound`).
+craft-collab = { workspace = true }
 craft-cloud = { workspace = true }
 craft-esign = { workspace = true }
 craft-nextcloud = { workspace = true }

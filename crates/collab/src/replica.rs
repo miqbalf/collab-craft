@@ -22,7 +22,6 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use yrs::undo::UndoManager;
 use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
 use yrs::{Any, ClientID, Doc, MapRef, Number, OffsetKind, Options, Origin, ReadTxn, StateVector, Transact, TransactionMut, Update, WriteTxn};
 
 use crate::ydoc::LiveError;
@@ -41,7 +40,7 @@ pub const UNTRACKED: &str = "craft-collab/untracked";
 pub const MAX_PENDING_UPDATES: usize = 2048;
 /// How many encoded bytes of waiting updates the replica keeps before it gives up and raises
 /// [`YReplica::needs_resync`].
-pub const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 /// One yrs replica with a fixed schema, as [`Live`](crate::Live) drives it.
 ///
@@ -89,8 +88,11 @@ pub struct YReplica {
     untracked: bool,
     /// Updates were dropped because dependencies never came ([`YReplica::needs_resync`]).
     resync: bool,
-    /// How many applies since the last time nothing was pending have left something pending.
+    /// How many updates have been held, as is, since nothing was last pending: applies that
+    /// advanced nothing (duplicates of a held update count again).
     held: usize,
+    /// The encoded size of those updates, from their incoming sizes.
+    held_bytes: usize,
 }
 
 impl YReplica {
@@ -116,7 +118,7 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0 }
+        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0, held_bytes: 0 }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -163,6 +165,15 @@ impl YReplica {
         self.damaged
     }
 
+    /// Carry the marks and the held counts of `old` across a rebuild that kept its state (the
+    /// state includes what yrs holds, so the counts still describe it).
+    pub fn carry_marks(&mut self, old: &YReplica) {
+        self.damaged = old.damaged;
+        self.resync = old.resync;
+        self.held = old.held;
+        self.held_bytes = old.held_bytes;
+    }
+
     /// Carry the damaged mark across a rebuild, or set it (a test of a caught panic).
     pub fn set_damaged(&mut self, damaged: bool) {
         self.damaged = damaged;
@@ -179,19 +190,25 @@ impl YReplica {
     /// [`needs_resync`](Self::needs_resync) is raised.
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
         let before = self.doc.transact().state_vector();
-        if let Err(e) = integrate(&self.doc, update) {
-            if e == Integrate::Panicked {
-                self.damaged = true;
-            }
+        let first = integrate(&self.doc, update);
+        if first == Err(Integrate::Panicked) {
+            self.damaged = true;
             return Err(LiveError::Decode);
         }
-        if let Err(e) = self.settle(before) {
-            if e == Integrate::Panicked {
-                self.damaged = true;
-            }
+        // Also after a refusal: yrs may have integrated part of the update first, which can
+        // make a held one ready.
+        if self.settle(before.clone(), update.len()) == Err(Integrate::Panicked) {
+            self.damaged = true;
             return Err(LiveError::Decode);
         }
-        Ok(())
+        if first.is_err() && self.doc.transact().state_vector() != before {
+            // Part of it landed before yrs refused the rest (or a held update it released), so
+            // what is held may be gone with the refusal: behind, but the apply did happen.
+            log::warn!("collab: an update applied only in part; resync needed");
+            self.drop_held();
+            return Ok(());
+        }
+        first.map_err(|_| LiveError::Decode)
     }
 
     /// A fresh document with this replica's client id holding exactly `state` (a checkpoint, or
@@ -199,25 +216,42 @@ impl YReplica {
     /// [`needs_resync`](Self::needs_resync). It is built from nothing rather than applied onto
     /// this document, because yrs's own held-update buffer is not bounded by our caps and a
     /// stuck document would carry it along. The schema [`assemble`](Self::assemble)s the result
-    /// again with the same client, which also clears the resync mark. Refused when the state
-    /// does not decode or itself leaves updates waiting for dependencies; this replica is
+    /// again with the same client, which also clears the resync mark.
+    ///
+    /// The client id stays the same, because it is the space the relay granted and the app's
+    /// own ids are minted from it; a fresh id cannot be invented here. That is only safe when
+    /// `state` holds every edit this replica already sent, or the next edit would reuse a clock
+    /// and be dropped by every peer as a duplicate. So the state's clock for this client must
+    /// not be behind this replica's own: otherwise [`LiveError::Stale`]. Also refused: a state
+    /// that does not decode or itself leaves updates waiting for dependencies. This replica is
     /// unchanged then.
     pub fn rebuilt_from_state(&self, state: &[u8]) -> Result<Doc, LiveError> {
-        let doc = build_doc(self.doc.client_id().get());
+        let own = self.doc.client_id();
+        let doc = build_doc(own.get());
         integrate(&doc, state).map_err(LiveError::from)?;
         if doc.transact().has_missing_updates() {
             return Err(LiveError::Decode);
         }
+        let theirs = doc.transact().state_vector().get(&own);
+        if theirs < self.doc.transact().state_vector().get(&own) {
+            return Err(LiveError::Stale);
+        }
         Ok(doc)
     }
 
-    /// After an apply: retry what yrs holds when the apply advanced the state vector, then
-    /// enforce the bounds on what is still held.
-    fn settle(&mut self, mut before: StateVector) -> Result<(), Integrate> {
+    /// After an apply of `incoming` bytes: retry what yrs holds when the apply advanced the
+    /// state vector, then enforce the bounds on what is still held.
+    ///
+    /// Failing part way through a retry means some held updates were taken out and not all went
+    /// back in, so this replica is behind without knowing it: resync is raised, and the apply
+    /// that triggered it still counts as done.
+    fn settle(&mut self, mut before: StateVector, incoming: usize) -> Result<(), Integrate> {
+        let mut advanced = false;
         loop {
             let txn = self.doc.transact();
             if !txn.has_missing_updates() {
                 self.held = 0;
+                self.held_bytes = 0;
                 return Ok(());
             }
             let now = txn.state_vector();
@@ -225,21 +259,39 @@ impl YReplica {
             if now == before {
                 break;
             }
+            advanced = true;
             before = now;
-            integrate_held(&self.doc)?;
+            match integrate_held(&self.doc) {
+                Ok(()) => {}
+                Err(Integrate::Panicked) => return Err(Integrate::Panicked),
+                Err(Integrate::Refused) => {
+                    log::warn!("collab: held updates did not apply together; dropped, resync needed");
+                    self.drop_held();
+                    return Ok(());
+                }
+            }
         }
-        self.held += 1;
-        let txn = self.doc.transact();
-        let store = txn.store();
-        let bytes = store.pending_update().map_or(0, |p| p.update.encode_v1().len()) + store.pending_ds().map_or(0, |d| d.encode_v1().len());
-        drop(txn);
-        if self.held > MAX_PENDING_UPDATES || bytes > MAX_PENDING_BYTES {
-            log::warn!("collab: {} updates ({bytes} bytes) are waiting for dependencies that did not come; dropped, resync needed", self.held);
-            drop(self.doc.transact_mut_with(REMOTE).prune_pending());
-            self.held = 0;
-            self.resync = true;
+        if !advanced {
+            self.held += 1;
+            self.held_bytes += incoming;
+        }
+        if self.held > MAX_PENDING_UPDATES || self.held_bytes > MAX_PENDING_BYTES {
+            log::warn!(
+                "collab: {} updates ({} bytes) are waiting for dependencies that did not come; dropped, resync needed",
+                self.held,
+                self.held_bytes
+            );
+            self.drop_held();
         }
         Ok(())
+    }
+
+    /// Throw away what is held and say the replica is behind.
+    fn drop_held(&mut self) {
+        drop(self.doc.transact_mut_with(REMOTE).prune_pending());
+        self.held = 0;
+        self.held_bytes = 0;
+        self.resync = true;
     }
 
     /// The whole document as one update (v1), for a checkpoint or a peer starting from nothing.
@@ -336,6 +388,27 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
     }
 }
 
+/// Whether `bytes` are a yrs update (v1) that decodes and whose ids are sane: no block or delete
+/// range runs past `u32::MAX`. For a relay to check an op before it orders it, so a crafted
+/// update never reaches a browser replica, where a yrs panic aborts the page.
+///
+/// Runs under `catch_unwind`, so a panic while decoding is a refusal. This is a check of
+/// the update on its own; whether it fits a document's history is only known to a replica.
+#[must_use]
+pub fn update_is_sound(bytes: &[u8]) -> bool {
+    std::panic::catch_unwind(|| {
+        let Ok(update) = Update::decode_v1(bytes) else {
+            return false;
+        };
+        let ranges_ok = |set: &yrs::IdSet| set.iter().all(|(_, ranges)| ranges.iter().all(|r| r.start <= r.end));
+        // The end of a client's blocks (clock + len, which wraps where overflow checks are off)
+        // can never be before where they start.
+        let (ends, starts) = (update.state_vector(), update.state_vector_lower());
+        ranges_ok(update.delete_set()) && ranges_ok(&update.insertions(true)) && starts.iter().all(|(client, start)| ends.get(client) >= *start)
+    })
+    .unwrap_or(false)
+}
+
 /// Take what yrs holds for missing dependencies out and apply it again, under `catch_unwind`
 /// for the same reason as [`integrate`]. What still lacks a dependency goes back to being held.
 fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
@@ -419,6 +492,7 @@ pub fn to_json(a: &Any) -> Value {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use yrs::updates::encoder::Encode;
     use yrs::{GetString, Text};
 
     use super::*;
@@ -725,6 +799,109 @@ mod tests {
             let _ = y.state();
         }
         assert!(start.elapsed().as_secs() < 30, "junk took {:?}", start.elapsed());
+    }
+
+    /// One v1 update by hand: client `client` at clock 0, one string item "a" whose parent is
+    /// the item `(pc, 0)`, with no origin.
+    fn child_of(client: u8, pc: u8) -> Vec<u8> {
+        vec![1, 1, client, 0, 0x04, 0, pc, 0, 1, b'a', 0]
+    }
+
+    /// Held updates that fail to apply together (one names a string item as its parent) raise
+    /// resync, never an error for the update that did apply, and never panic or damage.
+    #[test]
+    fn a_failing_retry_raises_resync_and_still_counts_as_applied() {
+        let (first, rest, _) = withheld(&[2, 1, 1]);
+        let (mut y, _) = peer(99);
+        y.apply(&child_of(5, 1)).unwrap();
+        y.apply(&rest[0]).unwrap();
+        assert!(pending(&y));
+        assert!(!y.needs_resync());
+        assert!(y.apply(&first).is_ok(), "the dependency did apply");
+        assert!(y.needs_resync());
+        assert!(!y.damaged());
+        assert!(!pending(&y), "nothing is left held");
+    }
+
+    /// A rebuild from a state that lacks this replica's own sent edits is refused, because the
+    /// next edit would reuse a clock.
+    #[test]
+    fn rebuild_from_a_stale_state_is_refused() {
+        let (mut y, text) = peer(99);
+        let before = y.state();
+        y.local(|txn| {
+            text.insert(txn, 0, "mine");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(y.rebuilt_from_state(&before).err(), Some(LiveError::Stale));
+        let after = y.state();
+        assert!(y.rebuilt_from_state(&after).is_ok());
+    }
+
+    /// Measures the cost of an apply that stays held, with the buffer near the caps. Prints the
+    /// worst and mean time per apply; asserts only a generous ceiling so a loaded machine does
+    /// not flake. See the report for the numbers the caps were set from.
+    #[test]
+    fn held_buffer_worst_case_cost() {
+        for (count, size) in [(MAX_PENDING_UPDATES - 1, 16), (64, MAX_PENDING_BYTES / 80), (MAX_PENDING_BYTES / 1024 - 1, 1024)] {
+            let sizes: Vec<usize> = std::iter::repeat_n(size, count + 1).collect();
+            let (first, rest, _) = withheld(&sizes);
+            let (mut y, _) = peer(99);
+            let (mut worst, mut total) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for u in &rest {
+                let t = std::time::Instant::now();
+                y.apply(u).unwrap();
+                let d = t.elapsed();
+                worst = worst.max(d);
+                total += d;
+            }
+            let t = std::time::Instant::now();
+            y.apply(&first).unwrap();
+            let release = t.elapsed();
+            println!(
+                "COST count {} size {size}: worst {worst:?} mean {:?} release {release:?} resync {}",
+                rest.len(),
+                total / u32::try_from(rest.len()).unwrap(),
+                y.needs_resync()
+            );
+            assert!(worst.as_millis() < 2000 && release.as_millis() < 2000, "worst {worst:?} release {release:?}");
+        }
+    }
+
+    fn varuint(mut n: u32, out: &mut Vec<u8>) {
+        while n > 127 {
+            out.push(u8::try_from(n & 127).unwrap() | 128);
+            n >>= 7;
+        }
+        out.push(u8::try_from(n).unwrap());
+    }
+
+    /// Orphans from many distinct clients, each waiting on the same missing item: the held
+    /// update names one client per orphan, which is what makes yrs's merge widest.
+    #[test]
+    fn held_buffer_cost_with_many_clients() {
+        let (first, _, _) = withheld(&[2, 1]);
+        let (mut y, _) = peer(99);
+        let (mut worst, mut total, mut n) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0_u32);
+        for i in 0..MAX_PENDING_UPDATES as u32 {
+            let mut u = vec![1, 1];
+            varuint(1000 + i, &mut u);
+            u.extend([0, 0x04, 0, 1, 0, 1, b'a', 0]);
+            let t = std::time::Instant::now();
+            y.apply(&u).unwrap();
+            let d = t.elapsed();
+            worst = worst.max(d);
+            total += d;
+            n += 1;
+            if y.needs_resync() {
+                break;
+            }
+        }
+        let t = std::time::Instant::now();
+        y.apply(&first).unwrap();
+        println!("COST clients {n}: worst {worst:?} mean {:?} release {:?} resync {}", total / n, t.elapsed(), y.needs_resync());
+        assert!(worst.as_millis() < 2000);
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.

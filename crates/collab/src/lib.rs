@@ -73,7 +73,7 @@ pub use proto::{
     CRDT_POS, CRDT_TEXT, ClientMsg, DocId, LockState, PROTO, PeerId, Presence, REFUSED_AUTH, REFUSED_FULL, REFUSED_PROTO, REFUSED_SCHEMA, RETRY,
     Scope, ServerMsg, is_crdt_command,
 };
-pub use replica::{Replica, YReplica};
+pub use replica::{Replica, YReplica, update_is_sound};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};

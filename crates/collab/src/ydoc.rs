@@ -104,6 +104,10 @@ pub enum LiveError {
     /// A position or length past the end of the text, or of the order.
     #[error("position out of range")]
     OutOfRange,
+    /// A full state that is behind this replica's own sent edits: rebuilding from it would
+    /// reuse clocks, so it is refused.
+    #[error("that state is behind this replica's own edits")]
+    Stale,
     /// The update bytes did not decode, or did not apply.
     #[error("the update did not decode")]
     Decode,
@@ -179,11 +183,8 @@ impl LiveDoc {
             return Ok(());
         }
         let doc = self.y.rebuilt(space)?;
-        let damaged = self.y.damaged();
-        let resync = self.y.needs_resync();
-        *self = assemble(doc, Some(space));
-        self.y.set_damaged(damaged);
-        self.y.set_needs_resync(resync);
+        let old = std::mem::replace(self, assemble(doc, Some(space)));
+        self.y.carry_marks(&old.y);
         Ok(())
     }
 
@@ -456,6 +457,12 @@ impl LiveDoc {
         // The observer saw this replica's own change; nobody needs it reported back.
         self.drain_seen();
         Ok(update)
+    }
+
+    /// Mark the replica behind, as an overflow of held updates would.
+    #[cfg(test)]
+    pub(crate) fn force_resync(&mut self, on: bool) {
+        self.y.set_needs_resync(on);
     }
 
     /// Mark the replica damaged, as a caught yrs panic would.

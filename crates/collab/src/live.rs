@@ -583,7 +583,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         if self.catching_up() {
             return Err(Error::malformed("client", "the join's catch-up has not arrived yet"));
         }
-        let state = self.sound_doc()?.state();
+        let doc = self.sound_doc()?;
+        if doc.needs_resync() {
+            // It dropped updates the room holds, so its state is not the room's: written as the
+            // checkpoint it would take those edits out of the file and out of the replay.
+            return Err(Error::malformed("client", "this replica is behind the room; reopen the file before saving"));
+        }
+        let state = doc.state();
         let params = serde_json::to_value(TextPayload::snapshot(&state)).map_err(|e| Error::malformed("client", e.to_string()))?;
         let bytes = measure(&params);
         if self.text_cap.is_some_and(|cap| bytes > cap) {
@@ -1450,6 +1456,23 @@ mod tests {
         assert!(live.redo().is_err());
         assert!(live.checkpoint().is_err());
         assert_eq!(hub.0.borrow().0.len(), 1, "only the edit before the damage went out");
+    }
+
+    /// A replica that dropped held updates (`needs_resync`) never becomes the room's checkpoint.
+    #[test]
+    fn a_replica_behind_the_room_does_not_checkpoint() {
+        let hub = Hub0::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&[block()]).unwrap();
+        hub.0.borrow_mut().1.push(joined_msg());
+        live.pump();
+        live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
+        live.doc.as_mut().unwrap().force_resync(true);
+        let sent = hub.0.borrow().0.len();
+        assert!(live.checkpoint().is_err());
+        assert_eq!(hub.0.borrow().0.len(), sent, "nothing went out");
+        live.doc.as_mut().unwrap().force_resync(false);
+        assert!(live.checkpoint().is_ok(), "the refusal was about being behind");
     }
 
     /// A schema that is not `LiveDoc`: one text, written on `YReplica`. What `Live` needs from

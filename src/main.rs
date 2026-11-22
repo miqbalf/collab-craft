@@ -85,7 +85,7 @@ use socketioxide::extract::{Data, SocketRef, State};
 use tokio::sync::Mutex;
 
 use bus::{Bus, LockOutcome};
-use room::{Op, Peer, Refusal, Room, Submission, is_crdt_command};
+use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, is_crdt_command};
 
 /// Bytes one opaque frame may carry, base64 included.
 ///
@@ -162,6 +162,10 @@ const CODE_FULL: &str = "full";
 /// [`ErrorMsg::code`] on a refused connection: the join named another replica schema than the
 /// one its room is pinned to, or a malformed one. Reconnecting with the same build cannot help.
 const CODE_SCHEMA: &str = "schema";
+
+/// [`ErrorMsg::code`] on a refused submit whose update is not a valid document update for the
+/// room's replica schema. Nothing was ordered or kept; sending it again cannot help.
+const CODE_INVALID: &str = "invalid";
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -1121,6 +1125,19 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     };
     if let Err(refusal) = preflight {
         let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: refusal.detail(), local, code: None });
+        return;
+    }
+
+    // A yrs update that does not decode, or whose ids overflow, is refused here: ordered, it
+    // would be replayed to every joiner and abort the browser replicas that decode it. Before
+    // the sequence number, so nothing is burned.
+    let schema = relay.rooms.lock().await.get(&claims.rm).and_then(|r| r.schema().map(str::to_owned));
+    if !crdt_ops_sound(schema.as_deref(), &msg.command, &msg.params) {
+        tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op that is not a valid document update");
+        let _ = socket.emit(
+            "error",
+            &ErrorMsg { doc: room_name, detail: "that change is not a valid document update".to_owned(), local, code: Some(CODE_INVALID) },
+        );
         return;
     }
 
