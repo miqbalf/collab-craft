@@ -21,9 +21,11 @@
 //!    [`EMPTY_GRACE_MS`], saves a last time, closes the room (which releases the app lock) and
 //!    leaves. The close says how long the room has been empty (`?idle=` seconds); the app
 //!    refuses it (`409`) when it handed out an edit ticket into the room since. A refused close,
-//!    like a new notify for a room being served (a reopen: the app's ticket joined this room),
-//!    means a window is on its way: the worker keeps serving the room and waits for it as for a
-//!    new grant's first editor ([`ALONE_MS`]). So a reopen never lands in a room the worker left.
+//!    like a new notify for a room being served (another window got a ticket into this room,
+//!    whether or not an editor was in it then), marks a window as expected: until an editor
+//!    joins after the mark, or [`ALONE_MS`] has passed, the empty-room close does not run. So a
+//!    window the worker was told about never lands in a room the worker left, however slowly
+//!    it loads (up to [`ALONE_MS`]).
 //!
 //! Right after its first join has caught up, the worker checkpoints the room once, so an editor
 //! that joins later restores the room's document from that snapshot instead of seeding from a
@@ -677,6 +679,12 @@ pub struct Room<H: Hub, S: DocumentService> {
     opened_at: u64,
     seen_editor: bool,
     empty_since: Option<u64>,
+    /// A window was announced (a notify, or a close refused as reopened) at this time and has
+    /// not joined yet: the room is not closed for being empty meanwhile. Cleared when an editor
+    /// joins after it, or after [`ALONE_MS`].
+    expected: Option<u64>,
+    /// The editors in the room at the last turn, to see one join.
+    editors_before: usize,
 }
 
 impl<H: Hub, S: DocumentService + Default> Room<H, S> {
@@ -746,6 +754,8 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             opened_at: now,
             seen_editor: false,
             empty_since: None,
+            expected: None,
+            editors_before: 0,
         })
     }
 
@@ -784,7 +794,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     pub async fn step(&mut self) -> Flow {
         let now = self.clock.now_ms();
         if self.files.renotified() {
-            self.expect_editor(now);
+            self.expect_window(now);
         }
         let editors = self.doc.pump();
         for n in self.doc.live_mut().take_notices() {
@@ -820,8 +830,16 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             return Flow::Done;
         }
 
+        if let Some(at) = self.expected
+            && (editors > self.editors_before || now.saturating_sub(at) >= ALONE_MS)
+        {
+            self.expected = None;
+        }
+        self.editors_before = editors;
         if editors == 0 {
-            if self.seen_editor || now.saturating_sub(self.opened_at) >= ALONE_MS {
+            if self.expected.is_some() {
+                self.empty_since = None;
+            } else if self.seen_editor || now.saturating_sub(self.opened_at) >= ALONE_MS {
                 self.empty_since.get_or_insert(now);
             }
         } else {
@@ -852,7 +870,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                     }
                     Ok(Closed::Reopened) => {
                         say(&self.doc_id, "reopened while empty; serving it on");
-                        self.expect_editor(now);
+                        self.expect_window(now);
                         return Flow::Continue;
                     }
                     Err(e) => {
@@ -867,12 +885,11 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         Flow::Continue
     }
 
-    /// A ticket into this room was handed out (a notify came, or the app refused the close): an
-    /// editor is on its way. Wait for it as for a new grant's first editor, and only close the
-    /// room once it has been empty again.
-    fn expect_editor(&mut self, now: u64) {
-        self.opened_at = now;
-        self.seen_editor = false;
+    /// A ticket into this room was handed out (a notify came, or the app refused the close): a
+    /// window is on its way. Until an editor joins after now, or [`ALONE_MS`] has passed, the
+    /// room is not closed for being empty.
+    fn expect_window(&mut self, now: u64) {
+        self.expected = Some(now);
         self.empty_since = None;
     }
 
