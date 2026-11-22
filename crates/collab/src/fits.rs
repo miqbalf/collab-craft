@@ -89,9 +89,70 @@ fn of_branch(b: &BranchPtr) -> Parent {
 
 const OPEN: Parent = Parent { key: None, class: Class::Open };
 
-/// Whether content of kind `kind` may go under `class`.
-fn allowed(class: Class, kind: u8) -> bool {
-    !(class == Class::List && matches!(kind, 4..=6))
+/// How deep shared types may nest. yrs deletes, reads and encodes nested types recursively:
+/// 5,000 levels overflow a 1 MiB stack (a browser's) natively in release, which aborts (yrs
+/// #749). No Craft app nests more than a few levels.
+pub(crate) const MAX_NESTING: usize = 64;
+
+/// How many types `p` sits under, counting itself (a root is 0): through the update's own type
+/// items, then up the document, which is a walk of each parent's list, so it stops past
+/// [`MAX_NESTING`].
+fn depth_of<T: ReadTxn>(
+    txn: &T,
+    sv: &StateVector,
+    at: &Local<'_>,
+    p: &Parent,
+    memo: &mut HashMap<usize, Resolved>,
+    depths: &mut HashMap<(u64, u32), usize>,
+) -> usize {
+    let mut key = p.key.clone();
+    let mut chain = Vec::new();
+    let mut depth = 0;
+    let base = loop {
+        match &key {
+            None | Some(Key::Root(_)) => break 0,
+            Some(Key::Nested(id)) => {
+                if let Some(d) = depths.get(id) {
+                    break *d;
+                }
+                if chain.len() > MAX_NESTING {
+                    break MAX_NESTING;
+                }
+                chain.push(*id);
+                key = match at.find(*id) {
+                    // A type of this update: where it goes.
+                    Some(j) => match parent_of(txn, sv, at, j, memo, 0) {
+                        Resolved::Known(q) => q.key,
+                        _ => None,
+                    },
+                    None => StickyIndex::from_id(yid(*id), Assoc::After).get_offset(txn).map(|o| of_branch(&o.branch)).and_then(|q| q.key),
+                };
+            }
+        }
+    };
+    // Record every type on the way, deepest last.
+    for id in chain.iter().rev() {
+        depth += 1;
+        depths.insert(*id, base + depth);
+    }
+    base + chain.len()
+}
+
+/// Whether content of kind `kind` may go under `class` (`keyed`: as a map entry of it).
+///
+/// A list takes no string, embed or format, keyed or not (a keyed string makes a map event
+/// unwrap `None`). A text's list takes no plain value, binary or sub-document: yrs counts them
+/// in the text's length but no reader shows them, so offsets an app computes from the
+/// characters run past the end (`Couldn't remove … elements`). As map entries (attributes) a
+/// text takes plain values, binaries and types, but no string, embed or format: those are list
+/// content, and the fuzz found a keyed string that makes a later cut panic (text.rs:845 again).
+fn allowed(class: Class, kind: u8, keyed: bool) -> bool {
+    match class {
+        Class::List => !matches!(kind, 4..=6),
+        Class::Text if keyed => !matches!(kind, 4..=6),
+        Class::Text => !matches!(kind, 3 | 8 | 9),
+        Class::Open => true,
+    }
 }
 
 /// Parents of items checked before, so the next keystroke (whose origin is the last one) does
@@ -99,6 +160,10 @@ fn allowed(class: Class, kind: u8) -> bool {
 #[derive(Default)]
 pub(crate) struct Seen {
     map: BTreeMap<(u64, u32), (u32, Parent)>,
+    /// What the last [`check`] that fit found, kept by [`Seen::commit`] once the update lands.
+    /// Not before: an update that waits, or that yrs holds back, may never land, and another
+    /// can bring the same ids with other content (found by the fuzz: a stale entry hid a split).
+    staged: Vec<((u64, u32), u32, Parent)>,
 }
 
 /// How many items [`Seen`] keeps before it starts over.
@@ -108,6 +173,16 @@ impl Seen {
     fn find(&self, id: (u64, u32)) -> Option<Parent> {
         let (start, (len, p)) = self.map.range(..=id).next_back()?;
         (start.0 == id.0 && id.1 < start.1.saturating_add(*len)).then(|| p.clone())
+    }
+
+    /// Keep what the last check staged, for the items `txn`'s document now holds.
+    pub(crate) fn commit<T: ReadTxn>(&mut self, txn: &T) {
+        let sv = txn.state_vector();
+        for (id, len, p) in std::mem::take(&mut self.staged) {
+            if len > 0 && present(&sv, (id.0, id.1 + (len - 1))) {
+                self.keep(id, len, p);
+            }
+        }
     }
 
     fn keep(&mut self, id: (u64, u32), len: u32, p: Parent) {
@@ -141,11 +216,12 @@ impl Local<'_> {
 }
 
 /// Where an item may be resolved: what yrs makes of it.
+#[derive(Clone)]
 enum Resolved {
     Known(Parent),
     /// A dependency is missing: this id.
     Waiting((u64, u32)),
-    /// Origin and right origin sit in different parents.
+    /// Origin and right origin sit in different parents, or the item names itself.
     Split,
 }
 
@@ -165,57 +241,117 @@ pub(crate) fn check<T: ReadTxn>(txn: &T, items: &[Placed], seen: &mut Seen) -> V
             if have >= p.id.1.saturating_add(p.len) {
                 return None;
             }
-            let right = match &p.under {
-                Under::Beside(_, r) => *r,
-                _ => None,
+            let last = (p.id.0, have - 1);
+            let under = match &p.under {
+                Under::Beside(_, right) => Under::Beside(Some(last), *right),
+                named => Under::Within(Box::new(named.clone()), last),
             };
             let cut = have - p.id.1;
-            Some(Placed { id: (p.id.0, have), len: p.len - cut, kind: p.kind, type_ref: p.type_ref, under: Under::Beside(Some((p.id.0, have - 1)), right) })
+            Some(Placed { id: (p.id.0, have), len: p.len - cut, under, ..p.clone() })
         })
         .collect();
     let items = items.as_slice();
     let index: BTreeMap<(u64, u32), usize> = items.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
     let at = Local { items, index, sv: &sv, seen: &*seen };
+    if cyclic(&at) {
+        return Verdict::Refused;
+    }
     let mut memo = HashMap::new();
+    let mut depths = HashMap::new();
     let mut waiting = None;
-    for i in 0..items.len() {
+    for (i, item) in items.iter().enumerate() {
         // Whether everything it names is here (cheap), before where it lands (a walk of its
         // parent's list, so only when the answer matters: content a list cannot hold, or two
         // neighbours that could sit in two parents).
-        if let Some(id) = missing(&sv, &at, &items[i]) {
+        if let Some(id) = missing(&sv, &at, item) {
             waiting = waiting.or(Some(id));
             continue;
         }
-        let both = matches!(items[i].under, Under::Beside(Some(_), Some(_)));
-        if !both && allowed(Class::List, items[i].kind) {
+        let both = matches!(item.under, Under::Beside(Some(_), Some(_)) | Under::Within(..));
+        let nests = item.kind == 7;
+        if !both && !nests && item.kind == 1 {
             continue;
         }
         match parent_of(txn, &sv, &at, i, &mut memo, 0) {
             Resolved::Waiting(id) => waiting = waiting.or(Some(id)),
             Resolved::Split => return Verdict::Refused,
-            Resolved::Known(p) if !allowed(p.class, items[i].kind) => return Verdict::Refused,
+            Resolved::Known(p) if !allowed(p.class, item.kind, item.sub) => return Verdict::Refused,
+            // A text reads a string embed back as text (its diff cannot tell them apart), so an
+            // app's offsets, taken from the characters, would count it as characters.
+            Resolved::Known(p) if p.class == Class::Text && item.string_embed => return Verdict::Refused,
+            Resolved::Known(p) if nests && depth_of(txn, &sv, &at, &p, &mut memo, &mut depths) >= MAX_NESTING => return Verdict::Refused,
             Resolved::Known(_) => {}
         }
     }
     let verdict = waiting.map_or(Verdict::Fits, Verdict::Waiting);
+    seen.staged.clear();
     if verdict == Verdict::Fits {
         for (i, p) in memo {
-            if let Ok(p) = p {
-                seen.keep(items[i].id, items[i].len, p);
+            if let Resolved::Known(p) = p {
+                seen.staged.push((items[i].id, items[i].len, p));
             }
         }
     }
     verdict
 }
 
-/// An id `item` names that neither the document nor the update holds.
-fn missing(sv: &StateVector, at: &Local<'_>, item: &Placed) -> Option<(u64, u32)> {
-    let named = match &item.under {
+/// The ids an item names: its parent, origin and right origin, as far as the update says.
+fn named(item: &Placed) -> [Option<(u64, u32)>; 2] {
+    match &item.under {
         Under::Root(_) => [None, None],
         Under::Parent(id) => [Some(*id), None],
         Under::Beside(o, r) => [*o, *r],
+        Under::Within(named, last) => [if let Under::Parent(id) = **named { Some(id) } else { None }, Some(*last)],
+    }
+}
+
+/// Whether the update's items can never all integrate: yrs takes a client's blocks in clock
+/// order, and an item only once what it names is in, so an item that names itself, a later
+/// clock of its own client, or anything that leads back to it waits in yrs for ever. yrs then
+/// integrates it whenever another update brings those ids, with whatever content that one
+/// gives them (found by the fuzz: a hang, and a format landing in a map). An update made from
+/// a document never does this.
+fn cyclic(at: &Local<'_>) -> bool {
+    let n = at.items.len();
+    let deps = |i: usize| {
+        let p = &at.items[i];
+        // The item before it in its client's clocks, if the update has it.
+        let before = at.index.range(..p.id).next_back().filter(|((c, _), _)| *c == p.id.0).map(|(_, &j)| j);
+        let names = named(p).into_iter().flatten().filter_map(|id| at.find(id));
+        before.into_iter().chain(names).collect::<Vec<usize>>()
     };
-    named.into_iter().flatten().find(|id| !present(sv, *id) && at.find(*id).is_none())
+    // Depth-first, without recursion: 0 unseen, 1 on the path, 2 done.
+    let mut state = vec![0_u8; n];
+    for root in 0..n {
+        if state[root] != 0 {
+            continue;
+        }
+        let mut stack = vec![(root, deps(root), 0_usize)];
+        state[root] = 1;
+        while let Some((node, next, k)) = stack.last_mut() {
+            if let Some(&j) = next.get(*k) {
+                *k += 1;
+                match state[j] {
+                    1 => return true,
+                    0 => {
+                        state[j] = 1;
+                        let d = deps(j);
+                        stack.push((j, d, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                state[*node] = 2;
+                stack.pop();
+            }
+        }
+    }
+    false
+}
+
+/// An id `item` names that neither the document nor the update holds.
+fn missing(sv: &StateVector, at: &Local<'_>, item: &Placed) -> Option<(u64, u32)> {
+    named(item).into_iter().flatten().find(|id| !present(sv, *id) && at.find(*id).is_none())
 }
 
 fn present(sv: &StateVector, id: (u64, u32)) -> bool {
@@ -234,31 +370,63 @@ fn known(r: &Resolved) -> Option<Parent> {
 }
 
 /// The parent of whatever item covers `id`, as yrs would give it to an item beside it.
-fn beside<T: ReadTxn>(txn: &T, sv: &StateVector, at: &Local<'_>, i: usize, id: (u64, u32), memo: &mut HashMap<usize, Result<Parent, (u64, u32)>>, depth: usize) -> Resolved {
+fn beside<T: ReadTxn>(
+    txn: &T,
+    sv: &StateVector,
+    at: &Local<'_>,
+    i: usize,
+    id: (u64, u32),
+    memo: &mut HashMap<usize, Resolved>,
+    depth: usize,
+) -> Resolved {
     match at.find(id) {
         Some(j) if j != i => parent_of(txn, sv, at, j, memo, depth + 1),
-        Some(_) => Resolved::Known(OPEN),
-        None if present(sv, id) => Resolved::Known(at.seen.find(id).unwrap_or_else(|| StickyIndex::from_id(yid(id), Assoc::After).get_offset(txn).map_or(OPEN, |o| of_branch(&o.branch)))),
+        // It names itself: yrs holds it for ever as missing a dependency, and integrates it once
+        // another update brings that id with other content (found by the fuzz: a format then
+        // lands in a map and the map event unwraps `None`).
+        Some(_) => Resolved::Split,
+        None if present(sv, id) => Resolved::Known(
+            at.seen.find(id).unwrap_or_else(|| StickyIndex::from_id(yid(id), Assoc::After).get_offset(txn).map_or(OPEN, |o| of_branch(&o.branch))),
+        ),
         None => Resolved::Waiting(id),
     }
 }
 
 /// Where item `i` goes.
-fn parent_of<T: ReadTxn>(txn: &T, sv: &StateVector, at: &Local<'_>, i: usize, memo: &mut HashMap<usize, Result<Parent, (u64, u32)>>, depth: usize) -> Resolved {
+fn parent_of<T: ReadTxn>(txn: &T, sv: &StateVector, at: &Local<'_>, i: usize, memo: &mut HashMap<usize, Resolved>, depth: usize) -> Resolved {
     if let Some(known) = memo.get(&i) {
-        return known.clone().map_or_else(Resolved::Waiting, Resolved::Known);
+        return known.clone();
     }
     if depth > 64 {
         // A chain this long inside one update: wait on the item itself, which never comes.
         return Resolved::Waiting(at.items[i].id);
     }
+    // Marked first, so a cycle of items beside each other ends here as waiting (it never lands).
+    memo.insert(i, Resolved::Waiting(at.items[i].id));
+    let resolved = resolve(txn, sv, at, i, &at.items[i].under, memo, depth);
+    memo.insert(i, resolved.clone());
+    resolved
+}
+
+/// Where `under` puts item `i`.
+fn resolve<T: ReadTxn>(
+    txn: &T,
+    sv: &StateVector,
+    at: &Local<'_>,
+    i: usize,
+    under: &Under,
+    memo: &mut HashMap<usize, Resolved>,
+    depth: usize,
+) -> Resolved {
     let items = at.items;
-    let resolved = match &items[i].under {
-        Under::Root(name) => Resolved::Known(BranchID::Root(Arc::from(name.as_str())).get_branch(txn).map_or_else(
-            || Parent { key: Some(Key::Root(name.clone())), class: Class::Open },
-            |b| of_branch(&b),
-        )),
+    match under {
+        Under::Root(name) => Resolved::Known(
+            BranchID::Root(Arc::from(name.as_str()))
+                .get_branch(txn)
+                .map_or_else(|| Parent { key: Some(Key::Root(name.clone())), class: Class::Open }, |b| of_branch(&b)),
+        ),
         Under::Parent(id) => match at.find(*id) {
+            Some(j) if j == i => Resolved::Split,
             // A parent in the same update: its own type, if it is one.
             Some(j) => Resolved::Known(match (items[j].kind, items[j].type_ref) {
                 (7, Some(b)) => Parent { key: Some(Key::Nested(items[j].id)), class: class_of_byte(b) },
@@ -274,22 +442,23 @@ fn parent_of<T: ReadTxn>(txn: &T, sv: &StateVector, at: &Local<'_>, i: usize, me
                 (Some(Resolved::Split), _) | (_, Some(Resolved::Split)) => Resolved::Split,
                 (Some(l), Some(r)) => match (known(&l), known(&r)) {
                     (Some(a), Some(b)) if a.key.is_some() && b.key.is_some() && a.key != b.key => Resolved::Split,
-                    // yrs takes the origin's parent.
+                    // An origin with no parent the doc can name (collected, so yrs finds no item
+                    // there): yrs takes the right origin's parent instead.
+                    (Some(a), Some(b)) if a.key.is_none() && b.key.is_some() => r,
+                    // Otherwise yrs takes the origin's parent.
                     _ => l,
                 },
                 (Some(one), None) | (None, Some(one)) => one,
                 (None, None) => Resolved::Known(OPEN),
             }
         }
-    };
-    match &resolved {
-        Resolved::Known(p) => {
-            memo.insert(i, Ok(p.clone()));
+        Under::Within(named, last) => {
+            let named = resolve(txn, sv, at, i, named, memo, depth);
+            let beside = beside(txn, sv, at, i, *last, memo, depth);
+            match (known(&named), known(&beside)) {
+                (Some(a), Some(b)) if a.key.is_some() && b.key.is_some() && a.key != b.key => Resolved::Split,
+                _ => named,
+            }
         }
-        Resolved::Waiting(id) => {
-            memo.insert(i, Err(*id));
-        }
-        Resolved::Split => {}
     }
-    resolved
 }

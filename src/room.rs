@@ -546,7 +546,6 @@ impl Room {
     }
 
     /// The replica schema the room is pinned to, if any.
-    #[cfg(test)]
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
@@ -923,7 +922,7 @@ impl Room {
 /// Measured by encoding it. A structural estimate would be cheaper and would also be the
 /// number an attacker optimises against, and a submit already pays one serialisation to reach
 /// the socket.
-fn value_bytes(value: &serde_json::Value) -> usize {
+pub(crate) fn value_bytes(value: &serde_json::Value) -> usize {
     serde_json::to_vec(value).map_or(0, |v| v.len())
 }
 

@@ -587,7 +587,12 @@ fn generic_history(seed: u64, offsets: Offsets, steps: usize) -> Vec<Vec<u8>> {
                         }
                         4 => {
                             if let Some((a, n)) = char_run(&p, r.below(64), r.below(8)) {
-                                text.format(&mut t, a, n, [("i".into(), if r.one_in(3) { Any::Null } else { Any::Bool(true) })].into_iter().collect());
+                                text.format(
+                                    &mut t,
+                                    a,
+                                    n,
+                                    [("i".into(), if r.one_in(3) { Any::Null } else { Any::Bool(true) })].into_iter().collect(),
+                                );
                             }
                         }
                         _ => {
@@ -689,7 +694,9 @@ fn live_history(seed: u64, steps: usize) -> Vec<Vec<u8>> {
         let made = match r.below(11) {
             0..=2 => d.insert_text(id, at, ["x", "\u{e9}t\u{e9} ", "\u{1f600}"][r.below(3)], &attrs(&[("i", true.into())])),
             3 => d.delete_text(id, at.min(len.saturating_sub(1)), n.min(len - at.min(len.saturating_sub(1)))),
-            4 => d.format(id, at.min(len), n.min(len - at.min(len)), &attrs(&[("b", if r.one_in(2) { serde_json::Value::Null } else { true.into() })])),
+            4 => {
+                d.format(id, at.min(len), n.min(len - at.min(len)), &attrs(&[("b", if r.one_in(2) { serde_json::Value::Null } else { true.into() })]))
+            }
             5 => d.set_attrs(id, &attrs(&[("align", "center".into())])),
             6 => {
                 next_id += 1;
@@ -923,12 +930,18 @@ fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
             }
         }
         12 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } {
                 s.client = *r.pick(&pool.clients).unwrap();
             }
         }
         13 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } {
                 let have = pool.clocks.get(&s.client).copied().unwrap_or(0);
                 s.clock = match r.below(4) {
                     0 => 0,
@@ -939,47 +952,56 @@ fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
             }
         }
         14 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
-                if s.blocks.len() > 1 {
-                    let (a, b) = (r.below(s.blocks.len()), r.below(s.blocks.len()));
-                    s.blocks.swap(a, b);
-                }
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } && s.blocks.len() > 1
+            {
+                let (a, b) = (r.below(s.blocks.len()), r.below(s.blocks.len()));
+                s.blocks.swap(a, b);
             }
             if u.secs.len() > 1 && r.one_in(2) {
                 u.secs.swap(0, 1);
             }
         }
         15 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
-                if !s.blocks.is_empty() {
-                    let at = r.below(s.blocks.len());
-                    match r.below(3) {
-                        0 => s.blocks.truncate(at.max(1)),
-                        1 => {
-                            s.blocks.remove(at);
-                        }
-                        _ => {
-                            let first = s.blocks.remove(0);
-                            s.clock = s.clock.saturating_add(first.len());
-                        }
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } && !s.blocks.is_empty()
+            {
+                let at = r.below(s.blocks.len());
+                match r.below(3) {
+                    0 => s.blocks.truncate(at.max(1)),
+                    1 => {
+                        s.blocks.remove(at);
+                    }
+                    _ => {
+                        let first = s.blocks.remove(0);
+                        s.clock = s.clock.saturating_add(first.len());
                     }
                 }
             }
         }
         16 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } {
                 let at = r.below(s.blocks.len() + 1);
                 let n = [1, 1, 2, 5][r.below(4)];
                 s.blocks.insert(at, if r.one_in(2) { Blk::Skip(n) } else { Blk::Gc(n) });
             }
         }
         17 => {
-            if let Some(s) = { let n = u.secs.len().max(1); u.secs.get_mut(r.below(n)) } {
-                if !s.blocks.is_empty() {
-                    let at = r.below(s.blocks.len());
-                    let b = s.blocks[at].clone();
-                    s.blocks.insert(at, b);
-                }
+            if let Some(s) = {
+                let n = u.secs.len().max(1);
+                u.secs.get_mut(r.below(n))
+            } && !s.blocks.is_empty()
+            {
+                let at = r.below(s.blocks.len());
+                let b = s.blocks[at].clone();
+                s.blocks.insert(at, b);
             }
         }
         18 | 19 => {
@@ -993,12 +1015,11 @@ fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
                         u.secs.push(s);
                     }
                 }
-                if r.one_in(2) {
-                    if let Some(ds) = r.pick(&d.ds) {
-                        if !u.ds.iter().any(|(c, _)| *c == ds.0) {
-                            u.ds.push(ds.clone());
-                        }
-                    }
+                if r.one_in(2)
+                    && let Some(ds) = r.pick(&d.ds)
+                    && !u.ds.iter().any(|(c, _)| *c == ds.0)
+                {
+                    u.ds.push(ds.clone());
                 }
             }
         }
@@ -1026,7 +1047,8 @@ fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
                 content,
                 len,
             };
-            let item = Blk::Item(Item { parent: if item.origin.is_some() || item.right.is_some() { Parent::Inherit } else { item.parent.clone() }, ..item });
+            let item =
+                Blk::Item(Item { parent: if item.origin.is_some() || item.right.is_some() { Parent::Inherit } else { item.parent.clone() }, ..item });
             if u.secs.is_empty() || r.one_in(3) {
                 let c = *r.pick(&pool.clients).unwrap();
                 if !u.secs.iter().any(|s| s.client == c) {
@@ -1107,10 +1129,10 @@ fn capture<R>(phase: &'static str, found: &mut Option<Found>, f: impl FnOnce() -
     CAPTURING.with(|c| c.set(true));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     CAPTURING.with(|c| c.set(false));
-    if let Some((at, msg)) = CAUGHT.with(|c| c.borrow_mut().take()) {
-        if found.is_none() {
-            *found = Some(Found { at, msg, phase });
-        }
+    if let Some((at, msg)) = CAUGHT.with(|c| c.borrow_mut().take())
+        && found.is_none()
+    {
+        *found = Some(Found { at, msg, phase });
     }
     out.ok()
 }
@@ -1366,16 +1388,16 @@ fn minimise(schema: Schema, base: &[u8], op: &Upd, follow: &[Vec<u8>], at: &str)
                 if !c.secs[i].blocks.is_empty() {
                     cands.push(c);
                 }
-                if let Blk::Item(it) = &best.secs[i].blocks[j] {
-                    if it.kind != 4 || it.len > 1 {
-                        let mut c = best.clone();
-                        if let Blk::Item(x) = &mut c.secs[i].blocks[j] {
-                            x.kind = 4;
-                            x.content = vec![1, b'a'];
-                            x.len = 1;
-                        }
-                        cands.push(c);
+                if let Blk::Item(it) = &best.secs[i].blocks[j]
+                    && (it.kind != 4 || it.len > 1)
+                {
+                    let mut c = best.clone();
+                    if let Blk::Item(x) = &mut c.secs[i].blocks[j] {
+                        x.kind = 4;
+                        x.content = vec![1, b'a'];
+                        x.len = 1;
                     }
+                    cands.push(c);
                 }
             }
         }
@@ -1627,8 +1649,8 @@ fn fuzz_case() {
         all.remove(k);
         try_ops(format!("all but follow-up {k}"), all);
     }
-    for k in 1..ops.len() {
-        println!("follow-up {k}: {:?}", Upd::parse(&ops[k]));
+    for (k, op) in ops.iter().enumerate().skip(1) {
+        println!("follow-up {k}: {:?}", Upd::parse(op));
     }
     let try_one = |label: String, u: Upd| {
         let bytes = u.encode();
@@ -1667,54 +1689,62 @@ fn fuzz_case() {
     }
 }
 
+/// One update nesting `depth` arrays, each inside the one before, under root "a".
+pub(crate) fn nested_chain(client: u64, depth: u32) -> Vec<u8> {
+    let mut u = Upd::default();
+    let mut blocks = Vec::new();
+    for k in 0..depth {
+        let parent = if k == 0 { Parent::Root("a".into()) } else { Parent::Item((client, k - 1)) };
+        blocks.push(Blk::Item(Item { origin: None, right: None, parent, sub: None, sub_bit: false, kind: 7, content: vec![0], len: 1 }));
+    }
+    u.secs.push(Sec { client, clock: 0, blocks });
+    u.encode()
+}
+
+/// yrs #749: deeply nested types overflow the stack when deleted (5,000 levels abort a 1 MiB
+/// stack, natively in release). The gate passes such an update; the replica refuses nesting past
+/// `MAX_NESTING`, in one update or built up over several. Runs on a 1 MiB stack, about a
+/// browser's: apply, read, delete the outermost, encode.
 #[test]
-#[ignore = "tmp"]
-fn c7_tmp_trace() {
-    let line = std::env::var("C7_CASE").unwrap();
-    let field = |k: &str| line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap_or("").to_owned();
-    let base = unhex(&field("base="));
-    let ops: Vec<Vec<u8>> = field("ops=").split(',').filter(|s| !s.is_empty()).map(unhex).collect();
-    let offsets = if field("schema=").contains("Utf16") { Offsets::Utf16 } else { Offsets::Bytes };
-    let doc = doc_for(99, offsets);
-    doc.get_or_insert_text("t");
-    doc.get_or_insert_map("m");
-    doc.get_or_insert_array("a");
-    crate::replica::integrate(&doc, &base).unwrap();
-    for op in &ops {
-        println!("apply {:?}", crate::replica::integrate(&doc, op));
+fn deep_nesting_is_refused_by_the_replica() {
+    let run = |ops: Vec<Vec<u8>>| -> Vec<bool> {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let doc = doc_for(99, Offsets::Bytes);
+                let a = doc.get_or_insert_array("a");
+                let mut y = YReplica::assemble(doc, Some(99), |_, _| {});
+                let applied: Vec<bool> = ops.iter().map(|op| y.apply(op).is_ok()).collect();
+                let _ = y.state();
+                y.local(|t| {
+                    if a.len(t) > 0 {
+                        a.remove(t, 0);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let _ = y.state();
+                applied
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    let max = u32::try_from(crate::fits::MAX_NESTING).unwrap();
+    for (depth, ok) in [(10, true), (max, true), (max + 1, false), (5_000, false)] {
+        let op = nested_chain(7, depth);
+        assert!(crate::update_is_sound(&op), "the gate takes {depth} levels");
+        assert_eq!(run(vec![op]), vec![ok], "{depth} levels");
     }
-    let mut t = doc.transact_mut();
-    for v in nested(&t, &doc) {
-        println!("nested {v:?}");
-        match v {
-            Out::YText(text) => {
-                println!("  diff {:?}", text.diff(&t, YChange::identity));
-                let p = pieces(&text, &t, offsets);
-                println!("  pieces {p:?} len {}", text.len(&t));
-                text.insert(&mut t, insert_at(&p, p.len() / 2), "z");
-                println!("  inserted");
-                let p = pieces(&text, &t, offsets);
-                if let Some((a, n)) = char_run(&p, 0, 3) {
-                    println!("  format {a} {n}");
-                    text.format(&mut t, a, n, [("u".into(), Any::Bool(true))].into_iter().collect());
-                    println!("  remove {a} {n}");
-                    text.remove_range(&mut t, a, n);
-                }
-            }
-            Out::YMap(m) => {
-                m.insert(&mut t, "k0", Any::from(5));
-                m.remove(&mut t, "k1");
-            }
-            Out::YArray(a) => {
-                println!("  array len {}", a.len(&t));
-                a.insert(&mut t, 0, Any::from(1));
-                println!("  inserted");
-                if a.len(&t) > 1 {
-                    a.remove(&mut t, 1);
-                }
-                println!("  removed");
-            }
-            _ => {}
-        }
-    }
+    // Built up over two updates: the second goes past the limit under the first's deepest type.
+    let first = nested_chain(7, max - 2);
+    let mut second = Upd::default();
+    let blocks = (0..4)
+        .map(|k| {
+            let parent = if k == 0 { Parent::Item((7, max - 3)) } else { Parent::Item((8, k - 1)) };
+            Blk::Item(Item { origin: None, right: None, parent, sub: None, sub_bit: false, kind: 7, content: vec![0], len: 1 })
+        })
+        .collect();
+    second.secs.push(Sec { client: 8, clock: 0, blocks });
+    assert_eq!(run(vec![first, second.encode()]), vec![true, false]);
 }

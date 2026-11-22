@@ -43,11 +43,10 @@ use serde_json::{Map, Value};
 use yrs::types::text::YChange;
 use yrs::types::{Attrs, Event, PathSegment};
 use yrs::{
-    Any, Array, ArrayRef, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact,
-    TransactionMut,
+    Any, Array, ArrayRef, DeepObservable, Doc, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact, TransactionMut,
 };
 
-use crate::replica::{REMOTE, Replica, YReplica, byte_at, byte_span, integrate, put_sorted, to_any, to_json};
+use crate::replica::{REMOTE, Replica, YReplica, byte_span, integrate, put_sorted, to_any, to_json};
 
 const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -263,7 +262,7 @@ impl LiveDoc {
         let attrs = run_attrs_of(run_attrs);
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let at = byte_at(&t.get_string(txn), char_at)?;
+            let at = *char_offsets(txn, &t)?.get(char_at).ok_or(LiveError::OutOfRange)?;
             t.insert_with_attributes(txn, at, text, attrs);
             Ok(())
         })
@@ -273,7 +272,7 @@ impl LiveDoc {
     pub fn delete_text(&mut self, id: u64, char_at: usize, len: usize) -> Result<Vec<u8>, LiveError> {
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let (at, bytes) = byte_span(&t.get_string(txn), char_at, len)?;
+            let (at, bytes) = span_of(&char_offsets(txn, &t)?, char_at, len)?;
             if bytes > 0 {
                 t.remove_range(txn, at, bytes);
             }
@@ -287,7 +286,7 @@ impl LiveDoc {
         let attrs: Attrs = run_attrs.iter().map(|(k, v)| (Arc::from(k.as_str()), to_any(v))).collect();
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let (at, bytes) = byte_span(&t.get_string(txn), char_at, len)?;
+            let (at, bytes) = span_of(&char_offsets(txn, &t)?, char_at, len)?;
             if bytes > 0 && !attrs.is_empty() {
                 t.format(txn, at, bytes, attrs);
             }
@@ -330,9 +329,9 @@ impl LiveDoc {
                 return Err(LiveError::Exists);
             }
             let t = text_of(txn, &block).ok_or(LiveError::UnknownBlock)?;
-            let string = t.get_string(txn);
-            let total = string.chars().count();
-            let (at, bytes) = byte_span(&string, char_at, total.checked_sub(char_at).ok_or(LiveError::OutOfRange)?)?;
+            let offsets = char_offsets(txn, &t)?;
+            let total = offsets.len() - 1;
+            let (at, bytes) = span_of(&offsets, char_at, total.checked_sub(char_at).ok_or(LiveError::OutOfRange)?)?;
             let tail = slice_chunks(chunks(txn, &t), char_at);
             let attrs = attrs_map(txn, &block).map(|a| read_attrs(txn, &a)).unwrap_or_default();
             if bytes > 0 {
@@ -708,6 +707,42 @@ fn put_block(txn: &mut TransactionMut, blocks: &MapRef, block: &SeedBlock) {
 }
 
 /// The text as `(string, attributes)` chunks, attributes without nulls.
+/// Where each char boundary of a block's text sits in yrs offsets: `n + 1` entries for `n`
+/// chars, the last being the text's whole length.
+///
+/// Not the bytes of [`get_string`](yrs::GetString::get_string): yrs counts an embed or a
+/// nested type in a text as one unit, and the string leaves it out, so offsets taken from the
+/// string fall short after one and a cut runs past the end (`Couldn't remove … elements`, a
+/// panic). WordCraft never writes either, but a crafted update can put one in a block's text
+/// (the `fits` check lets them be, since a text may hold embeds). A char boundary next to one
+/// sits after it, and a span of chars takes the embeds between its chars with it.
+fn char_offsets<T: ReadTxn>(txn: &T, text: &TextRef) -> Result<Vec<u32>, LiveError> {
+    let mut out = Vec::new();
+    let mut at: usize = 0;
+    for d in text.diff(txn, YChange::identity) {
+        match d.insert {
+            Out::Any(Any::String(s)) => {
+                for c in s.chars() {
+                    out.push(u32::try_from(at).map_err(|_| LiveError::OutOfRange)?);
+                    at += c.len_utf8();
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    out.push(u32::try_from(at).map_err(|_| LiveError::OutOfRange)?);
+    Ok(out)
+}
+
+/// Offset and length in yrs units of `len` chars from `char_at`, by [`char_offsets`].
+fn span_of(offsets: &[u32], char_at: usize, len: usize) -> Result<(u32, u32), LiveError> {
+    let end = char_at.checked_add(len).ok_or(LiveError::OutOfRange)?;
+    match (offsets.get(char_at), offsets.get(end)) {
+        (Some(&a), Some(&b)) => Ok((a, b - a)),
+        _ => Err(LiveError::OutOfRange),
+    }
+}
+
 fn chunks<T: ReadTxn>(txn: &T, text: &TextRef) -> Vec<(String, Attributes)> {
     text.diff(txn, YChange::identity)
         .into_iter()
@@ -770,6 +805,64 @@ mod tests {
         let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "hello".to_owned(), ..SeedBlock::default() }]).unwrap();
         d.set_client(1).unwrap();
         d
+    }
+
+    /// An embed another peer put in a block's text (WordCraft never writes one; a crafted update
+    /// can) is counted the way yrs counts it: local cuts, formats, inserts and splits around and
+    /// over it neither panic nor land on the wrong characters.
+    #[test]
+    fn local_edits_count_an_embed_in_the_text() {
+        use yrs::updates::decoder::Decode;
+        use yrs::{OffsetKind, Options, Update};
+        // Before the first char, after a two-byte one, and at the end.
+        for at_byte in [0_u32, 3, 8] {
+            let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "h\u{e9}llo w".to_owned(), ..SeedBlock::default() }]).unwrap();
+            d.set_client(1).unwrap();
+            // Another peer, in raw yrs, puts an embed at byte `at_byte` of block 1's text.
+            let fresh = || {
+                let mut options = Options::with_client_id(yrs::block::ClientID::new(77));
+                options.offset_kind = OffsetKind::Bytes;
+                Doc::with_options(options)
+            };
+            let raw = fresh();
+            raw.transact_mut().apply_update(Update::decode_v1(&d.state()).unwrap()).unwrap();
+            let blocks = raw.get_or_insert_map(BLOCKS);
+            let before = raw.transact().state_vector();
+            {
+                let mut txn = raw.transact_mut();
+                let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+                let text = text_of(&txn, &block).unwrap();
+                text.insert_embed(&mut txn, at_byte, Any::from("img"));
+            }
+            // A string embed reads back as text, so the replica refuses it outright.
+            assert!(d.apply(&raw.transact().encode_diff_v1(&before)).is_err(), "a string embed was taken");
+            let raw = fresh();
+            raw.transact_mut().apply_update(Update::decode_v1(&d.state()).unwrap()).unwrap();
+            let blocks = raw.get_or_insert_map(BLOCKS);
+            let before = raw.transact().state_vector();
+            {
+                let mut txn = raw.transact_mut();
+                let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+                let text = text_of(&txn, &block).unwrap();
+                let img = Any::Map(Arc::new([("src".to_owned(), Any::from("img"))].into_iter().collect()));
+                text.insert_embed(&mut txn, at_byte, img);
+            }
+            d.apply(&raw.transact().encode_diff_v1(&before)).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "h\u{e9}llo w", "the embed is not text");
+
+            d.format(1, 0, 7, &[("b".to_owned(), Value::Bool(true))].into_iter().collect()).unwrap();
+            d.insert_text(1, 7, "orld", &Map::new()).unwrap();
+            d.delete_text(1, 1, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo world");
+            d.split(1, 3, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo");
+            assert_eq!(d.block(2).unwrap().text, " world");
+            d.merge(1, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo world");
+            d.delete_text(1, 0, 9).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "");
+            assert!(!d.damaged());
+        }
     }
 
     /// The observer sees local changes too; they are drained, not left to pile up.

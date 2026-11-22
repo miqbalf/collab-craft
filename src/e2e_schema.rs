@@ -186,3 +186,58 @@ async fn junk_op_round(schema: Option<&str>) {
     let joined_text = format!("{replayed:?} {replay:?}");
     assert!(!joined_text.contains("/wEC") && !joined_text.contains(&overflow), "junk is in the replay: {joined_text}");
 }
+
+/// An op the gate takes alone but that breaks yrs in the document it lands in is refused by the
+/// relay's shadow copy, takes no sequence number and reaches nobody. The ops before and after
+/// it are ordered. With a schema the copy types the roots too, so a string straight in the
+/// WordCraft body (an array) is refused; with none, only what the ops themselves type is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_the_shadow_refuses_an_op_that_does_not_fit_the_document() {
+    shadow_round(Some("wordcraft/1")).await;
+    shadow_round(None).await;
+}
+
+async fn shadow_round(schema: Option<&str>) {
+    use base64::Engine as _;
+    let wire = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let Some(h) = start().await else { return };
+    let room = unique_room("shadow-round");
+    let mut alice = connect(&h.url, &room, "alice", schema).await;
+    let seen = answer(&mut alice).await;
+    let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
+    let mut bob = connect(&h.url, &room, "bob", schema).await;
+    answer(&mut bob).await;
+    let before = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+
+    // Client 50 puts an array in the body, then a string in that array (yrs cannot read it back:
+    // its array iterator spins for ever), then a string straight in the body.
+    let array = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+    let string_in_array = [1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
+    let string_in_body = [1, 1, 50, 1, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
+    for op in [&array[..], &string_in_array, &string_in_body] {
+        assert!(craft_collab::update_is_sound(op), "the gate alone takes {op:?}");
+    }
+    // One at a time: submits sent together are ordered by whichever handler takes the gate
+    // first, and an op that arrives before the one it names waits at the copy, unjudged.
+    let mut heard_a = Vec::new();
+    for (local, op) in [(1, &array[..]), (2, &string_in_array), (3, &string_in_body)] {
+        alice.send(text_op(&doc, local, &wire(op))).unwrap();
+        heard_a.extend(listen(&mut alice, 500).await);
+    }
+    let heard_b = listen(&mut bob, 100).await;
+
+    let refused: Vec<u64> = heard_a
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Error { local: Some(l), code: Some(c), .. } if c == "invalid" => Some(*l),
+            _ => None,
+        })
+        .collect();
+    let (want_refused, want_ops) = if schema.is_some() { (vec![2, 3], 1) } else { (vec![2], 2) };
+    assert_eq!(refused, want_refused, "{heard_a:?}");
+    assert_eq!(ops(&heard_a), want_ops, "{heard_a:?}");
+    assert_eq!(ops(&heard_b), want_ops, "{heard_b:?}");
+    let after = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+    assert_eq!(after - before, want_ops as u64, "a refused op burned a sequence number");
+}

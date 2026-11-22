@@ -2004,6 +2004,30 @@ mod relay_proto {
     }
 
     #[test]
+    fn the_shadow_is_on_unless_turned_off() {
+        use crate::parse_shadow;
+        for on in ["", "1", "on", "yes"] {
+            assert!(parse_shadow(on), "{on:?}");
+        }
+        for off in ["0", "false", " OFF "] {
+            assert!(!parse_shadow(off), "{off:?}");
+        }
+    }
+
+    /// The shadow copy refuses a submit whose second update does not fit, and keeps none of it:
+    /// the first is taken out again, so a resend of the first alone lands.
+    #[tokio::test]
+    async fn the_shadow_keeps_a_submit_whole_or_not_at_all() {
+        let mut gate = crate::Gate::default();
+        let array = vec![1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+        let string_in_array = vec![1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
+        let refused = crate::admit_on_shadow(&mut gate, "doc", None, vec![array.clone(), string_in_array]).await;
+        assert_eq!(refused, Err(craft_collab::shadow::ShadowRefusal::Invalid));
+        assert_eq!(gate.shadows["doc"].state(), craft_collab::shadow::Shadow::new(None).state(), "the first update was kept");
+        assert_eq!(crate::admit_on_shadow(&mut gate, "doc", None, vec![array]).await, Ok(()));
+    }
+
+    #[test]
     fn text_bytes_config_is_bounded() {
         use crate::parse_text_bytes;
         assert_eq!(parse_text_bytes(""), Ok(16 * 1024 * 1024 - 64 * 1024), "the default fits one native client frame with its wrapper");

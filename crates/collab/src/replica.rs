@@ -127,7 +127,18 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0, held_bytes: 0, waiting: Vec::new(), seen: crate::fits::Seen::default() }
+        YReplica {
+            undo,
+            doc,
+            client,
+            damaged: false,
+            untracked: false,
+            resync: false,
+            held: 0,
+            held_bytes: 0,
+            waiting: Vec::new(),
+            seen: crate::fits::Seen::default(),
+        }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -282,8 +293,10 @@ impl YReplica {
         let before = self.doc.transact().state_vector();
         let first = integrate_checked(&self.doc, update, true);
         if first.is_err() {
-            // The check kept the parents of this update's items; they did not land as checked.
+            // yrs may have taken part of it: start the cache again rather than guess.
             self.seen = crate::fits::Seen::default();
+        } else {
+            self.seen.commit(&self.doc.transact());
         }
         if first == Err(Integrate::Panicked) {
             self.damaged = true;
@@ -493,8 +506,10 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
 /// it is only checked again together with what yrs holds, if anything.
 fn integrate_checked(doc: &Doc, update: &[u8], checked: bool) -> Result<bool, Integrate> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
+        // The walk first: it refuses counts the bytes cannot back (an allocation bomb, which
+        // aborts rather than unwinds) before yrs's decoder sizes anything by them.
         let Some((_, incoming)) = crate::walk::items(update) else { return Err(Integrate::Refused) };
+        let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
         let mut txn = doc.transact_mut_with(REMOTE);
         let mut dropped = false;
         let seen = &mut crate::fits::Seen::default();
@@ -618,7 +633,10 @@ fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
             Some(held) => {
                 // The same check as `integrate`: what was held may now resolve to a parent that
                 // cannot hold it.
-                let bytes = { use yrs::updates::encoder::Encode; held.encode_v1() };
+                let bytes = {
+                    use yrs::updates::encoder::Encode;
+                    held.encode_v1()
+                };
                 match crate::walk::items(&bytes) {
                     Some((_, items)) if crate::fits::check(&txn, &items, &mut crate::fits::Seen::default()) != crate::fits::Verdict::Refused => {
                         txn.apply_update(held).map_err(|_| Integrate::Refused)
@@ -1360,6 +1378,50 @@ mod tests {
         assert!(!update_is_sound(&with(&[1, 0x81, 0x80, 0x80, 0x80, 0x10, 1, 0])));
         // Parent info 2^32 + 1, which yrs reads as 1 (named) where a wider reader reads an id.
         assert!(!update_is_sound(&[1, 1, 1, 0, 0x04, 0x81, 0x80, 0x80, 0x80, 0x10, 1, b't', 1, b'a', 0]));
+    }
+
+    /// Seeds for yrs issues known to panic or abort on crafted input (y-crdt #675/#750, #720,
+    /// #733, #743, #749): the gate refuses each before yrs reads it, and fast, since an
+    /// allocation bomb aborts rather than unwinds and no `catch_unwind` would help.
+    #[test]
+    fn known_yrs_crashers_are_refused_before_yrs_reads_them() {
+        let item = |info: u8, content: &[u8]| {
+            let mut u = vec![1, 1, 5, 0, info, 1, 1, b't'];
+            u.extend(content);
+            u.push(0);
+            u
+        };
+        let t = std::time::Instant::now();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            // #675/#750: counts the bytes cannot back (4e9 sections, 4e9 blocks, 4e9 Any values,
+            // a 4 GB string, 4e9 delete-set clients).
+            ("sections", vec![0xff, 0xff, 0xff, 0xff, 0x0f, 1, 5, 0]),
+            ("blocks", vec![1, 0xff, 0xff, 0xff, 0xff, 0x0f, 5, 0, 0x04]),
+            ("any values", item(0x08, &[0xff, 0xff, 0xff, 0xff, 0x0f, 0x7f])),
+            ("string", item(0x04, &[0xff, 0xff, 0xff, 0xff, 0x0f, b'a'])),
+            ("delete set", vec![0, 0xff, 0xff, 0xff, 0xff, 0x0f, 1, 1, 0, 1]),
+            // #720: content ref 18 (info 0x12, JSON once masked), which applies and then panics
+            // at the next encode.
+            ("content ref 18", item(0x12, &[1, 1, b'1'])),
+            // #733: a weak link type (type ref 7), whose splice panics (and is only built with
+            // yrs's `weak` feature, which no crate here turns on).
+            ("weak link", item(0x07, &[7])),
+            // #743: a client id past 2^53.
+            ("client id", vec![1, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10, 0, 0x04, 1, 1, b't', 1, b'a', 0]),
+            // #749's cousin in values: an Any nested 100 deep.
+            ("deep any", {
+                let mut c = vec![1];
+                c.extend(std::iter::repeat_n([0x75, 1], 100).flatten());
+                c.push(0x7f);
+                item(0x08, &c)
+            }),
+        ];
+        for (name, bytes) in &cases {
+            assert!(!update_is_sound(bytes), "{name} passed the gate");
+            let doc = YReplica::seed_doc();
+            assert!(integrate(&doc, bytes).is_err(), "{name} was integrated");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "the refusals took {:?}", t.elapsed());
     }
 
     /// Edits of every kind the Craft apps make, on three peers that sync now and then.

@@ -78,6 +78,10 @@ pub(crate) enum Under {
     Parent((u64, u32)),
     /// Beside an origin and a right origin (at least one of them).
     Beside(Option<(u64, u32)>, Option<(u64, u32)>),
+    /// The rest of an item with a named parent (a root or a parent item) whose first clocks the
+    /// document already holds: yrs keeps the named parent and puts it beside the last clock it
+    /// holds. Only made by the `fits` check, never read.
+    Within(Box<Under>, (u64, u32)),
 }
 
 /// One item of an update: its first id, its length, its content kind (`info & 0x0f`), the type
@@ -89,6 +93,10 @@ pub(crate) struct Placed {
     pub(crate) kind: u8,
     pub(crate) type_ref: Option<u8>,
     pub(crate) under: Under,
+    /// It names a key in its parent (a map entry), rather than taking its origin's.
+    pub(crate) sub: bool,
+    /// An embed whose value is a JSON string.
+    pub(crate) string_embed: bool,
 }
 
 impl Reader<'_> {
@@ -210,6 +218,7 @@ impl Reader<'_> {
         let (origin, right, sub) = (info & 0x80 != 0, info & 0x40 != 0, info & 0x20 != 0);
         let origin = if origin { Some(self.id()?) } else { None };
         let right = if right { Some(self.id()?) } else { None };
+        let mut keyed = false;
         let under = match (origin, right) {
             (None, None) => {
                 // Parent: a root name (1) or the id of an item.
@@ -217,6 +226,7 @@ impl Reader<'_> {
                 // Only named here: an item with an origin takes its key from it.
                 if sub {
                     self.string()?;
+                    keyed = true;
                 }
                 under
             }
@@ -224,9 +234,15 @@ impl Reader<'_> {
         };
         let kind = info & 0x0f;
         let type_ref = (kind == 7).then(|| self.bytes.get(self.at).copied()).flatten();
+        let start = self.at;
         let len = self.content(kind)?;
         if let Some(items) = &mut self.items {
-            items.push(Placed { id, len, kind, type_ref, under });
+            // An embed's JSON follows its length; a string's starts with a quote.
+            let string_embed = kind == 5 && {
+                let mut peek = Reader { bytes: self.bytes, at: start, items: None };
+                peek.u32().is_some() && self.bytes[peek.at..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'"')
+            };
+            items.push(Placed { id, len, kind, type_ref, under, sub: keyed, string_embed });
         }
         Some(len)
     }
