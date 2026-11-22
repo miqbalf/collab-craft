@@ -419,9 +419,14 @@ pub struct Nextcloud {
 
 impl Nextcloud {
     pub fn new(base: &str, secret: Arc<Secret>) -> Result<Nextcloud, String> {
+        Nextcloud::with_timeout(base, secret, HTTP_TIMEOUT)
+    }
+
+    /// [`Nextcloud::new`] with every call given up after `timeout` instead of 30 s (tests).
+    pub fn with_timeout(base: &str, secret: Arc<Secret>, timeout: Duration) -> Result<Nextcloud, String> {
         // No redirects: the signature header would follow one to wherever it points.
         let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("http client: {e}"))?;
