@@ -243,32 +243,42 @@ async fn shadow_round(schema: Option<&str>) {
 }
 
 /// The copy holds only what the room records, and judges the document scope whatever other
-/// scopes a peer invents. A viewer's op (refused by the room as read-only) once stayed in the
-/// copy, so an editor's op with the same ids and content that does not fit was taken as
-/// already there and ordered; and 64 invented scope names once filled the copy slots and
-/// turned the shadow off for the room.
+/// scopes a peer invents. An editor's op that the room refuses after the copy (here: past the
+/// room's size limit, which only the room reads, with the padding outside the ops) once stayed
+/// in the copy, so a second op with the same ids and content that does not fit was taken as
+/// already there and ordered; and 64 invented scope names once filled the copy slots and turned
+/// the shadow off for the room.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn e2e_the_shadow_holds_only_what_the_room_records() {
     use base64::Engine as _;
     let wire = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-    let Some(h) = start().await else { return };
+    // A text cap of 8 MiB: the room refuses params past 8 MiB, and the transport carries 64 KiB
+    // more, so an op can reach the copy and then be refused by the room.
+    let cap = crate::room::HISTORY_BYTES;
+    let Some(h) = crate::e2e_reconnect::start_capped(None, cap).await else { return };
     let room = unique_room("shadow-holds");
     let schema = Some("wordcraft/1");
     let mut alice = connect(&h.url, &room, "alice", schema).await;
     let seen = answer(&mut alice).await;
     let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
-    let viewer = crate::token::sign_at(crate::e2e_reconnect::SECRET, &room, "eve", "eve", false, "eve", now()).unwrap();
-    let mut eve = NativeHub::connect_as(&h.url, &viewer, None, schema).await.expect("connects");
-    answer(&mut eve).await;
-    let before = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
 
     // The same id (client 50, clock 0): an array in the body, then a string in the body.
     let array = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
     let string_in_body = [1, 1, 50, 0, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
-    eve.send(text_op(&doc, 1, &wire(&array))).unwrap();
-    let heard_e = listen(&mut eve, 500).await;
-    assert!(heard_e.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(1), .. })), "the viewer's op was not refused: {heard_e:?}");
+    let padded = craft_collab::ClientMsg::Submit {
+        doc: doc.clone(),
+        local: 1,
+        command: craft_collab::CRDT_TEXT.to_owned(),
+        params: serde_json::json!({ "scope": craft_collab::DOC_SCOPE, "ops": [wire(&array)], "pad": "x".repeat(cap + 1024) }),
+        scope: None,
+        fence: None,
+    };
+    alice.send(padded).unwrap();
+    let heard = listen(&mut alice, 3000).await;
+    let too_large =
+        heard.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(1), detail, .. } if detail.contains("more than this relay will carry")));
+    assert!(too_large, "the padded op was not refused by the room: {heard:?}");
 
     // Ops in 70 invented scopes (each its own client), then the string on the document scope.
     let mut heard_a = Vec::new();
@@ -290,6 +300,6 @@ async fn e2e_the_shadow_holds_only_what_the_room_records() {
     heard_a.extend(listen(&mut alice, 500).await);
     let refused = heard_a.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(2), code: Some(c), .. } if c == "invalid"));
     assert!(refused, "a string in the body was ordered: {heard_a:?}");
-    let after = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
-    assert_eq!(after - before, 70, "{heard_a:?}");
+    // The 70 junk ops are ordered; the string is not.
+    assert_eq!(ops(&heard_a), 70, "{heard_a:?}");
 }

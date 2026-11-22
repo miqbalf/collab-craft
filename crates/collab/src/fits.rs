@@ -26,7 +26,16 @@
 //! lookups per item: O(n log m) for n items against a document of m runs, with no walk of any
 //! list. An id the index misses (a document built before the replica, say) rebuilds the index
 //! from the document's state once per check. Updates of more than [`MAX_ITEMS`] items are
-//! refused.
+//! refused as too large to check.
+//!
+//! Memory: the index costs about 96 bytes per run of items that share a place (a typing run is
+//! one), in every replica, browsers included, alongside the document's own items. It has no cap
+//! of its own; the document's size bounds it.
+//!
+//! An item that yrs holds in part (an update sent again, longer) keeps its own parent and key
+//! but is linked after the held part, in that part's list or map chain. A checkpoint writes it
+//! with an origin and so without parent or key, and a reader takes both from the held part. So
+//! the rest fits only when its own parent and key are the held part's.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -103,9 +112,26 @@ fn class_of_byte(b: u8) -> Class {
 /// #749). No Craft app nests more than a few levels.
 pub(crate) const MAX_NESTING: usize = 64;
 
-/// The most items one check takes. A 1 MiB document's full state has tens of thousands; past
-/// this, an update is refused rather than checked (each item costs a few map lookups).
-pub(crate) const MAX_ITEMS: usize = 1 << 20;
+/// The most items one check takes; past it, an update is refused as too large to check
+/// ([`too_many`]), not as content that does not fit.
+///
+/// Sized so no update an honest peer can send reaches it. Every v1 block costs at least two
+/// bytes (a GC or skip block: info and length; an item: info, origin and content), so an update
+/// holds at most half its length in blocks. The largest the relay carries is one client frame
+/// (16 MiB, a checkpoint of the largest document it retains), at most 8.4 M blocks; held
+/// updates add at most 1 MiB (0.5 M). A 1 MiB document, or a 1 MiB offline batch or seed, has
+/// tens of thousands. 2^24 (16.8 M) is past all of these. What it bounds is a check's work:
+/// a few ordered-map lookups per item, about 1 µs each in release.
+pub(crate) const MAX_ITEMS: usize = 1 << 24;
+
+/// Whether `items` are past what one check takes ([`MAX_ITEMS`]).
+pub(crate) fn too_many(items: usize) -> bool {
+    if items > MAX_ITEMS {
+        log::warn!("collab: an update of {items} items is past the {MAX_ITEMS} a check takes; refused as too large");
+        return true;
+    }
+    false
+}
 
 /// Whether content of kind `kind` may go under `class` (`keyed`: as a map entry of it).
 ///
@@ -183,12 +209,21 @@ impl Seen {
         };
         let mut scratch = Seen::default();
         let mut ctx = Ctx { txn, sv: StateVector::default(), seen: &mut scratch, rebuilt: true };
-        if let Some(places) = place_all(&mut ctx, &items) {
-            for (i, p) in places.into_iter().enumerate() {
-                if let Some(Resolved::Known(p)) = p {
-                    self.keep(items[i].id, items[i].len, p);
-                }
+        let Some(places) = place_all(&mut ctx, &items) else {
+            log::warn!("collab: the document's own state does not order; its index stays empty");
+            return;
+        };
+        let mut lost = 0_usize;
+        for (i, p) in places.into_iter().enumerate() {
+            match p {
+                Some(Resolved::Known(p)) => self.keep(items[i].id, items[i].len, p),
+                Some(_) => lost += 1,
+                None => {}
             }
+        }
+        if lost > 0 {
+            // Looked up later, these read as collected (no class check for their neighbours).
+            log::warn!("collab: {lost} items of the document's own state did not resolve; they are left out of its index");
         }
     }
 }
@@ -295,8 +330,8 @@ pub(crate) fn check<T: ReadTxn>(txn: &T, items: &[Placed], seen: &mut Seen) -> V
     let sv = txn.state_vector();
     let items = trimmed(items, &sv);
     seen.staged.clear();
+    // The callers ask [`too_many`] first and report it as such; this is the backstop.
     if items.len() > MAX_ITEMS {
-        log::warn!("collab: an update of {} items is past the {MAX_ITEMS} a check takes; refused", items.len());
         return Verdict::Refused;
     }
     let mut ctx = Ctx { txn, sv, seen, rebuilt: false };
@@ -527,11 +562,17 @@ fn resolve<T: ReadTxn>(ctx: &mut Ctx<'_, T>, at: &Local<'_>, places: &[Option<Re
             };
             match near(ctx, at, places, i, *last) {
                 Near::Place(l) if l.parent.is_some() => {
-                    // yrs keeps the named parent but links it after `last` and takes its key.
-                    if base.parent.is_some() && l.parent != base.parent {
+                    // yrs keeps the named parent and its own key, links the rest after `last`
+                    // in `last`'s chain, and takes `last`'s key if it has one. A checkpoint then
+                    // writes it with an origin and no parent or key, so a reader takes both from
+                    // `last`. Only when the two agree is that the same place: a keyed rest
+                    // linked into a list chain reads back unkeyed (a value in a text's list,
+                    // which no restore takes). Honest trims always agree: a keyed item is one
+                    // long, so it is never held in part.
+                    if (base.parent.is_some() && l.parent != base.parent) || l.sub != own_sub {
                         return Resolved::Split;
                     }
-                    Place { sub: l.sub.or(own_sub), ..base }
+                    Place { sub: l.sub, ..base }
                 }
                 Near::Place(_) => Place { sub: own_sub, ..base },
                 Near::Waiting(w) => return Resolved::Waiting(w),

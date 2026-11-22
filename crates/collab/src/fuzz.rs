@@ -854,7 +854,21 @@ fn items_mut(u: &mut Upd) -> Vec<&mut Item> {
 fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
     let n_items = items_mut(u).len();
     let pick_item = |_: &mut Upd, r: &mut Rng| -> Option<usize> { if n_items == 0 { None } else { Some(r.below(n_items)) } };
-    match r.below(23) {
+    match r.below(24) {
+        22 => {
+            // A client's last held clock sent again, longer, with a named parent and a key: yrs
+            // keeps the rest's own key but links it after the held item, in that item's chain
+            // (re-review N1: a keyed value linked into a text's list, which no restore takes).
+            let held: Vec<(u64, u32)> = pool.clocks.iter().filter(|&(_, &end)| end > 0).map(|(&c, &end)| (c, end - 1)).collect();
+            if let Some(&(c, k)) = r.pick(&held)
+                && !u.secs.iter().any(|s| s.client == c)
+            {
+                let parent = pool.parent(r);
+                let sub = Some(r.pick(&pool.subs).unwrap().clone());
+                let item = Item { origin: None, right: None, parent, sub, sub_bit: false, kind: 8, content: vec![2, 0x7d, 1, 0x7d, 2], len: 2 };
+                u.secs.push(Sec { client: c, clock: k, blocks: vec![Blk::Item(item)] });
+            }
+        }
         21 => {
             // An item beside a keyed entry this update makes, naming no parent: yrs gives it the
             // entry's parent and its key (the review's C1, a keyed string in a text).
@@ -1307,6 +1321,18 @@ pub(crate) fn run_case(schema: Schema, base: &[u8], ops: &[Vec<u8>]) -> Option<F
             }
             for op in ops {
                 capture("apply", &mut found, || d.apply(op));
+                if found.is_some() {
+                    return found;
+                }
+                // A checkpoint written now loads back (re-review N1: one that does not leaves
+                // the document unopenable from every later checkpoint).
+                capture("restore", &mut found, || {
+                    if !d.damaged()
+                        && let Err(e) = LiveDoc::from_state(&d.state())
+                    {
+                        panic!("a checkpoint taken after an accepted op does not load back: {e}");
+                    }
+                });
                 if found.is_some() {
                     return found;
                 }

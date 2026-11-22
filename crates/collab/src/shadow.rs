@@ -30,6 +30,9 @@ pub enum ShadowRefusal {
     /// yrs panicked applying it or encoding the result.
     #[error("the update makes the document library panic")]
     Panicked,
+    /// It has more items than one check takes (see the `fits` module); not judged.
+    #[error("the update is too large to check")]
+    TooLarge,
 }
 
 /// One room's copy of its document. See the [module docs](self).
@@ -95,24 +98,20 @@ impl Shadow {
     }
 
     /// Try one submit's updates and keep them all or none, because the relay refuses the whole
-    /// submit. Several are merged into one update first, so a refusal is found before anything
-    /// is applied and leaves nothing to take out again; only a panic costs a rebuild.
+    /// submit. They are tried one at a time, in order, each under `catch_unwind`, as every
+    /// replica applies them: a merged update is not the same thing (yrs's merge writes a
+    /// block that overlaps an earlier one with an offset, and so without its parent and key).
+    /// When a later one is refused after earlier ones landed, the copy is rolled back, which
+    /// is a rebuild; [`rebuilds`](Self::rebuilds) says when that happened.
     pub fn admit_all<U: AsRef<[u8]>>(&mut self, updates: &[U]) -> Result<(), ShadowRefusal> {
-        match updates {
-            [] => Ok(()),
-            [one] => self.admit_one(one.as_ref()),
-            many => {
-                // Each read by the gate's walk first: yrs's merge decodes them.
-                if many.iter().any(|u| crate::walk::read(u.as_ref()).is_none()) {
-                    return Err(ShadowRefusal::Invalid);
-                }
-                let merged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| yrs::merge_updates_v1(many.iter().map(AsRef::as_ref))))
-                    .ok()
-                    .and_then(Result::ok)
-                    .ok_or(ShadowRefusal::Invalid)?;
-                self.admit_one(&merged)
+        let mark = self.mark();
+        for update in updates {
+            if let Err(refusal) = self.admit_one(update.as_ref()) {
+                self.rollback(mark);
+                return Err(refusal);
             }
         }
+        Ok(())
     }
 
     /// Where the copy stands now, to [`rollback`](Self::rollback) to when the relay refuses an
@@ -180,6 +179,7 @@ impl Shadow {
                 self.rebuild();
                 return Err(ShadowRefusal::Panicked);
             }
+            Ok(Err(crate::LiveError::TooLarge)) => return Err(ShadowRefusal::TooLarge),
             Ok(Err(_)) => {
                 // Refused before yrs saw it, as a rule; if yrs took part of it, start again.
                 if self.y.doc().transact().state_vector() != before {
@@ -349,6 +349,32 @@ mod tests {
 
     /// The shadow refuses an op its replica refuses, keeps going, and stays level with a replica
     /// that took the same accepted ops.
+    /// Re-review N4: a submit is judged as replicas apply it, one update at a time. Merged,
+    /// `[one letter at the end of a text, the same id two long with the text as parent, key
+    /// `k`, "ab"]` loses the second update's parent and key (yrs writes the overlap with an
+    /// offset) and reads as an unkeyed string beside the letter, which fits; replicas apply the
+    /// second as a keyed string in a text and refuse it. The copy refuses the submit and keeps
+    /// none of it.
+    #[test]
+    fn a_submit_is_judged_one_update_at_a_time() {
+        use crate::ydoc::tests::{doc, resent_keyed, text_id_and_letter};
+        let d = doc();
+        let (text, letter) = text_id_and_letter(&d);
+        let keyed_string = resent_keyed(text, 0x04, &[2, b'a', b'b']);
+        let fresh = || {
+            let mut s = Shadow::new(Some("wordcraft/1"));
+            s.admit(&d.state()).unwrap();
+            s
+        };
+        let merged = yrs::merge_updates_v1([letter.as_slice(), keyed_string.as_slice()]).unwrap();
+        assert!(fresh().admit(&merged).is_ok(), "the merged form is refused too, so this test shows nothing");
+        let mut shadow = fresh();
+        let before = shadow.state();
+        assert_eq!(shadow.admit_all(&[letter.clone(), keyed_string]), Err(ShadowRefusal::Invalid));
+        assert_eq!(shadow.state(), before, "part of the submit was kept");
+        shadow.admit(&letter).unwrap();
+    }
+
     /// An honest checkpoint of a block split, more than the nesting cap times, by as many
     /// sessions in turn, is judged in full by a fresh copy (it used to wait for ever: the cap
     /// was on origin-chain length, and the body's chain crosses between the sessions' runs).

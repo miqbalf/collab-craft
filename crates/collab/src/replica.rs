@@ -227,6 +227,7 @@ impl YReplica {
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
         match readiness(&self.doc, update, &mut self.seen) {
             Ready::Refused => return Err(LiveError::Decode),
+            Ready::TooLarge => return Err(LiveError::TooLarge),
             Ready::Waiting(need) => {
                 self.wait(update, need);
                 return Ok(());
@@ -278,7 +279,7 @@ impl YReplica {
                 }
                 match readiness(&self.doc, &u, &mut self.seen) {
                     Ready::Waiting(need) => keep.push((u, need)),
-                    Ready::Refused => log::warn!("collab: a waiting update does not fit the document; dropped"),
+                    Ready::Refused | Ready::TooLarge => log::warn!("collab: a waiting update does not fit the document; dropped"),
                     Ready::Now => {
                         let applied = self.apply_now(&u);
                         if self.damaged {
@@ -322,7 +323,7 @@ impl YReplica {
             self.drop_held();
             return Ok(());
         }
-        first.map_err(|_| LiveError::Decode)
+        first.map_err(LiveError::from)
     }
 
     /// A fresh document with this replica's client id holding exactly `state` (a checkpoint, or
@@ -400,7 +401,7 @@ impl YReplica {
             match integrate_held(&self.doc, &mut self.seen) {
                 Ok(()) => {}
                 Err(Integrate::Panicked) => return Err(Integrate::Panicked),
-                Err(Integrate::Refused) => {
+                Err(Integrate::Refused | Integrate::TooLarge) => {
                     log::warn!("collab: held updates did not apply together; dropped, resync needed");
                     self.drop_held();
                     return Ok(());
@@ -508,13 +509,18 @@ impl YReplica {
 pub enum Integrate {
     #[error("the update did not decode or apply")]
     Refused,
+    #[error("the update is too large to check")]
+    TooLarge,
     #[error("yrs panicked while applying the update")]
     Panicked,
 }
 
 impl From<Integrate> for LiveError {
-    fn from(_: Integrate) -> LiveError {
-        LiveError::Decode
+    fn from(i: Integrate) -> LiveError {
+        match i {
+            Integrate::TooLarge => LiveError::TooLarge,
+            _ => LiveError::Decode,
+        }
     }
 }
 
@@ -542,6 +548,9 @@ fn integrate_checked(doc: &Doc, update: &[u8], checked: bool, seen: &mut crate::
         // The walk first: it refuses counts the bytes cannot back (an allocation bomb, which
         // aborts rather than unwinds) before yrs's decoder sizes anything by them.
         let Some((_, incoming)) = crate::walk::items(update) else { return Err(Integrate::Refused) };
+        if crate::fits::too_many(incoming.len()) {
+            return Err(Integrate::TooLarge);
+        }
         let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
         let mut txn = doc.transact_mut_with(REMOTE);
         let mut dropped = false;
@@ -588,6 +597,8 @@ enum Ready {
     Waiting((u64, u32)),
     /// It does not read, or does not fit the document.
     Refused,
+    /// It has more items than one check takes.
+    TooLarge,
 }
 
 /// Read `update` and check it against `doc`: [`Ready::Refused`] when the reader does not take it
@@ -597,6 +608,9 @@ enum Ready {
 fn readiness(doc: &Doc, update: &[u8], seen: &mut crate::fits::Seen) -> Ready {
     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Some((shape, items)) = crate::walk::items(update) else { return Ready::Refused };
+        if crate::fits::too_many(items.len()) {
+            return Ready::TooLarge;
+        }
         let txn = doc.transact();
         let fits = crate::fits::check(&txn, &items, seen);
         if fits == crate::fits::Verdict::Refused {
@@ -1473,6 +1487,17 @@ mod tests {
             n >>= 7;
         }
         out.push(n as u8);
+    }
+
+    /// The item cap is past any update an honest peer can send (one 16 MiB client frame, at
+    /// most half its bytes in blocks, plus 1 MiB of held updates), and past it an update is
+    /// refused as too large to check, not as content that does not fit.
+    #[test]
+    fn the_item_cap_is_past_any_honest_update() {
+        const { assert!(crate::fits::MAX_ITEMS >= (16 << 20) / 2 + (1 << 20) / 2) };
+        assert!(!crate::fits::too_many(crate::fits::MAX_ITEMS));
+        assert!(crate::fits::too_many(crate::fits::MAX_ITEMS + 1));
+        assert_eq!(LiveError::from(Integrate::TooLarge), LiveError::TooLarge);
     }
 
     /// The fit check costs about the same per item however far into a long array an op lands:

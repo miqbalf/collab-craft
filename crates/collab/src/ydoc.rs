@@ -123,6 +123,10 @@ pub enum LiveError {
     /// no more local edits; rebuild it from a snapshot or reopen the file.
     #[error("the shared document is damaged; reopen the file")]
     Damaged,
+    /// The update has more items than one check takes (see the `fits` module). No update an
+    /// honest peer sends is this large; it is not judged as content that does not fit.
+    #[error("the update is too large to check")]
+    TooLarge,
 }
 
 /// One replica of a block document.
@@ -799,15 +803,65 @@ fn run_attrs_of(attrs: &Attributes) -> Attrs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
 
-    fn doc() -> LiveDoc {
+    pub(crate) fn doc() -> LiveDoc {
         let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "hello".to_owned(), ..SeedBlock::default() }]).unwrap();
         d.set_client(1).unwrap();
         d
+    }
+
+    /// Block 1's text: its id, and an update from client 77 that types one letter at its end.
+    pub(crate) fn text_id_and_letter(d: &LiveDoc) -> (yrs::ID, Vec<u8>) {
+        use yrs::branch::BranchID;
+        use yrs::updates::decoder::Decode;
+        let raw = yrs::Doc::with_options(yrs::Options {
+            offset_kind: yrs::OffsetKind::Bytes,
+            ..yrs::Options::with_client_id(yrs::block::ClientID::new(77))
+        });
+        raw.transact_mut().apply_update(yrs::Update::decode_v1(&d.state()).unwrap()).unwrap();
+        let blocks = raw.get_or_insert_map(BLOCKS);
+        let before = raw.transact().state_vector();
+        let id = {
+            let mut txn = raw.transact_mut();
+            let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+            let text = text_of(&txn, &block).unwrap();
+            let len = text.len(&txn);
+            text.insert(&mut txn, len, "!");
+            let BranchID::Nested(id) = AsRef::<yrs::branch::Branch>::as_ref(&text).id() else { panic!("a root text") };
+            id
+        };
+        (id, raw.transact().encode_diff_v1(&before))
+    }
+
+    /// The same id sent again, longer, naming `parent` and key `k`, with `content`
+    /// (`kind`: 0x08 Any, 0x04 string).
+    pub(crate) fn resent_keyed(parent: yrs::ID, kind: u8, content: &[u8]) -> Vec<u8> {
+        let (client, clock) = (parent.client.get(), u64::from(parent.clock));
+        assert!(client < 0x80 && clock < 0x80);
+        let mut u = vec![1, 1, 77, 0, 0x20 | kind, 0, client as u8, clock as u8, 1, b'k'];
+        u.extend(content);
+        u.push(0);
+        u
+    }
+
+    /// Re-review N1: one letter at the end of a block text, then the same id sent again two
+    /// long, naming the text as its parent and key `k`. yrs keeps the rest's key but links it
+    /// into the text's list, and a checkpoint then reads it back as an unkeyed value in the
+    /// text, which no restore takes. The second op is refused, and every checkpoint loads back.
+    #[test]
+    fn a_held_item_resent_with_its_own_key_is_refused() {
+        let mut d = doc();
+        let (text, letter) = text_id_and_letter(&d);
+        d.apply(&letter).unwrap();
+        let keyed_values = resent_keyed(text, 0x08, &[2, 0x7d, 1, 0x7d, 2]);
+        assert!(d.apply(&keyed_values).is_err(), "the keyed rest was taken");
+        assert!(LiveDoc::from_state(&d.state()).is_ok(), "the checkpoint does not load back");
+        assert_eq!(d.block(1).unwrap().text, "hello!");
+        d.delete_text(1, 0, 6).unwrap();
     }
 
     /// A state is checked against the typed roots it is read with: a string straight in the

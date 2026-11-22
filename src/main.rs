@@ -354,8 +354,10 @@ struct Gates {
     /// Whether each `crdt.*` op is tried on a shadow copy of its room's document before it is
     /// ordered (`COLLABCRAFT_SHADOW`, on unless set to `0`). See [`admit_on_shadow`].
     shadow: bool,
-    /// What all rooms' shadow copies hold, about ([`Shadow::bytes`]), and the caps on it.
+    /// What all rooms' shadow copies hold, about ([`Shadow::bytes`]), how many rooms have one,
+    /// and the caps.
     shadow_bytes: std::sync::atomic::AtomicUsize,
+    shadowed: std::sync::atomic::AtomicUsize,
     room_cap: usize,
     global_cap: usize,
 }
@@ -368,7 +370,19 @@ impl Default for Gates {
 
 impl Gates {
     fn new(shadow: bool, room_cap: usize, global_cap: usize) -> Gates {
-        Gates { map: std::sync::Mutex::new(HashMap::new()), shadow, shadow_bytes: std::sync::atomic::AtomicUsize::new(0), room_cap, global_cap }
+        Gates {
+            map: std::sync::Mutex::new(HashMap::new()),
+            shadow,
+            shadow_bytes: std::sync::atomic::AtomicUsize::new(0),
+            shadowed: std::sync::atomic::AtomicUsize::new(0),
+            room_cap,
+            global_cap,
+        }
+    }
+
+    /// One room's fair share of the relay-wide cap: the cap over the rooms that hold a copy.
+    fn fair_share(&self) -> usize {
+        self.global_cap / self.shadowed.load(std::sync::atomic::Ordering::Relaxed).max(1)
     }
 }
 
@@ -378,11 +392,21 @@ const DEFAULT_SHADOW_ROOM_BYTES: usize = 256 * 1024 * 1024;
 /// Default cap on all rooms' shadow copies together (`COLLABCRAFT_SHADOW_BYTES`).
 const DEFAULT_SHADOW_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Rebuilds (after a panic, or a rollback) one room's copy may make in [`REBUILD_WINDOW`]
-/// before the room's ops are refused for [`REBUILD_PAUSE`]: each costs a replay of the copy.
-const MAX_REBUILDS: usize = 4;
-const REBUILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-const REBUILD_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Ops one connection may send that cost the copy a rebuild (yrs panicked on them, or a later
+/// update of a submit was refused after earlier ones landed) within [`STRIKE_WINDOW`], before
+/// that connection's CRDT ops are refused for [`STRIKE_PAUSE`]. Only that connection: the
+/// room's other editors and its checkpoints go on. A rollback because the bus did not answer
+/// is never counted.
+const MAX_STRIKES: usize = 4;
+const STRIKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const STRIKE_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One connection's rebuild-costing ops, and until when its ops are refused.
+#[derive(Default)]
+struct Strikes {
+    at: std::collections::VecDeque<std::time::Instant>,
+    paused_until: Option<std::time::Instant>,
+}
 
 /// What a room's gate guards besides the order of its broadcasts: the shadow copy of the
 /// room's document (the [`craft_collab::DOC_SCOPE`] scope, the only one replicas read), which
@@ -392,10 +416,8 @@ struct Gate {
     shadow: Option<Shadow>,
     /// What the copy held at its last count, as added to [`Gates::shadow_bytes`].
     bytes: usize,
-    /// When the copy was last rebuilt, and until when the room's ops are refused for it.
-    rebuilt: std::collections::VecDeque<std::time::Instant>,
-    rebuilds_seen: u64,
-    paused_until: Option<std::time::Instant>,
+    /// Per connection (socket id): ops that cost the copy a rebuild. See [`MAX_STRIKES`].
+    strikes: HashMap<String, Strikes>,
 }
 
 /// Why the relay refused an op at the shadow.
@@ -403,10 +425,12 @@ struct Gate {
 enum ShadowStop {
     /// The copy refused it, or yrs panicked on it.
     Refused(ShadowRefusal),
-    /// The room's copy, or all copies together, are past their byte cap.
-    Full,
-    /// The copy was rebuilt too often lately; the room's ops wait for a while.
-    Paused,
+    /// For now: the room's copy is past its byte cap, or past its fair share while all copies
+    /// are past theirs, or this connection is paused for its rebuilds. Sent as `retry`.
+    Busy,
+    /// The op alone is past the room's copy cap, or has more items than a check takes:
+    /// sending it again cannot help, and it says nothing about its content.
+    TooLarge,
 }
 
 /// Times the blocking task of a shadow copy failed (the copy is lost and started again).
@@ -438,52 +462,72 @@ fn crdt_updates(command: &str, params: &serde_json::Value) -> Option<Vec<Vec<u8>
     ops.iter().map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok())).collect()
 }
 
-/// Try a submit's updates on the room's shadow copy (`gate` is held by the caller). Refused when
-/// the copy's replica refuses them (they do not fit the document) or yrs panics applying or
-/// encoding them; the copy then stays as it was. Returns where the copy stood before, for the
-/// caller to roll back to if the room then refuses the op. Run off the async runtime, because a
-/// checkpoint costs tens of milliseconds on a large document.
+/// Try a submit's updates (from connection `conn`) on the room's shadow copy (`gate` is held by
+/// the caller). Refused when the copy's replica refuses them (they do not fit the document) or
+/// yrs panics applying or encoding them; the copy then stays as it was. Returns where the copy
+/// stood before, for the caller to roll back to if the op is not ordered after all. Run off the
+/// async runtime, because a checkpoint costs tens of milliseconds on a large document.
 ///
-/// Bounded: a copy past its byte cap is compacted, and if still past it (or all copies together
-/// are past theirs), the op is refused rather than let through unjudged; a copy rebuilt
-/// [`MAX_REBUILDS`] times in [`REBUILD_WINDOW`] pauses the room's ops for [`REBUILD_PAUSE`].
-async fn admit_on_shadow(gates: &Gates, gate: &mut Gate, schema: Option<String>, updates: Vec<Vec<u8>>) -> Result<Option<Mark>, ShadowStop> {
+/// Bounded, and never by switching judgement off: a copy past the room cap is compacted, and
+/// if still past it, the op is refused for now (`retry`). Past the relay-wide cap, only a room
+/// whose copy holds more than its fair share is refused for now; the others go on. A
+/// connection whose ops cost [`MAX_STRIKES`] rebuilds in [`STRIKE_WINDOW`] is refused for
+/// [`STRIKE_PAUSE`].
+async fn admit_on_shadow(
+    gates: &Gates,
+    gate: &mut Gate,
+    conn: &str,
+    schema: Option<String>,
+    updates: Vec<Vec<u8>>,
+) -> Result<Option<Mark>, ShadowStop> {
+    use std::sync::atomic::Ordering::Relaxed;
     let now = std::time::Instant::now();
-    if gate.paused_until.is_some_and(|until| now < until) {
-        return Err(ShadowStop::Paused);
+    if gate.strikes.get(conn).and_then(|s| s.paused_until).is_some_and(|until| now < until) {
+        return Err(ShadowStop::Busy);
     }
     let incoming: usize = updates.iter().map(Vec::len).sum();
+    if incoming > gates.room_cap {
+        return Err(ShadowStop::TooLarge);
+    }
+    let fresh = gate.shadow.is_none();
     let mut shadow = gate.shadow.take().unwrap_or_else(|| Shadow::new(schema.as_deref()));
-    let (room_cap, global_cap) = (gates.room_cap, gates.global_cap);
-    let total = gates.shadow_bytes.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(gate.bytes);
+    if fresh {
+        gates.shadowed.fetch_add(1, Relaxed);
+    }
+    let (room_cap, global_cap, share) = (gates.room_cap, gates.global_cap, gates.fair_share());
+    let others = gates.shadow_bytes.load(Relaxed).saturating_sub(gate.bytes);
     let judged = tokio::task::spawn_blocking(move || {
         // The op before this one was ordered (or rolled back), so its mark is spent.
         shadow.settle();
         shadow.set_schema(schema.as_deref());
-        let fits = |s: &Shadow| s.bytes() + 2 * incoming <= room_cap && total + s.bytes() + 2 * incoming <= global_cap;
-        if !fits(&shadow) {
+        let need = |s: &Shadow| s.bytes() + 2 * incoming;
+        let over = |s: &Shadow| need(s) > room_cap || (others + need(s) > global_cap && need(s) > share);
+        if over(&shadow) {
             shadow.compact_now();
         }
-        if !fits(&shadow) {
-            return (shadow, Err(ShadowStop::Full), None);
+        if over(&shadow) {
+            return (shadow, Err(ShadowStop::Busy), None, 0);
         }
-        let mark = shadow.mark();
-        let verdict = shadow.admit_all(&updates).map_err(ShadowStop::Refused);
-        (shadow, verdict, Some(mark))
+        let (mark, before) = (shadow.mark(), shadow.rebuilds());
+        let verdict =
+            shadow.admit_all(&updates).map_err(|r| if r == ShadowRefusal::TooLarge { ShadowStop::TooLarge } else { ShadowStop::Refused(r) });
+        let cost = shadow.rebuilds() - before;
+        (shadow, verdict, Some(mark), cost)
     })
     .await;
     match judged {
-        Ok((shadow, verdict, mark)) => {
+        Ok((shadow, verdict, mark, cost)) => {
             if shadow.is_waiting() {
                 // Expected until the room's first checkpoint (the copy lacks the seed), after a
                 // relay restart, and when two submits race for the gate. Logged, not refused:
                 // honest clients send such ops.
                 tracing::debug!("an op waits at the shadow copy for something it lacks");
             }
-            let rebuilds = shadow.rebuilds();
             account(gates, gate, &shadow);
             gate.shadow = Some(shadow);
-            note_rebuilds(gate, rebuilds, now);
+            if cost > 0 {
+                strike(gate, conn, now);
+            }
             verdict.map(|()| mark)
         }
         // The copy is caught under `catch_unwind` inside, so this is a cancelled task; the room
@@ -499,10 +543,12 @@ async fn admit_on_shadow(gates: &Gates, gate: &mut Gate, schema: Option<String>,
 /// the next op starts a fresh copy. The op at hand is let through unjudged, as with the shadow
 /// off; [`SHADOW_LOST`] says how often that happened.
 fn lose_copy(gates: &Gates, gate: &mut Gate, error: &str) {
-    let lost = SHADOW_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    use std::sync::atomic::Ordering::Relaxed;
+    let lost = SHADOW_LOST.fetch_add(1, Relaxed) + 1;
     tracing::warn!(error, lost, "the shadow copy was lost; starting a new one");
     gate.shadow = None;
-    gates.shadow_bytes.fetch_sub(std::mem::take(&mut gate.bytes), std::sync::atomic::Ordering::Relaxed);
+    gates.shadowed.fetch_sub(1, Relaxed);
+    gates.shadow_bytes.fetch_sub(std::mem::take(&mut gate.bytes), Relaxed);
 }
 
 /// Count the copy's bytes into the relay-wide total.
@@ -515,30 +561,30 @@ fn account(gates: &Gates, gate: &mut Gate, shadow: &Shadow) {
 }
 
 /// Take an op back out of the room's copy when it is not ordered after all (the bus could not
-/// number it). A rebuild, so it counts toward the room's pause like any other.
-fn unadmit(gate: &mut Gate, mark: Option<Mark>) {
-    if let (Some(mark), Some(shadow)) = (mark, gate.shadow.as_mut()) {
+/// number it, or the room refused it). A rebuild, but not the sender's doing, so not counted
+/// against it.
+fn unadmit(gates: &Gates, gate: &mut Gate, mark: Option<Mark>) {
+    if let (Some(mark), Some(mut shadow)) = (mark, gate.shadow.take()) {
         shadow.rollback(mark);
-        let rebuilds = shadow.rebuilds();
-        note_rebuilds(gate, rebuilds, std::time::Instant::now());
+        account(gates, gate, &shadow);
+        gate.shadow = Some(shadow);
     }
 }
 
-/// Record the copy's rebuilds since the last count (`rebuilds` is its running total) and pause
-/// the room when there were [`MAX_REBUILDS`] within [`REBUILD_WINDOW`].
-fn note_rebuilds(gate: &mut Gate, rebuilds: u64, now: std::time::Instant) {
-    while gate.rebuilt.front().is_some_and(|t| now.duration_since(*t) > REBUILD_WINDOW) {
-        gate.rebuilt.pop_front();
+/// Count an op of `conn` that cost the copy a rebuild, and pause `conn` when it is the
+/// [`MAX_STRIKES`]th within [`STRIKE_WINDOW`].
+fn strike(gate: &mut Gate, conn: &str, now: std::time::Instant) {
+    // Bounded by the room's connections: forget those with nothing recent.
+    gate.strikes.retain(|_, s| s.paused_until.is_some_and(|u| now < u) || s.at.back().is_some_and(|t| now.duration_since(*t) <= STRIKE_WINDOW));
+    let s = gate.strikes.entry(conn.to_owned()).or_default();
+    while s.at.front().is_some_and(|t| now.duration_since(*t) > STRIKE_WINDOW) {
+        s.at.pop_front();
     }
-    let fresh = rebuilds.saturating_sub(gate.rebuilds_seen);
-    gate.rebuilds_seen = rebuilds;
-    for _ in 0..fresh.min(MAX_REBUILDS as u64) {
-        gate.rebuilt.push_back(now);
-    }
-    if gate.rebuilt.len() >= MAX_REBUILDS {
-        gate.paused_until = Some(now + REBUILD_PAUSE);
-        gate.rebuilt.clear();
-        tracing::warn!("a room's shadow copy was rebuilt {MAX_REBUILDS} times within a minute; its ops are refused for a while");
+    s.at.push_back(now);
+    if s.at.len() >= MAX_STRIKES {
+        s.at.clear();
+        s.paused_until = Some(now + STRIKE_PAUSE);
+        tracing::warn!(conn, "a connection's ops cost the shadow copy {MAX_STRIKES} rebuilds within a minute; its ops are refused for a while");
     }
 }
 
@@ -563,6 +609,9 @@ impl Relay {
             && let Ok(gate) = gate.try_lock()
         {
             self.gates.shadow_bytes.fetch_sub(gate.bytes, std::sync::atomic::Ordering::Relaxed);
+            if gate.shadow.is_some() {
+                self.gates.shadowed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -1447,25 +1496,25 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         };
         // Refused by the room below, with its own message; the copy is not asked.
         if room_says.is_ok() {
-            match admit_on_shadow(&relay.gates, &mut ordered, schema, updates).await {
+            match admit_on_shadow(&relay.gates, &mut ordered, &socket.id.to_string(), schema, updates).await {
                 Ok(m) => mark = m,
                 Err(stop) => {
                     drop(ordered);
                     let (detail, code) = match stop {
                         ShadowStop::Refused(refusal) => {
                             tracing::warn!(room = %claims.rm, peer = %claims.pid, reason = %refusal, "refused an op the shadow copy could not take");
-                            ("that change is not a valid document update", CODE_INVALID)
+                            ("that change is not a valid document update".to_owned(), Some(CODE_INVALID))
                         }
-                        ShadowStop::Full => {
-                            tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op: the room's shadow copy is past its byte cap");
-                            ("that document is too large for this relay to check", CODE_INVALID)
+                        ShadowStop::Busy => {
+                            tracing::info!(room = %claims.rm, peer = %claims.pid, "refused an op for now: the shadow copy is at its cap, or this peer is paused");
+                            ("relay is busy checking this document; try again shortly".to_owned(), Some(CODE_RETRY))
                         }
-                        ShadowStop::Paused => {
-                            tracing::info!(room = %claims.rm, peer = %claims.pid, "refused an op while the room's shadow copy is paused");
-                            ("relay is busy checking this document; try again shortly", CODE_RETRY)
+                        ShadowStop::TooLarge => {
+                            tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op too large for the shadow copy to check");
+                            (Refusal::TooLarge { bytes: room::value_bytes(&msg.params) }.detail(), None)
                         }
                     };
-                    let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: detail.to_owned(), local, code: Some(code) });
+                    let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail, local, code });
                     return;
                 }
             }
@@ -1482,7 +1531,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         match bus.next_seq(&claims.rm, floor).await {
             Ok(s) => s,
             Err(e) => {
-                unadmit(&mut ordered, mark);
+                unadmit(&relay.gates, &mut ordered, mark);
                 drop(ordered);
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
                 let _ = socket
@@ -1508,7 +1557,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         )
     };
     if outcome.is_err() {
-        unadmit(&mut ordered, mark);
+        unadmit(&relay.gates, &mut ordered, mark);
     }
     drop(ordered);
 
