@@ -37,7 +37,8 @@ pub enum Polled<P> {
         holder: String,
     },
     /// The run lost its lock. Told once per run; the app treats the ordered edit as failed and
-    /// says so. `finish` still ends the run (and owes no unlock).
+    /// says so. `finish` still ends the run; under a fenced grant it still sends the unlock,
+    /// which releases nothing at the relay but ends the client's dead fence.
     ///
     /// Against a fencing relay: the relay refused an edit made under the grant, or a lease
     /// refresh found it gone ([`LockEvent::Lost`]). Every edit of the run the relay did not
@@ -60,9 +61,11 @@ enum State {
     /// Granted at `seq`, under fencing `token` when the relay gave one: the item waits for the
     /// replica to apply up to `seq`.
     Granted { seq: u64, token: Option<u64> },
-    /// The item ran; its edits are being flushed. `held` is false once the grant is gone, so no
-    /// unlock is owed; `told` is whether [`Polled::LockLost`] went out; `token` the grant's.
-    Running { held: bool, told: bool, token: Option<u64> },
+    /// The item ran; its edits are being flushed. `held` is whether an unlock is owed: under a
+    /// fenced grant it stays owed after the loss, because the unlock is what ends the client's
+    /// dead fence (until then every edit is held back and taken back). `lost` is whether the
+    /// run lost its lock, `told` whether [`Polled::LockLost`] went out; `token` the grant's.
+    Running { held: bool, lost: bool, told: bool, token: Option<u64> },
 }
 
 /// One ordered edit at a time under one relay scope.
@@ -133,14 +136,15 @@ impl<P> Ordered<P> {
             // The grant this queue holds is gone. Before the run, ask again; during it, the run
             // is lost. A loss for another grant (an older one) is not ours.
             LockEvent::Lost { scope, token } if *scope == self.scope => match self.state {
+                // The unlock ends the dead fence (it releases nothing at the relay); then ask again.
                 State::Granted { token: Some(t), .. } if t == *token => {
                     self.state = State::Asking;
                     self.since = now_ms;
                     self.released_early = false;
-                    vec![Action::SendLock]
+                    vec![Action::SendUnlock, Action::SendLock]
                 }
-                State::Running { held: true, told, token: Some(t) } if t == *token => {
-                    self.state = State::Running { held: false, told, token: Some(t) };
+                State::Running { held, told, token: Some(t), .. } if t == *token => {
+                    self.state = State::Running { held, lost: true, told, token: Some(t) };
                     Vec::new()
                 }
                 _ => Vec::new(),
@@ -169,7 +173,7 @@ impl<P> Ordered<P> {
         match &self.state {
             State::Granted { seq, token } if applied >= *seq => match self.item.take() {
                 Some(item) => {
-                    self.state = State::Running { held: true, told: false, token: *token };
+                    self.state = State::Running { held: true, lost: false, told: false, token: *token };
                     Polled::Run(item)
                 }
                 None => {
@@ -177,8 +181,8 @@ impl<P> Ordered<P> {
                     Polled::Nothing
                 }
             },
-            State::Running { held: false, told: false, token } => {
-                self.state = State::Running { held: false, told: true, token: *token };
+            State::Running { held, lost: true, told: false, token } => {
+                self.state = State::Running { held: *held, lost: true, told: true, token: *token };
                 Polled::LockLost { scope: self.scope.clone() }
             }
             State::Asking | State::Denied { .. } if now_ms - self.since > GIVE_UP_MS => {
@@ -216,8 +220,8 @@ impl<P> Ordered<P> {
     pub fn replica_broken(&mut self) -> Vec<Action> {
         self.broken = true;
         match self.state {
-            State::Running { held, token, .. } => {
-                self.state = State::Running { held: false, told: false, token };
+            State::Running { held, told, token, .. } => {
+                self.state = State::Running { held: false, lost: true, told, token };
                 if held { vec![Action::SendUnlock] } else { Vec::new() }
             }
             _ => Vec::new(),
@@ -245,7 +249,7 @@ impl<P> Ordered<P> {
         match self.state {
             State::Idle | State::Running { token: Some(_), .. } => Vec::new(),
             State::Running { told, token: None, .. } => {
-                self.state = State::Running { held: false, told, token: None };
+                self.state = State::Running { held: false, lost: true, told, token: None };
                 Vec::new()
             }
             State::Asking | State::Denied { .. } | State::Granted { .. } => {

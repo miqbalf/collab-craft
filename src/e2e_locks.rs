@@ -27,6 +27,15 @@ struct Wire {
 
 impl Wire {
     async fn connect(url: &str, room: &str, pid: &str) -> Wire {
+        Wire::connect_with(url, ticket(room, pid, now())).await
+    }
+
+    /// Connect with a read ticket: it may watch, never edit or lock.
+    async fn connect_reader(url: &str, room: &str, pid: &str) -> Wire {
+        Wire::connect_with(url, crate::token::sign_at(crate::e2e_reconnect::SECRET, room, pid, pid, false, pid, now()).unwrap()).await
+    }
+
+    async fn connect_with(url: &str, token: String) -> Wire {
         let (tx, heard) = unbounded_channel();
         let mut builder = ClientBuilder::new(url.to_owned()).reconnect(false).transport_type(TransportType::Websocket);
         for event in ["op", "lock_granted", "lock_denied", "lock_released", "lock_lost", "error", "joined"] {
@@ -43,7 +52,7 @@ impl Wire {
                 .boxed()
             });
         }
-        let auth = json!({ "token": ticket(room, pid, now()), "proto": craft_collab::PROTO });
+        let auth = json!({ "token": token, "proto": craft_collab::PROTO });
         let client = builder.auth(auth).connect().await.expect("connects");
         let mut wire = Wire { client, heard };
         wire.next("joined").await;
@@ -322,4 +331,23 @@ async fn a_refreshed_lease_outlives_its_length() {
     a.send("refresh", json!({ "scope": STRUCT, "token": token })).await;
     a.next("lock_lost").await;
     assert_eq!(lease(&h, &room).await, None, "a refresh revived a lapsed lease");
+}
+
+/// A read ticket never holds a lock, so its refresh is not even checked: no bus call, no
+/// answer, and the holder's lease is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_reader_cannot_refresh_a_lease() {
+    let Some(h) = start().await else { return };
+    let room = unique_room("fence-reader");
+    let mut a = Wire::connect(&h.url, &room, "alice").await;
+    let mut r = Wire::connect_reader(&h.url, &room, "rita").await;
+    let token = a.take().await;
+    r.send("refresh", json!({ "scope": STRUCT, "token": token })).await;
+    let answer = tokio::time::timeout(Duration::from_millis(500), r.next("lock_lost")).await;
+    assert!(answer.is_err(), "a reader's refresh was answered: {answer:?}");
+    assert_eq!(lease(&h, &room).await.as_deref(), Some("alice"));
+    a.send("refresh", json!({ "scope": STRUCT, "token": token })).await;
+    let answer = tokio::time::timeout(Duration::from_millis(500), a.next("lock_lost")).await;
+    assert!(answer.is_err(), "the holder's own refresh lost its lock: {answer:?}");
 }

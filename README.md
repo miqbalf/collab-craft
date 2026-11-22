@@ -362,9 +362,17 @@ variants gained fields (see below), so literals and exhaustive matches need upda
   goes out under the fence; a fenced refusal takes the run back (the replica is rebuilt from its
   state at the grant plus everything the room ordered since, `Work::Reset`) and reports
   `LockEvent::Lost`. `Live::fence()` and `Live::refresh_lease(now_ms)`.
+  Under the fence edits go out one submit at a time (the next waits for the relay's answer to the
+  one before, so a refusal never leaves a later edit ordered behind a hole); an edit is only ever
+  sent under the token it was made under. After a loss the fence stays, dead, until
+  `Live::unlock(scope)`: edits made meanwhile are never sent and are taken back, so a lost run
+  fails closed. `Live::unlock` while fenced edits are unanswered waits for them before the unlock
+  goes out (edits made in between wait too, then go free).
 - **`craft-live`.** `LiveEditing::pump` refreshes the lease at half its length on the host clock
   (`set_clock`) and passes `LockEvent::Lost` through `take_lock_events()`. `Ordered`: a `Lost`
-  for its grant before the run asks again, during the run ends it as `Polled::LockLost`; a rejoin
+  for its grant before the run gives the dead grant back and asks again, during the run ends it as
+  `Polled::LockLost`, and `finish` still returns `SendUnlock` for a fenced run (the unlock ends the
+  client's dead fence and releases nothing at the relay); a rejoin
   no longer loses a fenced run by itself (the relay's answer to its edits decides). `MemRelay`
   fences like the relay, and `MemRelay::lapse(scope)`, `refreshes()` and `holder(scope)` let a
   test run a lease out.
@@ -372,6 +380,13 @@ variants gained fields (see below), so literals and exhaustive matches need upda
 ## Known limits
 
 Phase 1 of live co-editing ships with these. Each is a decision, not an oversight.
+
+- **Fencing tokens restart with Valkey's data.** The per-scope token counter lives in Valkey
+  (`collabcraft:doc:<room>:fence:<scope>`, 30 days idle). A Valkey restart without persistence,
+  a `FLUSHDB`, or a scope idle past that resets it, so tokens can repeat. Safety holds because the
+  fence also requires the holder to be the same peer id, so only that peer could reuse a token.
+  The lock scripts also touch two keys without a hash tag, so a Valkey Cluster would refuse them
+  (`CROSSSLOT`), which fails closed: every lock becomes `retry`.
 
 - **Room state lives in relay memory only.** The op history, the retained text with its
   checkpoint snapshot, and the saved marker are not written to Valkey (only the sequence, the id

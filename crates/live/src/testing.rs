@@ -44,9 +44,8 @@ struct Relay {
     ephemeral: Vec<(String, String, Value)>,
     /// The holder (connection index) of each locked scope, and its grant's fencing token.
     locks: Vec<(String, usize, u64)>,
-    /// The last fencing token handed out, for any scope (the real relay counts per scope; one
-    /// counter is still increasing per scope).
-    tokens: u64,
+    /// The last fencing token handed out for each scope, as the real relay counts them.
+    fences: std::collections::HashMap<String, u64>,
     /// Lease refreshes heard, `(scope, token)`, oldest first.
     refreshes: Vec<(String, u64)>,
     /// How many of the next submits the relay refuses for now (the retry code).
@@ -358,8 +357,11 @@ impl Relay {
                     }
                     _ => {
                         // Every grant, a re-grant to the holder too, takes a new token.
-                        self.tokens += 1;
-                        let token = self.tokens;
+                        let token = {
+                            let last = self.fences.entry(scope.clone()).or_default();
+                            *last += 1;
+                            *last
+                        };
                         if holder.is_none() {
                             self.broadcast(&ServerMsg::PresenceLock { doc: ROOM.into(), scope: scope.clone(), holder: me }, Some(at));
                         }

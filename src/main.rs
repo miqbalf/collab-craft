@@ -1388,7 +1388,13 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<UnlockMsg>, State(relay): 
             Some(token) => match bus.release_fenced(&claims.rm, &msg.scope, &claims.pid, token).await {
                 Ok(ReleaseOutcome::Released) => true,
                 Ok(ReleaseOutcome::Absent) => false,
-                Ok(ReleaseOutcome::NotYours) | Err(_) => return,
+                Ok(ReleaseOutcome::NotYours) => return,
+                // Not known whether it was released: fail closed (the lease is the backstop,
+                // and announcing a release that did not happen would send others to a busy lock).
+                Err(e) => {
+                    tracing::warn!(error = %e, room = %claims.rm, scope = %msg.scope, token, "could not release a fenced lock");
+                    return;
+                }
             },
             None => bus.release(&claims.rm, &msg.scope, &claims.pid).await.unwrap_or(false),
         }
@@ -1417,6 +1423,10 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<UnlockMsg>, State(relay): 
 /// protected before its next edit is refused.
 async fn on_refresh(socket: SocketRef, Data(msg): Data<RefreshMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
+    // A read ticket never holds a lock, so it has nothing to refresh: no bus call for it.
+    if !claims.may_edit() {
+        return;
+    }
     let held = {
         let mut bus = relay.bus.lock().await;
         bus.check_fence(&claims.rm, &msg.scope, &claims.pid, msg.token).await

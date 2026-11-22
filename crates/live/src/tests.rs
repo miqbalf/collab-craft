@@ -784,9 +784,16 @@ fn unlock_is_held_back_until_the_own_op_is_ordered() {
     }
     let Polled::Run(_) = q.poll(a.le.newest_seq(), 2.0) else { panic!("not granted") };
     a.set(1, "uno");
-    // The relay's order for the edit sits unread in A's inbox: not settled, no unlock.
+    // The relay's order for the edit sits unread in A's inbox: not settled, no unlock. Edits
+    // under the lock go one submit at a time, so it takes a pump per submit.
     assert!(q.finish(a.le.local_settled()).is_empty());
-    a.pump();
+    let mut pumps = 0;
+    while !a.le.local_settled() {
+        assert!(q.finish(false).is_empty());
+        a.pump();
+        pumps += 1;
+        assert!(pumps < 8, "the run never settled");
+    }
     assert_eq!(q.finish(a.le.local_settled()), vec![Action::SendUnlock]);
 }
 
@@ -906,7 +913,11 @@ fn a_paused_holder_whose_lease_went_to_another_is_refused_and_taken_back() {
         q.on_lock(e, 3.0);
     }
     assert_eq!(q.poll(a.le.newest_seq(), 4.0), Polled::LockLost { scope: SCOPE.into() });
-    assert!(q.finish(a.le.local_settled()).is_empty(), "an unlock owed for a lost grant");
+    // The unlock is still owed: it ends A's dead fence, and releases nothing at the relay.
+    assert_eq!(q.finish(a.le.local_settled()), vec![Action::SendUnlock]);
+    a.le.unlock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), Some((peer_of(&relay, &b), new)), "the stale unlock released B's grant");
 
     // A's replica and engine are back at the room's state, with B's edit and without its own.
     assert_eq!(a.line(1), "one");
@@ -1014,10 +1025,22 @@ fn a_long_run_refreshes_its_lease() {
     assert_eq!(events, vec![lost(token)]);
     q.on_lock(&events[0], 1.0);
     assert_eq!(q.poll(a.le.newest_seq(), 2.0), Polled::LockLost { scope: SCOPE.into() });
-    // Edits after the loss are free again, and nothing was taken back.
+    assert!(a.le.live().fence().is_none(), "a lost grant still fences as if it were held");
+    // The run goes on a moment longer (its last frame): its edit never goes out free. It
+    // stays under the lost grant and is taken back, so the fence fails closed.
+    let seq = relay.seq();
+    a.set(2, "the run's last edit");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.seq(), seq, "an edit of a lost run went out");
+    assert_eq!((a.line(2), b.line(2)), ("two", "two"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+    // The run's unlock ends the dead fence: edits after it are free again.
+    assert_eq!(q.finish(a.le.local_settled()), vec![Action::SendUnlock]);
+    a.le.unlock(SCOPE).unwrap();
     a.set(2, "free again");
     settle(&mut [&mut a, &mut b]);
     assert_eq!((b.line(1), b.line(2)), ("after a long run", "free again"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
 }
 
 /// Edits without a lock are not fenced, even while another window holds one.
@@ -1084,7 +1107,7 @@ fn a_lost_grant_asks_again_or_loses_the_run() {
     q.request("x", 0.0).unwrap();
     q.on_lock(&fenced(5, 3), 1.0);
     assert!(q.on_lock(&lost(2), 2.0).is_empty(), "an older grant's loss is not ours");
-    assert_eq!(q.on_lock(&lost(3), 2.0), vec![Action::SendLock], "lost before the run: ask again");
+    assert_eq!(q.on_lock(&lost(3), 2.0), vec![Action::SendUnlock, Action::SendLock], "lost before the run: end the fence, ask again");
     assert_eq!(q.poll(5, 3.0), Polled::Nothing);
     q.on_lock(&fenced(6, 4), 4.0);
     assert_eq!(q.poll(6, 5.0), Polled::Run("x"));
@@ -1093,10 +1116,160 @@ fn a_lost_grant_asks_again_or_loses_the_run() {
     assert!(q.on_lock(&lost(4), 7.0).is_empty());
     assert_eq!(q.poll(6, 8.0), Polled::LockLost { scope: SCOPE.into() });
     assert_eq!(q.poll(6, 9.0), Polled::Nothing, "told twice");
-    assert!(q.finish(true).is_empty(), "an unlock owed for a lost grant");
+    assert_eq!(q.finish(true), vec![Action::SendUnlock], "a lost fenced run must still end its fence");
     // A fenced run that was not lost gives its lock back as before.
     q.request("y", 10.0).unwrap();
     q.on_lock(&fenced(7, 5), 11.0);
     assert_eq!(q.poll(7, 12.0), Polled::Run("y"));
     assert_eq!(q.finish(true), vec![Action::SendUnlock]);
+}
+
+/// The review's C1: a fenced edit the relay ordered just before the link dropped, its answer
+/// lost with the link. The rejoin sends it again under a new counter, which the relay refuses
+/// (the drop released the grant and B took it), but the catch-up carries the order of the old
+/// counter, which counts: the edit is the room's, and A keeps it. A's replica ends equal to B's.
+#[test]
+fn a_fenced_edit_ordered_before_the_link_dropped_is_kept() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    // The edit goes out (the relay orders its first submit) and A never hears the answer.
+    let seq = relay.seq();
+    a.set(1, "ordered");
+    assert_eq!(relay.seq(), seq + 1, "not exactly one fenced submit in flight");
+    relay.drop_link(a.le.hub());
+    b.pump();
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    // The ordered part (the delete) is everybody's, A's included; the rest was taken back.
+    assert_eq!(b.line(1), "", "the relay did not order the first submit");
+    assert_eq!(a.line(1), "");
+    assert_eq!(replica_lines(&a), replica_lines(&b), "A's replica parted from the room's");
+    let events = a.le.take_lock_events();
+    assert!(events.iter().any(|e| matches!(e, LockEvent::Lost { .. })), "A was not told: {events:?}");
+    // And the two stay together from there.
+    a.le.unlock(SCOPE).unwrap();
+    a.set(2, "after");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(2), "after");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The review's I1: an edit refused for now under one grant is never sent under a newer one.
+/// A asks again (a new token); the old fence dies, its edit is taken back, and only edits made
+/// under the new grant go out under it.
+#[test]
+fn an_edit_refused_for_now_is_never_sent_under_a_newer_grant() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    let old = take_grant(&mut a);
+    relay.refuse_next_submits(1);
+    let seq = relay.seq();
+    a.set(1, "under the old grant");
+    a.pump();
+    assert_eq!(relay.seq(), seq);
+    // The lease lapses and A asks again before the retry: a newer grant.
+    relay.lapse(SCOPE);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    let events = a.le.take_lock_events();
+    assert!(events.contains(&lost(old)), "the old grant's loss was not told: {events:?}");
+    let new = relay.holder(SCOPE).expect("A holds it again").1;
+    assert!(new > old);
+    assert_eq!(a.le.live().fence().map(|f| f.token), Some(new));
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.seq(), seq, "the old grant's edit was sent under the new one");
+    assert_eq!((a.line(1), b.line(1)), ("one", "one"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+    // An edit made under the new grant is ordered.
+    a.set(1, "under the new grant");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "under the new grant");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The review's I3: one fenced submit at a time. While the first is unanswered (here refused
+/// for now) nothing after it goes out, so a refusal can never leave a later edit ordered behind
+/// a hole. When the grant is gone by the retry, the whole edit is taken back, and A's next free
+/// edits (which reuse the refused clock range) do not bring any of it back.
+#[test]
+fn only_one_fenced_submit_is_in_flight() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    relay.refuse_next_submits(1);
+    let seq = relay.seq();
+    a.set(1, "refused");
+    a.set(2, "queued behind it");
+    a.pump();
+    assert_eq!(relay.seq(), seq, "an edit went out behind an unanswered one");
+    relay.lapse(SCOPE);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    // The backoff runs out: the retry goes under the old grant and is refused.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.seq(), seq, "an edit of the lost run was ordered");
+    assert_eq!((a.line(1), a.line(2)), ("one", "two"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+    a.le.unlock(SCOPE).unwrap();
+    a.set(1, "x");
+    a.set(2, "y");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), ("x", "y"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The review's M3: an unlock while an edit under the lock is unanswered waits for it, so the
+/// holder's own last edit is never refused because the unlock overtook it.
+#[test]
+fn an_unlock_waits_for_the_edits_under_the_lock() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    a.set(1, "last edit");
+    a.le.unlock(SCOPE).unwrap();
+    assert!(relay.holder(SCOPE).is_some(), "the unlock overtook an unanswered edit");
+    // An edit after the unlock waits for the fence to end, then goes free.
+    a.set(2, "after the unlock");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), None);
+    assert_eq!((b.line(1), b.line(2)), ("last edit", "after the unlock"));
+    assert!(a.le.take_lock_events().iter().all(|e| !matches!(e, LockEvent::Lost { .. })));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The review's M4: a replaced document ends the fence with [`LockEvent::Lost`].
+#[test]
+fn a_replaced_document_loses_the_fence() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    let token = take_grant(&mut a);
+    relay.fall_behind(a.le.hub());
+    a.pump();
+    assert!(a.le.take_lock_events().contains(&lost(token)));
+    assert!(a.le.live().fence().is_none());
 }

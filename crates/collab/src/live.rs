@@ -251,32 +251,47 @@ impl PendingCheckpoint {
 /// An ordered run's fence: the lock the edits are made under, and what the replica needs to go
 /// back to the room's state when the relay refuses one of them ([`FENCED`]).
 ///
-/// From the grant until [`Live::unlock`], every local edit goes out fenced. The relay orders a
-/// fenced edit only while this peer still holds the scope under the token, so a holder that was
-/// paused or cut off past its lease can never append an edit after somebody else was granted
-/// the lock. A refused edit already landed in this replica, so the replica is rebuilt from the
-/// state it had at the grant plus everything the room has ordered since, which is the room's
-/// state, and the app is told ([`Work::Reset`], then [`LockEvent::Lost`]).
+/// From the grant until [`Live::unlock`], every local edit is made under the fence. The relay
+/// orders a fenced edit only while this peer still holds the scope under the token, so a holder
+/// that was paused or cut off past its lease can never append an edit after somebody else was
+/// granted the lock. Edits under the fence go out one submit at a time: the next waits until the
+/// relay has ordered the one before, so a refusal can never leave a later edit ordered behind a
+/// refused one.
+///
+/// Once the grant is gone (an edit refused, a refresh answered, or a newer grant of the scope)
+/// the fence is dead but stays until [`Live::unlock`]: edits made under it are never sent, and
+/// whatever of the run the relay did not order is taken back. The replica is rebuilt from its
+/// state at the grant plus everything the room has ordered since, which is the room's state, and
+/// the app is told ([`Work::Reset`] and [`LockEvent::Lost`]).
 struct Fenced {
     scope: Scope,
     token: u64,
     /// The replica's full state at the grant. `None` when it had none (not loaded, broken), or
-    /// when [`Fenced::log`] outgrew [`MAX_UNCONFIRMED_BYTES`]: a refusal then breaks the replica.
+    /// when [`Fenced::log`] outgrew [`MAX_UNCONFIRMED_BYTES`]: a take-back then breaks the replica.
     base: Option<Vec<u8>>,
     /// The updates the room ordered since [`Fenced::base`], in the order this replica took them:
     /// other peers' it applied, and its own fenced ones the relay ordered.
     log: Vec<Vec<u8>>,
     log_bytes: usize,
-    /// Fenced submits sent and not answered yet, by counter.
-    pending: std::collections::BTreeSet<u64>,
-    /// The relay refused a fenced submit: the token is dead for good.
-    refused: bool,
-    /// The fence guards no new edit: the app gave the lock back, or it was lost. It ends once
-    /// [`Fenced::pending`] is empty.
-    closing: bool,
-    /// Edits made while closing with fenced submits still unanswered. Sent unfenced once the
-    /// fence ends cleanly; dropped with the rest if it ends refused (they were made on state
-    /// the room may never have).
+    /// Edits made under the fence and not sent yet, oldest first.
+    queue: Vec<Vec<u8>>,
+    /// The one fenced submit sent and not answered yet.
+    inflight: Option<InFlight>,
+    /// Every counter a submit under this fence went out with: a refusal of any of them as
+    /// [`FENCED`] means the grant is gone.
+    sent: std::collections::BTreeSet<u64>,
+    /// The relay refused [`Fenced::inflight`] for now: it goes again after the backoff.
+    retry: bool,
+    /// An edit made under the fence was refused, or never sent once the fence died: the replica
+    /// holds what the room does not.
+    owed_back: bool,
+    /// The grant is gone. Nothing more is sent under the fence.
+    dead: bool,
+    /// The app gave the lock back. The unlock goes out once every edit under the fence is
+    /// answered, and the fence ends then.
+    unlocked: bool,
+    /// Edits made after [`Live::unlock`] while the fence drains. Sent free once it ends cleanly;
+    /// dropped with the run if it is taken back (they were made on state the room may not have).
     held_back: Vec<Vec<u8>>,
     /// [`LockEvent::Lost`] went out for this fence.
     told: bool,
@@ -284,11 +299,49 @@ struct Fenced {
     lease_ms: u64,
     /// When the lease was last granted or refreshed, on the clock [`Live::refresh_lease`] is given.
     refreshed_at: Option<f64>,
+    /// A newer grant of this scope, `(token, lease_ms)`, that starts its fence once this one ends.
+    next: Option<(u64, u64)>,
+}
+
+/// The fenced submit in flight.
+struct InFlight {
+    update: Vec<u8>,
+    /// Every counter it was sent under, oldest first. A rejoin sends it again under a new one,
+    /// and the relay's order for an old one can still arrive in the rejoin's catch-up (it was
+    /// ordered just before the link dropped), which counts as its order too.
+    locals: Vec<u64>,
 }
 
 impl Fenced {
+    fn new(scope: &str, token: u64, lease_ms: u64, base: Option<Vec<u8>>) -> Fenced {
+        Fenced {
+            scope: scope.to_owned(),
+            token,
+            base,
+            log: Vec::new(),
+            log_bytes: 0,
+            queue: Vec::new(),
+            inflight: None,
+            sent: std::collections::BTreeSet::new(),
+            retry: false,
+            owed_back: false,
+            dead: false,
+            unlocked: false,
+            held_back: Vec::new(),
+            told: false,
+            lease_ms,
+            refreshed_at: None,
+            next: None,
+        }
+    }
+
     fn fence(&self) -> Fence {
         Fence { scope: self.scope.clone(), token: self.token }
+    }
+
+    /// Edits made under the fence (or held back behind it) the room has not ordered yet.
+    fn outstanding(&self) -> usize {
+        self.queue.len() + usize::from(self.inflight.is_some()) + self.held_back.len()
     }
 
     /// Note an update the room ordered since the grant.
@@ -299,7 +352,7 @@ impl Fenced {
         self.log_bytes += update.len();
         if self.log_bytes > MAX_UNCONFIRMED_BYTES {
             // Too much to replay: the run can no longer be taken back, only given up on.
-            log::warn!("collab: an ordered run outgrew what it can take back; a refusal will break the replica");
+            log::warn!("collab: an ordered run outgrew what it can take back; a take-back will break the replica");
             self.base = None;
             self.log.clear();
             self.log_bytes = 0;
@@ -576,13 +629,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// counter: a resend takes a new counter, and the old one is gone. Edits dropped when the
     /// replica broke still count: the room never got them.
     pub fn unconfirmed_edits(&self) -> usize {
-        self.unconfirmed.len() + self.abandoned + self.fence.as_ref().map_or(0, |f| f.held_back.len())
+        self.unconfirmed.len() + self.abandoned + self.fence.as_ref().map_or(0, Fenced::outstanding)
     }
 
     /// The fence edits go out under now: the scope and the grant's token, while this replica
     /// holds a fenced grant it has not given back.
     pub fn fence(&self) -> Option<Fence> {
-        self.fence.as_ref().filter(|f| !f.closing).map(Fenced::fence)
+        self.fence.as_ref().filter(|f| !f.dead && !f.unlocked).map(Fenced::fence)
     }
 
     /// The highest relay sequence applied to the replica in order. An op that arrived ahead of
@@ -747,23 +800,30 @@ impl<H: Hub, R: Replica> Live<H, R> {
     ///
     /// Carries the grant's fencing token when the relay gave one, so the relay releases only
     /// that grant: a late unlock never releases a newer one. Ends the fence: later edits are free
-    /// again. Call it once every edit under the lock is ordered ([`Live::unconfirmed_edits`] is
-    /// 0); one still unanswered keeps the fence until the relay answers it, and edits made
-    /// meanwhile wait for that.
+    /// again. While edits made under the lock are still unanswered the unlock waits for them
+    /// (it would otherwise reach the relay first and get the holder's own last edit refused),
+    /// and edits made meanwhile wait behind them. A dead fence (the grant was lost) ends here,
+    /// once what the relay did not order is taken back.
     pub fn unlock(&mut self, scope: &str) -> Result<()> {
-        let token = self.grants.remove(scope);
-        let msg = self.wire.release_grant(scope, token);
-        let sent = self.hub.send(msg);
-        if let Some(f) = self.fence.as_mut()
-            && f.scope == scope
-        {
-            f.closing = true;
-            if f.pending.is_empty() {
-                let f = self.fence.take();
-                self.fence_ended(f);
+        let token = self.grants.get(scope).copied();
+        match self.fence.as_mut() {
+            Some(f) if f.scope == scope => {
+                f.unlocked = true;
+                let drained = f.inflight.is_none() && f.queue.is_empty() && !f.owed_back;
+                if drained {
+                    // Nothing waits: end it now (a dead one owes no unlock, but sending it is harmless).
+                    let mut work = Vec::new();
+                    self.settle_fence(&mut work);
+                    debug_assert!(work.is_empty(), "a drained fence needs no take-back");
+                }
+                Ok(())
+            }
+            _ => {
+                self.grants.remove(scope);
+                let msg = self.wire.release_grant(scope, token);
+                self.hub.send(msg)
             }
         }
-        sent
     }
 
     /// Extend the lease of the fenced grant, at half the lease, while it is held. `now_ms` is the
@@ -771,7 +831,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// relay also extends it on each fenced edit. When the lease is gone the relay answers and
     /// [`pump`](Live::pump) reports [`LockEvent::Lost`].
     pub fn refresh_lease(&mut self, now_ms: f64) {
-        let Some(f) = self.fence.as_mut().filter(|f| !f.closing) else { return };
+        let Some(f) = self.fence.as_mut().filter(|f| !f.dead && !f.unlocked) else { return };
         let at = *f.refreshed_at.get_or_insert(now_ms);
         if now_ms - at < f.lease_ms as f64 / 2.0 {
             return;
@@ -837,6 +897,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         self.time_out_checkpoint(&mut work);
         self.send_retries();
+        self.settle_fence(&mut work);
         work
     }
 
@@ -865,7 +926,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.unconfirmed_bytes = 0;
         self.retrying.clear();
         self.held.clear();
-        self.fence = None;
+        if let Some(f) = self.fence.take() {
+            self.abandoned += f.outstanding();
+        }
         self.notices.push("the shared document could not be restored; reopen the file".to_owned());
     }
 
@@ -909,6 +972,10 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.told_incomplete = false;
         if self.joined_once {
             self.resend_unconfirmed();
+            // The fenced edit in flight goes again under its own fence. If the relay ordered it
+            // just before the drop, the catch-up above carries that order and it counts; if
+            // not, the relay answers this one.
+            self.resend_fenced();
         }
         self.retrying.clear();
         self.retry_at = None;
@@ -965,21 +1032,75 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// already landed in this replica, which the room will never see, so the replica is
     /// broken too: carrying on would let the two drift apart for the rest of the session.
     fn send_update(&mut self, update: &[u8]) -> Result<()> {
-        let fence = match self.fence.as_mut() {
-            None => None,
-            Some(f) if !f.closing => Some(f.fence()),
-            Some(f) => {
-                // The lock is given back or lost, and edits under it are still unanswered: this
-                // one waits, unsent, for the fence to end (see `Fenced::held_back`).
+        match self.fence.as_mut() {
+            None => self.send_with(update, None).map(|_| ()),
+            Some(f) if f.unlocked => {
+                // The lock is given back and edits under it are still unanswered: this one
+                // waits, unsent, for the fence to end (see `Fenced::held_back`).
                 f.held_back.push(update.to_vec());
-                return Ok(());
+                Ok(())
             }
-        };
-        self.send_with(update, fence)
+            Some(f) => {
+                // Under the lock: queued, and sent once the edit before it is ordered. Under a
+                // dead fence it is never sent, and is taken back with the run.
+                f.queue.push(update.to_vec());
+                if f.dead {
+                    f.owed_back = true;
+                }
+                self.send_fenced()
+            }
+        }
     }
 
-    /// Send one local update, fenced or free, and track it until the relay orders it.
-    fn send_with(&mut self, update: &[u8], fence: Option<Fence>) -> Result<()> {
+    /// Send the next queued edit under the fence, merged with the ones after it where they fit,
+    /// when none is in flight and the grant is still current.
+    fn send_fenced(&mut self) -> Result<()> {
+        let Some(f) = self.fence.as_mut() else { return Ok(()) };
+        if f.dead || f.inflight.is_some() || f.queue.is_empty() || self.broken {
+            return Ok(());
+        }
+        let queue = std::mem::take(&mut f.queue);
+        let fence = f.fence();
+        let mut chunks = self.chunked(queue).into_iter();
+        let Some(first) = chunks.next() else { return Ok(()) };
+        if let Some(f) = self.fence.as_mut() {
+            f.queue = chunks.collect();
+        }
+        let local = self.send_with(&first, Some(fence));
+        // Kept unless it never left for good (too large: the replica broke). One the hub could
+        // not send goes again on the rejoin.
+        if let (Ok(Some(_)) | Err(Error::Hub(_)), Some(f)) = (&local, self.fence.as_mut()) {
+            let locals: Vec<u64> = local.as_ref().ok().copied().flatten().into_iter().collect();
+            f.sent.extend(locals.iter().copied());
+            f.inflight = Some(InFlight { update: first, locals });
+        }
+        local.map(|_| ())
+    }
+
+    /// Send the fenced edit in flight again, under the fence it was made under, with a new
+    /// counter: after a rejoin, or once a refusal for now has waited out its backoff.
+    fn resend_fenced(&mut self) {
+        let Some(f) = self.fence.as_mut() else { return };
+        let Some(update) = f.inflight.as_ref().map(|i| i.update.clone()) else { return };
+        f.retry = false;
+        let fence = f.fence();
+        match self.send_with(&update, Some(fence)) {
+            Ok(Some(local)) => {
+                if let Some(f) = self.fence.as_mut() {
+                    f.sent.insert(local);
+                    if let Some(i) = f.inflight.as_mut() {
+                        i.locals.push(local);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("collab: an edit made under the lock could not be sent again: {e}"),
+        }
+    }
+
+    /// Send one local update, fenced or free. A free one is tracked in [`Live::unconfirmed`]
+    /// until the relay orders it; a fenced one is [`Fenced::inflight`]'s. Returns its counter.
+    fn send_with(&mut self, update: &[u8], fence: Option<Fence>) -> Result<Option<u64>> {
         let params = serde_json::to_value(TextPayload::new(update)).map_err(|e| Error::malformed("client", e.to_string()))?;
         if let Some(bytes) = self.over_cap(&params) {
             self.break_replica(&format!("a local edit of {bytes} bytes is past what the relay carries"));
@@ -988,12 +1109,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         let fenced = fence.is_some();
         let msg: ClientMsg = self.wire.submit_fenced(CRDT_TEXT, params, fence);
-        if let ClientMsg::Submit { local, .. } = &msg {
-            self.unconfirmed.insert(*local, update.to_vec());
+        let local = match &msg {
+            ClientMsg::Submit { local, .. } => Some(*local),
+            _ => None,
+        };
+        if let (Some(local), false) = (local, fenced) {
+            self.unconfirmed.insert(local, update.to_vec());
             self.unconfirmed_bytes += update.len();
-            if fenced && let Some(f) = self.fence.as_mut() {
-                f.pending.insert(*local);
-            }
         }
         self.hub.send(msg)?;
         if self.unconfirmed_bytes > MAX_UNCONFIRMED_BYTES {
@@ -1001,7 +1123,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             // gone; holding more would grow without bound.
             self.break_replica("too many edits are waiting for the relay");
         }
-        Ok(())
+        Ok(local)
     }
 
     /// Send again every local update the relay has not confirmed, after a rejoin.
@@ -1023,27 +1145,15 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.resend(updates.into_iter().collect(), "unconfirmed edits could not be sent again");
     }
 
-    /// Send `updates` (by their old counters) again, merged where they fit: free ones free, and
-    /// the fenced ones under the fence they were made under, so a resend never lets an edit made
-    /// under the lock through without it. The relay refuses them if the grant is gone.
+    /// Send free `updates` (by their old counters) again, merged where they fit. Edits made under
+    /// a fence are never in here: [`Live::resend_fenced`] sends those, under their own fence.
     fn resend(&mut self, updates: Vec<(u64, Vec<u8>)>, why: &str) {
-        let (mut fenced, mut free) = (Vec::new(), Vec::new());
-        for (local, update) in updates {
-            if self.fence.as_mut().is_some_and(|f| f.pending.remove(&local)) {
-                fenced.push(update);
-            } else {
-                free.push(update);
+        for chunk in self.chunked(updates.into_iter().map(|(_, update)| update)) {
+            if self.broken {
+                return;
             }
-        }
-        let fence = self.fence.as_ref().map(Fenced::fence);
-        for (group, fence) in [(free, None), (fenced, fence)] {
-            for chunk in self.chunked(group) {
-                if self.broken {
-                    return;
-                }
-                if let Err(e) = self.send_with(&chunk, fence.clone()) {
-                    log::warn!("collab: {why}: {e}");
-                }
+            if let Err(e) = self.send_with(&chunk, None) {
+                log::warn!("collab: {why}: {e}");
             }
         }
     }
@@ -1051,7 +1161,8 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// Send again the edits the relay refused for now, once their backoff is over and the link
     /// is up. While it is down they wait for the rejoin, which sends every unconfirmed edit.
     fn send_retries(&mut self) {
-        if self.retrying.is_empty() || self.broken || !self.hub.connected() {
+        let fenced = self.fence.as_ref().is_some_and(|f| f.retry);
+        if (self.retrying.is_empty() && !fenced) || self.broken || !self.hub.connected() {
             return;
         }
         if let (Some(at), Some(now)) = (self.retry_at, now_ms())
@@ -1069,6 +1180,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         log::info!("collab: sending {} edits the relay refused for now again", updates.len());
         self.resend(updates, "an edit refused for now could not be sent again");
+        if fenced {
+            self.resend_fenced();
+        }
     }
 
     /// Merge `updates` in order into as few updates as fit the relay's cap, each measured as
@@ -1315,98 +1429,156 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
     }
 
-    /// A grant with a fencing token: edits from now on go out under it. A grant for the scope
-    /// already fenced (asked again) takes over the fence and keeps what it can take back.
-    fn fenced_grant(&mut self, scope: &str, token: u64, lease_ms: Option<u64>) {
+    /// A grant with a fencing token: edits from now on go out under it. A newer grant of the
+    /// scope already fenced (the app asked again) makes the old fence dead: its edits stay
+    /// under the old token, so the relay refuses them, and the new fence starts once the old
+    /// one has settled. An edit made under a grant is never sent under another.
+    fn fenced_grant(&mut self, scope: &str, token: u64, lease_ms: Option<u64>, work: &mut Vec<Work<R::Change>>) {
         self.grants.insert(scope.to_owned(), token);
         let lease_ms = lease_ms.unwrap_or(DEFAULT_LEASE_MS);
         match self.fence.as_mut() {
-            Some(f) if f.scope == scope => {
-                f.token = token;
-                f.closing = false;
-                f.told = false;
-                f.lease_ms = lease_ms;
+            Some(f) if f.scope == scope && f.token == token => {
+                // The same grant again (a refresh of the same holder): the lease is fresh.
                 f.refreshed_at = None;
+                f.lease_ms = lease_ms;
+            }
+            Some(f) if f.scope == scope => {
+                f.next = Some((token, lease_ms));
+                let old = f.token;
+                self.kill_fence(old, work);
             }
             Some(f) => log::warn!("collab: {scope} was granted while a run under {} is still fenced; its edits go out under that one", f.scope),
-            None => {
-                let base = self.doc.as_ref().filter(|_| !self.broken && !self.awaiting_snapshot).map(Replica::state);
-                self.fence = Some(Fenced {
-                    scope: scope.to_owned(),
-                    token,
-                    base,
-                    log: Vec::new(),
-                    log_bytes: 0,
-                    pending: std::collections::BTreeSet::new(),
-                    refused: false,
-                    closing: false,
-                    held_back: Vec::new(),
-                    told: false,
-                    lease_ms,
-                    refreshed_at: None,
-                });
-            }
+            None => self.start_fence(scope, token, lease_ms),
         }
+        self.settle_fence(work);
+    }
+
+    fn start_fence(&mut self, scope: &str, token: u64, lease_ms: u64) {
+        let base = self.doc.as_ref().filter(|_| !self.broken && !self.awaiting_snapshot).map(Replica::state);
+        self.fence = Some(Fenced::new(scope, token, lease_ms, base));
     }
 
     /// The grant `token` of `scope` is gone (an edit under it was refused, or a refresh found
-    /// the lease gone): the fence guards nothing more, and the app is told once.
+    /// the lease gone). The app is told once.
     fn lose_fence(&mut self, scope: &str, token: u64, work: &mut Vec<Work<R::Change>>) {
         if self.grants.get(scope) == Some(&token) {
             self.grants.remove(scope);
         }
-        match self.fence.as_mut() {
-            Some(f) if f.scope == scope && f.token == token => {
-                f.closing = true;
-                if !std::mem::replace(&mut f.told, true) {
-                    work.push(Work::Lock(LockEvent::Lost { scope: scope.to_owned(), token }));
-                }
-            }
+        match self.fence.as_ref() {
+            Some(f) if f.scope == scope && f.token == token => self.kill_fence(token, work),
             Some(_) => {}
             None => work.push(Work::Lock(LockEvent::Lost { scope: scope.to_owned(), token })),
         }
-        self.resolve_fence(work);
+        self.settle_fence(work);
     }
 
-    /// End a closing fence once every edit made under it is answered: cleanly, or by taking
-    /// the run back when the relay refused one.
-    fn resolve_fence(&mut self, work: &mut Vec<Work<R::Change>>) {
-        if !self.fence.as_ref().is_some_and(|f| f.closing && f.pending.is_empty()) {
-            return;
+    /// Mark the fence under `token` dead: nothing more goes out under it, and whatever of the
+    /// run the relay did not order is taken back when it settles. It stays until the unlock.
+    fn kill_fence(&mut self, token: u64, work: &mut Vec<Work<R::Change>>) {
+        let Some(f) = self.fence.as_mut().filter(|f| f.token == token) else { return };
+        f.dead = true;
+        if !f.queue.is_empty() {
+            f.owed_back = true;
         }
-        let Some(f) = self.fence.take() else { return };
-        if f.refused {
-            self.take_back(f, work);
-        } else {
-            self.fence_ended(Some(f));
+        if f.retry {
+            // Refused for now and not sent again: never ordered, and never will be now.
+            f.retry = false;
+            f.inflight = None;
+            f.owed_back = true;
+        }
+        if !std::mem::replace(&mut f.told, true) {
+            work.push(Work::Lock(LockEvent::Lost { scope: f.scope.clone(), token }));
         }
     }
 
-    /// A fence ended with every edit under it ordered: what waited for it goes out, free.
-    fn fence_ended(&mut self, fence: Option<Fenced>) {
-        let Some(f) = fence else { return };
-        for chunk in self.chunked(f.held_back) {
-            if self.broken {
+    /// Move the fence on once its submit in flight is answered: send the next queued edit, take
+    /// back what a dead fence's relay did not order, and end the fence on the unlock (or when a
+    /// newer grant waits).
+    fn settle_fence(&mut self, work: &mut Vec<Work<R::Change>>) {
+        loop {
+            let Some(f) = self.fence.as_mut() else { return };
+            if f.inflight.is_some() {
                 return;
             }
-            if let Err(e) = self.send_with(&chunk, None) {
-                log::warn!("collab: an edit held back for the end of an ordered run could not be sent: {e}");
+            if !f.dead {
+                if !f.queue.is_empty() {
+                    if let Err(e) = self.send_fenced() {
+                        log::warn!("collab: an edit made under the lock could not be sent: {e}");
+                    }
+                    return;
+                }
+                if !f.unlocked {
+                    return;
+                }
+                // Every edit under the lock is ordered: give it back, then what waited goes free.
+                let Some(f) = self.fence.take() else { return };
+                self.end_fence(&f);
+                for chunk in self.chunked(f.held_back) {
+                    if self.broken {
+                        return;
+                    }
+                    if let Err(e) = self.send_with(&chunk, None) {
+                        log::warn!("collab: an edit held back for the end of an ordered run could not be sent: {e}");
+                    }
+                }
+                return;
             }
+            if f.owed_back || !f.queue.is_empty() || (f.unlocked && !f.held_back.is_empty()) {
+                f.owed_back = false;
+                f.queue.clear();
+                f.held_back.clear();
+                self.take_back(work);
+                if self.broken {
+                    return;
+                }
+            }
+            let Some(f) = self.fence.as_ref() else { return };
+            if !f.unlocked && f.next.is_none() {
+                return;
+            }
+            let Some(f) = self.fence.take() else { return };
+            if f.unlocked {
+                self.end_fence(&f);
+            }
+            if let Some((token, lease_ms)) = f.next {
+                self.start_fence(&f.scope, token, lease_ms);
+                if f.unlocked {
+                    return;
+                }
+                // Asked again without an unlock: the old fence's unlock is moot.
+                continue;
+            }
+            return;
         }
     }
 
-    /// The relay refused an edit made under the lock. Rebuild the replica as the room has it:
-    /// the state at the grant, plus every update the room ordered since (other peers', and this
-    /// replica's own fenced ones the relay ordered). The edits it did not order, and those
-    /// made after them, are gone from the replica; the app re-reads it ([`Work::Reset`]).
-    fn take_back(&mut self, f: Fenced, work: &mut Vec<Work<R::Change>>) {
-        let Some(base) = f.base else {
+    /// The fence `f` ended: its unlock goes out under its own token, and the token is no longer
+    /// a grant this client holds unless a newer one replaced it.
+    fn end_fence(&mut self, f: &Fenced) {
+        if self.grants.get(&f.scope) == Some(&f.token) {
+            self.grants.remove(&f.scope);
+        }
+        let msg = self.wire.release_grant(&f.scope, Some(f.token));
+        if let Err(e) = self.hub.send(msg) {
+            log::debug!("collab: an unlock was not sent: {e}");
+        }
+    }
+
+    /// The relay refused an edit made under the lock, or the lock died with edits unsent.
+    /// Rebuild the replica as the room has it: the state at the grant, plus every update the
+    /// room ordered since (other peers', and this replica's own fenced ones the relay ordered).
+    /// The edits it did not order, and those made after them, are gone from the replica; the
+    /// app re-reads it ([`Work::Reset`]). The base and log stay valid for a later take-back.
+    fn take_back(&mut self, work: &mut Vec<Work<R::Change>>) {
+        let Some(f) = self.fence.as_ref() else { return };
+        let scope = f.scope.clone();
+        let Some(base) = f.base.as_ref() else {
             self.lose_checkpoint(work, "the replica broke");
             self.break_replica("an edit made under a lost lock was refused and could not be taken back");
             work.push(Work::TextIncomplete { scope: DOC_SCOPE.to_owned() });
             return;
         };
-        let rebuilt = R::from_state(&base).and_then(|mut doc| {
+        let rebuilt = R::from_state(base).and_then(|mut doc| {
             if let Some(space) = self.space {
                 doc.set_client(space)?;
             }
@@ -1420,7 +1592,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 self.doc = Some(doc);
                 // A snapshot taken of the replica before this is not the room's.
                 self.lose_checkpoint(work, "an ordered run was taken back");
-                self.notices.push(format!("another editor took {} before your change was shared; it was taken back", f.scope));
+                self.notices.push(format!("another editor took {scope} before your change was shared; it was taken back"));
                 work.push(Work::Reset);
             }
             Err(e) => {
@@ -1504,16 +1676,20 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 if let Some(update) = self.unconfirmed.remove(&local) {
                     self.unconfirmed_bytes -= update.len();
                     self.retry_wait = RETRY_FIRST;
-                    if let Some(f) = self.fence.as_mut()
-                        && f.pending.remove(&local)
-                    {
-                        // Ordered under the lock: the room's now, so a take-back keeps it.
-                        f.record(&update);
-                    }
+                }
+                if let Some(f) = self.fence.as_mut()
+                    && f.inflight.as_ref().is_some_and(|i| i.locals.contains(&local))
+                    && let Some(i) = f.inflight.take()
+                {
+                    // Ordered under the lock, by any counter it went out with (an old one's order
+                    // can arrive in a rejoin's catch-up): the room's now, so a take-back keeps it.
+                    f.record(&i.update);
+                    f.retry = false;
+                    self.retry_wait = RETRY_FIRST;
                 }
                 self.first_of_catchup(seq);
                 self.confirmed(local, seq, work);
-                self.resolve_fence(work);
+                self.settle_fence(work);
             }
             Effect::Replace { document, seq } => {
                 self.lose_checkpoint(work, "the relay replaced the document");
@@ -1523,7 +1699,12 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 self.unconfirmed.clear();
                 self.unconfirmed_bytes = 0;
                 self.retrying.clear();
-                self.fence = None;
+                if let Some(f) = self.fence.take() {
+                    self.abandoned += f.outstanding();
+                    if !f.told {
+                        work.push(Work::Lock(LockEvent::Lost { scope: f.scope, token: f.token }));
+                    }
+                }
                 if document.is_null() {
                     // The relay keeps no document, so this is not a recovery. Saying nothing
                     // and carrying on would leave the peer believing it is current when it has
@@ -1537,7 +1718,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             }
             Effect::LockHeld { scope, seq, token, lease_ms } => {
                 if let Some(token) = token {
-                    self.fenced_grant(&scope, token, lease_ms);
+                    self.fenced_grant(&scope, token, lease_ms, work);
                 }
                 work.push(Work::Lock(LockEvent::Granted { scope, seq, token }));
             }
@@ -1555,21 +1736,42 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 self.notices.push(detail);
             }
             Effect::SubmitRefused { local, code, .. }
-                if code.as_deref() == Some(FENCED) && self.fence.as_ref().is_some_and(|f| f.pending.contains(&local)) =>
+                if code.as_deref() == Some(FENCED) && self.fence.as_ref().is_some_and(|f| f.sent.contains(&local)) =>
             {
                 // An edit made under the lock, refused because the lock is no longer this
                 // grant's. Never ordered and never will be: out of the replica it goes, with
                 // every other edit under the lock the relay did not order.
-                if let Some(update) = self.unconfirmed.remove(&local) {
-                    self.unconfirmed_bytes -= update.len();
-                }
-                self.retrying.remove(&local);
                 let Some(f) = self.fence.as_mut() else { return };
-                f.pending.remove(&local);
-                f.refused = true;
+                if f.inflight.as_ref().and_then(|i| i.locals.last()) == Some(&local) {
+                    f.inflight = None;
+                    f.retry = false;
+                    f.owed_back = true;
+                }
                 let (scope, token) = (f.scope.clone(), f.token);
                 log::info!("collab: the relay refused an edit made under {scope} (grant {token}); taking the run back");
                 self.lose_fence(&scope, token, work);
+            }
+            Effect::SubmitRefused { local, code, detail }
+                if self.fence.as_ref().and_then(|f| f.inflight.as_ref()).and_then(|i| i.locals.last()) == Some(&local) && !self.broken =>
+            {
+                let retry = code.as_deref() == Some(RETRY) || !(refusal_is_permanent(&detail) || matches!(code.as_deref(), Some(INVALID)));
+                let Some(f) = self.fence.as_mut() else { return };
+                if retry && !f.dead {
+                    log::info!("collab: the relay refused an edit made under the lock for now; sending it again in {:?}", self.retry_wait);
+                    f.retry = true;
+                    if self.retry_at.is_none() {
+                        self.retry_at = now_ms().map(|now| now + self.retry_wait.as_secs_f64() * 1000.0);
+                        self.retry_wait = (self.retry_wait * 2).min(RETRY_MOST);
+                    }
+                } else if retry {
+                    f.inflight = None;
+                    f.owed_back = true;
+                    self.settle_fence(work);
+                } else {
+                    self.lose_checkpoint(work, "an edit was refused");
+                    self.break_replica(&format!("the relay refused an edit: {detail}"));
+                    work.push(Work::TextIncomplete { scope: DOC_SCOPE.to_owned() });
+                }
             }
             Effect::SubmitRefused { local, detail, code } => {
                 // The relay refused one of this client's submits by its counter. It is the
