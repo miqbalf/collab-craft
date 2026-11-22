@@ -66,6 +66,29 @@ impl Shape {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// Where each item goes, when the caller asked ([`items`]).
+    items: Option<Vec<Placed>>,
+}
+
+/// Where an item says it goes: a root by name, a parent item, or beside its origin (or, without
+/// one, its right origin), whose parent yrs then gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Under {
+    Root(String),
+    Parent((u64, u32)),
+    /// Beside an origin and a right origin (at least one of them).
+    Beside(Option<(u64, u32)>, Option<(u64, u32)>),
+}
+
+/// One item of an update: its first id, its length, its content kind (`info & 0x0f`), the type
+/// byte of a type item, and where it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placed {
+    pub(crate) id: (u64, u32),
+    pub(crate) len: u32,
+    pub(crate) kind: u8,
+    pub(crate) type_ref: Option<u8>,
+    pub(crate) under: Under,
 }
 
 impl Reader<'_> {
@@ -136,10 +159,14 @@ impl Reader<'_> {
         u32::try_from(s.encode_utf16().count()).ok()
     }
 
-    fn id(&mut self) -> Option<()> {
-        self.client()?;
-        self.clock()?;
-        Some(())
+    fn id(&mut self) -> Option<(u64, u32)> {
+        Some((self.client()?, self.clock()?))
+    }
+
+    /// A string, for a root name.
+    fn name(&mut self) -> Option<String> {
+        let n = self.u32()?;
+        std::str::from_utf8(self.take(u64::from(n))?).ok().map(str::to_owned)
     }
 
     fn any(&mut self, depth: usize) -> Option<()> {
@@ -174,32 +201,39 @@ impl Reader<'_> {
         }
     }
 
-    /// One item, after its info byte; returns its length in clocks.
-    fn item(&mut self, info: u8) -> Option<u32> {
+    /// One item, after its info byte, at `id`; returns its length in clocks.
+    fn item(&mut self, info: u8, id: (u64, u32)) -> Option<u32> {
         // yrs masks the content kind with 0x0f; it never writes 0x10.
         if info & 0x10 != 0 {
             return None;
         }
         let (origin, right, sub) = (info & 0x80 != 0, info & 0x40 != 0, info & 0x20 != 0);
-        if origin {
-            self.id()?;
-        }
-        if right {
-            self.id()?;
-        }
-        if !origin && !right {
-            // Parent: a root name (1) or the id of an item.
-            if self.u32()? == 1 {
-                self.string()?;
-            } else {
-                self.id()?;
+        let origin = if origin { Some(self.id()?) } else { None };
+        let right = if right { Some(self.id()?) } else { None };
+        let under = match (origin, right) {
+            (None, None) => {
+                // Parent: a root name (1) or the id of an item.
+                let under = if self.u32()? == 1 { Under::Root(self.name()?) } else { Under::Parent(self.id()?) };
+                // Only named here: an item with an origin takes its key from it.
+                if sub {
+                    self.string()?;
+                }
+                under
             }
-            // Only named here: an item with an origin takes its key from it.
-            if sub {
-                self.string()?;
-            }
+            _ => Under::Beside(origin, right),
+        };
+        let kind = info & 0x0f;
+        let type_ref = (kind == 7).then(|| self.bytes.get(self.at).copied()).flatten();
+        let len = self.content(kind)?;
+        if let Some(items) = &mut self.items {
+            items.push(Placed { id, len, kind, type_ref, under });
         }
-        match info & 0x0f {
+        Some(len)
+    }
+
+    /// An item's content of kind `kind`; returns its length in clocks.
+    fn content(&mut self, kind: u8) -> Option<u32> {
+        match kind {
             // deleted
             1 => self.u32(),
             // binary
@@ -252,7 +286,16 @@ impl Reader<'_> {
 /// past it, a client with two sections or two delete entries, an id naming a clock past it, a
 /// delete range past it, an empty block, trailing bytes, and anything this reader cannot parse.
 pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
-    let mut r = Reader { bytes, at: 0 };
+    read_into(Reader { bytes, at: 0, items: None }).map(|(shape, _)| shape)
+}
+
+/// [`read`], and where every item goes, in the order written.
+pub(crate) fn items(bytes: &[u8]) -> Option<(Shape, Vec<Placed>)> {
+    read_into(Reader { bytes, at: 0, items: Some(Vec::new()) }).map(|(shape, items)| (shape, items.unwrap_or_default()))
+}
+
+fn read_into(mut r: Reader<'_>) -> Option<(Shape, Option<Vec<Placed>>)> {
+    let bytes = r.bytes;
     let mut shape = Shape::default();
     let mut seen = HashSet::new();
     for _ in 0..r.u32()? {
@@ -270,7 +313,7 @@ pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
             let (len, skip) = match r.byte()? {
                 0 => (r.u32()?, false),
                 10 => (r.u32()?, true),
-                info => (r.item(info)?, false),
+                info => (r.item(info, (client, clock))?, false),
             };
             if len == 0 {
                 return None;
@@ -312,7 +355,7 @@ pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
             return None;
         }
     }
-    (r.at == bytes.len()).then_some(shape)
+    (r.at == bytes.len()).then_some((shape, r.items))
 }
 
 /// Whether yrs's parse of an update, `update`, is the one [`read`] made of the same bytes,

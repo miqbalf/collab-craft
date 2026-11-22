@@ -93,6 +93,15 @@ pub struct YReplica {
     held: usize,
     /// The encoded size of those updates, from their incoming sizes.
     held_bytes: usize,
+    /// Updates that wait for something this document lacks (an earlier clock of a client, an
+    /// item they name), in arrival order. They are kept here rather than handed to yrs: yrs 0.28
+    /// integrates an update past a gap in a client's clocks with a placeholder and then mixes up
+    /// later updates that overlap it, and merges held updates with different content under the
+    /// same clock (both panic). So yrs only ever sees an update it can integrate whole.
+    /// Each with the id it waits for: it is looked at again once the state vector passes it.
+    waiting: Vec<(Vec<u8>, (u64, u32))>,
+    /// Parents of recently checked items, for the next check (see the `fits` module).
+    seen: crate::fits::Seen,
 }
 
 impl YReplica {
@@ -118,7 +127,7 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0, held_bytes: 0 }
+        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0, held_bytes: 0, waiting: Vec::new(), seen: crate::fits::Seen::default() }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -159,6 +168,12 @@ impl YReplica {
         self.resync = resync;
     }
 
+    /// Whether updates are waiting for something this document lacks (see [`apply`](Self::apply)).
+    #[must_use]
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty() || self.doc.transact().has_missing_updates()
+    }
+
     /// Whether yrs panicked during an earlier apply.
     #[must_use]
     pub fn damaged(&self) -> bool {
@@ -172,6 +187,7 @@ impl YReplica {
         self.resync = old.resync;
         self.held = old.held;
         self.held_bytes = old.held_bytes;
+        self.waiting.clone_from(&old.waiting);
     }
 
     /// Carry the damaged mark across a rebuild, or set it (a test of a caught panic).
@@ -181,20 +197,103 @@ impl YReplica {
 
     /// Merge an update from another replica. A yrs panic marks this replica damaged.
     ///
-    /// Updates may arrive in any order. One whose dependencies are missing is held by yrs. yrs
-    /// 0.28 does not always apply a held update once its dependencies land (it only looks at the
-    /// client ids of the update that just arrived), so whenever an apply advanced the state
-    /// vector and something is still held, the held part is taken out ([`WriteTxn::prune_pending`])
-    /// and applied again, until nothing more lands. What stays held is bounded by
+    /// Updates may arrive in any order. Each is first read and checked against this document
+    /// (see [`integrate`]): one that puts content where its parent cannot hold it is refused
+    /// with nothing changed. One that needs something this document lacks (an earlier clock of a
+    /// client, an item it names, an item it deletes) waits here and is applied once that has
+    /// landed; yrs only ever sees updates it can integrate whole. What waits is bounded by
     /// [`MAX_PENDING_UPDATES`] and [`MAX_PENDING_BYTES`]; past either it is dropped and
     /// [`needs_resync`](Self::needs_resync) is raised.
+    ///
+    /// Should yrs still hold something back, it is retried the same way: whenever an apply
+    /// advanced the state vector, the held part is taken out ([`WriteTxn::prune_pending`]) and
+    /// applied again, until nothing more lands.
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
+        match readiness(&self.doc, update, &mut self.seen) {
+            Ready::Refused => return Err(LiveError::Decode),
+            Ready::Waiting(need) => {
+                self.wait(update, need);
+                return Ok(());
+            }
+            Ready::Now => {}
+        }
+        let applied = self.apply_now(update);
+        if self.damaged {
+            return applied;
+        }
+        self.release()?;
+        if self.waiting.is_empty() && !self.doc.transact().has_missing_updates() {
+            self.held = 0;
+            self.held_bytes = 0;
+        }
+        applied
+    }
+
+    /// Keep `update` until what it needs has landed.
+    fn wait(&mut self, update: &[u8], need: (u64, u32)) {
+        self.waiting.push((update.to_vec(), need));
+        self.held += 1;
+        self.held_bytes += update.len();
+        if self.held > MAX_PENDING_UPDATES || self.held_bytes > MAX_PENDING_BYTES {
+            log::warn!(
+                "collab: {} updates ({} bytes) are waiting for dependencies that did not come; dropped, resync needed",
+                self.held,
+                self.held_bytes
+            );
+            self.drop_held();
+        }
+    }
+
+    /// Apply what waits and is ready now, until nothing more lands. One that is refused now (its
+    /// parent turned out unable to hold it) is dropped.
+    fn release(&mut self) -> Result<(), LiveError> {
+        let mut seen = StateVector::default();
+        loop {
+            let now = self.doc.transact().state_vector();
+            if self.waiting.is_empty() || now == seen {
+                return Ok(());
+            }
+            let mut keep = Vec::new();
+            for (u, need) in std::mem::take(&mut self.waiting) {
+                // Only what the state vector has passed the need of can have changed.
+                if now.get(&ClientID::new(need.0)) <= need.1 {
+                    keep.push((u, need));
+                    continue;
+                }
+                match readiness(&self.doc, &u, &mut self.seen) {
+                    Ready::Waiting(need) => keep.push((u, need)),
+                    Ready::Refused => log::warn!("collab: a waiting update does not fit the document; dropped"),
+                    Ready::Now => {
+                        let applied = self.apply_now(&u);
+                        if self.damaged {
+                            self.waiting = keep;
+                            return applied;
+                        }
+                    }
+                }
+            }
+            seen = now;
+            self.waiting.extend(keep);
+        }
+    }
+
+    /// Hand one ready update to yrs.
+    fn apply_now(&mut self, update: &[u8]) -> Result<(), LiveError> {
         let before = self.doc.transact().state_vector();
-        let first = integrate(&self.doc, update);
+        let first = integrate_checked(&self.doc, update, true);
+        if first.is_err() {
+            // The check kept the parents of this update's items; they did not land as checked.
+            self.seen = crate::fits::Seen::default();
+        }
         if first == Err(Integrate::Panicked) {
             self.damaged = true;
             return Err(LiveError::Decode);
         }
+        if first == Ok(true) {
+            // Held updates that did not fit were dropped: behind, as after any dropped hold.
+            self.resync = true;
+        }
+        let first = first.map(|_| ());
         // Also after a refusal: yrs may have integrated part of the update first, which can
         // make a held one ready.
         if self.settle(before.clone(), if first.is_ok() { update.len() } else { 0 }, first.is_ok()) == Err(Integrate::Panicked) {
@@ -249,8 +348,10 @@ impl YReplica {
         loop {
             let txn = self.doc.transact();
             if !txn.has_missing_updates() {
-                self.held = 0;
-                self.held_bytes = 0;
+                if self.waiting.is_empty() {
+                    self.held = 0;
+                    self.held_bytes = 0;
+                }
                 return Ok(());
             }
             let now = txn.state_vector();
@@ -291,6 +392,7 @@ impl YReplica {
     /// Throw away what is held and say the replica is behind.
     fn drop_held(&mut self) {
         drop(self.doc.transact_mut_with(REMOTE).prune_pending());
+        self.waiting.clear();
         self.held = 0;
         self.held_bytes = 0;
         self.resync = true;
@@ -375,11 +477,43 @@ impl From<Integrate> for LiveError {
 /// yrs can panic on bytes that decode but do not describe a valid document, so the apply runs
 /// under `catch_unwind`: a hostile or damaged update must not take the app down. That only holds
 /// where panics unwind; a wasm build with `panic = "abort"` still aborts.
+///
+/// Before yrs sees it, the update is read by the gate's byte reader and every item is checked
+/// against the document for a parent that can hold its content (see the `fits` module): yrs
+/// takes a string inside an array and then loops for ever reading that array. Refused: an update
+/// the reader does not take, and one with an item that does not fit. When the only misfit is in
+/// what yrs already holds for missing dependencies, that held part is dropped (yrs would apply it
+/// along with this update) and this update is applied.
 pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
+    integrate_checked(doc, update, false).map(|_| ())
+}
+
+/// [`integrate`]; `Ok(true)` when held updates were dropped because they did not fit.
+/// `checked`: the update alone was already checked against this document ([`readiness`]), so
+/// it is only checked again together with what yrs holds, if anything.
+fn integrate_checked(doc: &Doc, update: &[u8], checked: bool) -> Result<bool, Integrate> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let update = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
+        let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
+        let Some((_, incoming)) = crate::walk::items(update) else { return Err(Integrate::Refused) };
         let mut txn = doc.transact_mut_with(REMOTE);
-        txn.apply_update(update).map_err(|_| Integrate::Refused)
+        let mut dropped = false;
+        let seen = &mut crate::fits::Seen::default();
+        let held = txn.store().pending_update().is_some();
+        let verdict = if checked && !held { crate::fits::Verdict::Fits } else { crate::fits::check(&txn, &with_held(&txn, &incoming), seen) };
+        match verdict {
+            crate::fits::Verdict::Refused if crate::fits::check(&txn, &incoming, seen) == crate::fits::Verdict::Refused => {
+                log::warn!("collab: an update puts content where its parent cannot hold it; refused");
+                return Err(Integrate::Refused);
+            }
+            crate::fits::Verdict::Refused => {
+                log::warn!("collab: held updates put content where its parent cannot hold it; dropped");
+                drop(txn.prune_pending());
+                dropped = true;
+            }
+            _ => {}
+        }
+        txn.apply_update(decoded).map_err(|_| Integrate::Refused)?;
+        Ok(dropped)
     }));
     match outcome {
         Ok(result) => result,
@@ -388,6 +522,69 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
             Err(Integrate::Panicked)
         }
     }
+}
+
+/// Whether an update can go to yrs now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ready {
+    Now,
+    /// It needs something the document lacks: the state vector to pass this id.
+    Waiting((u64, u32)),
+    /// It does not read, or does not fit the document.
+    Refused,
+}
+
+/// Read `update` and check it against `doc`: [`Ready::Refused`] when the reader does not take it
+/// or an item does not fit its parent (see the `fits` module), [`Ready::Waiting`] when it starts
+/// past a client's clock in `doc`, skips clocks, names an item `doc` lacks, or deletes past what
+/// `doc` and the update hold.
+fn readiness(doc: &Doc, update: &[u8], seen: &mut crate::fits::Seen) -> Ready {
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some((shape, items)) = crate::walk::items(update) else { return Ready::Refused };
+        let txn = doc.transact();
+        let fits = crate::fits::check(&txn, &items, seen);
+        if fits == crate::fits::Verdict::Refused {
+            log::warn!("collab: an update puts content where its parent cannot hold it; refused");
+            return Ready::Refused;
+        }
+        let sv = txn.state_vector();
+        let mut reach: BTreeMap<u64, u32> = BTreeMap::new();
+        for (client, ranges) in &shape.blocks {
+            let mut have = sv.get(&ClientID::new(*client));
+            for (start, end) in ranges {
+                if *start > have {
+                    return Ready::Waiting((*client, start - 1));
+                }
+                have = have.max(*end);
+            }
+            reach.insert(*client, have);
+        }
+        for (client, ranges) in &shape.deletes {
+            let have = reach.get(client).copied().unwrap_or_else(|| sv.get(&ClientID::new(*client)));
+            if let Some((_, end)) = ranges.iter().find(|(_, end)| *end > have) {
+                return Ready::Waiting((*client, end - 1));
+            }
+        }
+        match fits {
+            crate::fits::Verdict::Waiting(id) => Ready::Waiting(id),
+            _ => Ready::Now,
+        }
+    }));
+    checked.unwrap_or(Ready::Refused)
+}
+
+/// `incoming` and the items yrs holds for missing dependencies (yrs applies those along with
+/// the next update that releases them, so they are checked with it).
+fn with_held<T: ReadTxn>(txn: &T, incoming: &[crate::walk::Placed]) -> Vec<crate::walk::Placed> {
+    let mut all = incoming.to_vec();
+    if let Some(held) = txn.store().pending_update() {
+        use yrs::updates::encoder::Encode;
+        // yrs's own encoding of what it holds: the reader takes it, or nothing is added.
+        if let Some((_, items)) = crate::walk::items(&held.update.encode_v1()) {
+            all.extend(items);
+        }
+    }
+    all
 }
 
 /// Whether `bytes` are a yrs update (v1) that decodes and whose ids are sane: no block or delete
@@ -418,7 +615,20 @@ fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut txn = doc.transact_mut_with(REMOTE);
         match txn.prune_pending() {
-            Some(held) => txn.apply_update(held).map_err(|_| Integrate::Refused),
+            Some(held) => {
+                // The same check as `integrate`: what was held may now resolve to a parent that
+                // cannot hold it.
+                let bytes = { use yrs::updates::encoder::Encode; held.encode_v1() };
+                match crate::walk::items(&bytes) {
+                    Some((_, items)) if crate::fits::check(&txn, &items, &mut crate::fits::Seen::default()) != crate::fits::Verdict::Refused => {
+                        txn.apply_update(held).map_err(|_| Integrate::Refused)
+                    }
+                    _ => {
+                        log::warn!("collab: held updates put content where its parent cannot hold it");
+                        Err(Integrate::Refused)
+                    }
+                }
+            }
             None => Ok(()),
         }
     }))
@@ -615,7 +825,7 @@ mod tests {
     }
 
     fn pending(y: &YReplica) -> bool {
-        y.doc().transact().has_missing_updates()
+        y.is_waiting()
     }
 
     fn read(y: &YReplica) -> String {
@@ -810,20 +1020,27 @@ mod tests {
         vec![1, 1, client, 0, 0x04, 0, pc, 0, 1, b'a', 0]
     }
 
-    /// Held updates that fail to apply together (one names a string item as its parent) raise
-    /// resync, never an error for the update that did apply, and never panic or damage.
+    /// A waiting update that yrs then refuses (it names a string item as its parent) is dropped
+    /// alone: the honest updates waiting beside it land, nothing is left held, no resync is
+    /// needed (every replica drops it the same way), nothing panics or is damaged.
     #[test]
-    fn a_failing_retry_raises_resync_and_still_counts_as_applied() {
-        let (first, rest, _) = withheld(&[2, 1, 1]);
+    fn a_waiting_update_that_does_not_apply_is_dropped_alone() {
+        let (first, rest, state) = withheld(&[2, 1, 1]);
         let (mut y, _) = peer(99);
         y.apply(&child_of(5, 1)).unwrap();
         y.apply(&rest[0]).unwrap();
         assert!(pending(&y));
         assert!(!y.needs_resync());
         assert!(y.apply(&first).is_ok(), "the dependency did apply");
-        assert!(y.needs_resync());
+        for u in &rest[1..] {
+            y.apply(u).unwrap();
+        }
+        assert!(!y.needs_resync());
         assert!(!y.damaged());
         assert!(!pending(&y), "nothing is left held");
+        let (author, _) = peer(98);
+        integrate(author.doc(), &state).unwrap();
+        assert_eq!(read(&y), read(&author));
     }
 
     /// A rebuild from a state that lacks this replica's own sent edits is refused, because the
@@ -907,8 +1124,8 @@ mod tests {
         assert!(worst.as_millis() < 2000);
     }
 
-    /// Each update applies one block and leaves one waiting on a missing item. Counting only
-    /// updates that advanced nothing would never trip the cap while yrs's pending grew.
+    /// Each update has one block that could apply and one that waits on a missing item. The
+    /// whole update waits (yrs never sees half of one), and the cap still trips.
     #[test]
     fn mixed_updates_that_half_apply_still_hit_the_cap() {
         let (_, _, _) = withheld(&[1, 1]);
@@ -928,8 +1145,8 @@ mod tests {
             y.apply(&u).unwrap();
             worst = worst.max(t.elapsed());
             if n == 3 {
-                assert!(pending(&y), "the orphan half is held");
-                assert!(read(&y).len() >= 4, "the other half applied");
+                assert!(pending(&y), "the updates wait");
+                assert!(read(&y).is_empty(), "nothing of a waiting update lands");
             }
             n += 1;
         }

@@ -40,7 +40,10 @@
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(test)]
+mod fuzz;
 mod error;
+mod fits;
 mod hub;
 mod live;
 pub mod proto;
