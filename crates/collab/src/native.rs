@@ -51,6 +51,9 @@ struct Shared {
     /// The replica schema every (re)connect names, if the app named one
     /// ([`NativeHub::connect_as`]).
     schema: Option<String>,
+    /// The id space the replica mints in, which every rejoin names ([`Hub::set_space`]); 0 for
+    /// none yet.
+    space: std::sync::atomic::AtomicU32,
 }
 
 impl Shared {
@@ -65,6 +68,10 @@ impl Shared {
         let (token, generation) = self.token();
         let mut auth = serde_json::json!({ "token": token, "proto": crate::proto::PROTO });
         add_schema(&mut auth, self.schema.as_deref());
+        let space = self.space.load(Ordering::SeqCst);
+        if let (true, Some(map)) = (space > 0, auth.as_object_mut()) {
+            map.insert("space".to_owned(), serde_json::json!(space));
+        }
         (auth, generation)
     }
 
@@ -137,6 +144,7 @@ impl NativeHub {
             generation: AtomicU64::new(0),
             token: Mutex::new((token.to_owned(), 0)),
             schema: schema.map(str::to_owned),
+            space: std::sync::atomic::AtomicU32::new(0),
         });
         let link = Link { url: Endpoint::of(url).url(), in_tx, control: control.clone(), shared: shared.clone() };
 
@@ -661,6 +669,10 @@ impl Hub for NativeHub {
 
     fn connected(&self) -> bool {
         self.shared.connected.load(Ordering::SeqCst)
+    }
+
+    fn set_space(&mut self, space: u32) {
+        self.shared.space.store(space, Ordering::SeqCst);
     }
 
     fn set_token(&mut self, token: String) {

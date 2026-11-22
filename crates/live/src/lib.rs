@@ -444,6 +444,9 @@ impl<H: Hub> Hub for Tap<H> {
     fn set_token(&mut self, token: String) {
         self.hub.set_token(token);
     }
+    fn set_space(&mut self, space: u32) {
+        self.hub.set_space(space);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -567,6 +570,10 @@ pub struct LiveEditing<H: Hub, K: LiveKind> {
     saver_wait: Option<CatchUp>,
     /// Live, yet no document service has been in the room for [`SAVER_WAIT_MS`].
     saver_missing: bool,
+    /// The ordered run whose edit was refused because the link was down, told as lost once.
+    lost_offline: Option<(String, u64)>,
+    /// A [`Work::Unmerged`] reached the app in this pump.
+    handed_unmerged: bool,
 }
 
 impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
@@ -603,6 +610,8 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             snapshot_wait: None,
             saver_wait: None,
             saver_missing: false,
+            lost_offline: None,
+            handed_unmerged: false,
         })
     }
 
@@ -614,6 +623,8 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, app: &mut impl LiveApp<K>) -> Vec<Peer<K::Pos>> {
+        let was_broken = self.broken.is_some();
+        self.handed_unmerged = false;
         self.flush(app);
         let works = self.live.pump();
         self.give_back_dropped_grants();
@@ -626,6 +637,9 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         }
         self.take_live_notices();
         self.update_status();
+        if !was_broken {
+            self.hand_unmerged_on_break(app);
+        }
         self.cursor.frames = self.cursor.frames.saturating_add(1);
         self.send_due_cursor();
         self.roster()
@@ -690,8 +704,10 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// it ([`LiveApp::reset`]), and `LockEvent::Lost` follows. The lease is refreshed at half its
     /// length while held, on the host's clock ([`set_clock`](Self::set_clock)).
     ///
-    /// Refused while the link is down ([`ordered_editable`](Self::ordered_editable) is false):
-    /// nothing is sent and nothing changes; the user is told [`ORDERED_OFFLINE`].
+    /// Refused while the link is down: nothing is sent and nothing changes ([`ORDERED_OFFLINE`]).
+    /// Gate the command itself on [`ordered_editable`](Self::ordered_editable), which also needs
+    /// the link to be live and caught up; a lock asked for while connected but still catching up
+    /// is sent, and the run waits for the grant's sequence as usual.
     pub fn lock(&mut self, scope: &str) -> craft_collab::Result<()> {
         if !self.live.connected() {
             return Err(craft_collab::Error::Hub(ORDERED_OFFLINE.to_owned()));
@@ -884,6 +900,25 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         &mut self.live.hub_mut().hub
     }
 
+    /// An edit under an open fence was refused because the link is down ([`ORDERED_OFFLINE`]):
+    /// the ordered run it belongs to failed. The app's `Ordered` is told the grant is lost (once
+    /// per grant), so a run that was under way ends as `Polled::LockLost`, a failed ordered edit,
+    /// and never reads as done. Nothing reached the replica, so nothing is taken back; the
+    /// run's unlock ends the fence.
+    fn lose_run_offline(&mut self, why: &str) {
+        if why != ORDERED_OFFLINE {
+            return;
+        }
+        let Some(fence) = self.live.open_fence() else { return };
+        let grant = (fence.scope, fence.token);
+        if self.lost_offline.as_ref() == Some(&grant) {
+            return;
+        }
+        log::info!("live: an ordered edit was refused while the link is down; the run failed");
+        lock(&self.seen).lock_events.push(LockEvent::Lost { scope: grant.0.clone(), token: grant.1 });
+        self.lost_offline = Some(grant);
+    }
+
     /// A join dropped fenced grants the app never took ([`Seen::dropped_grants`]): they went with
     /// the old link, and no `Ordered` will unlock them, so their fences end here. Otherwise every
     /// later edit would go out under a grant the relay no longer holds and be taken back.
@@ -896,6 +931,22 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
                     log::debug!("live: an unlock was not sent: {e}");
                 }
             }
+        }
+    }
+
+    /// The link broke in this pump for a reason of this side's own (the service ended or closed
+    /// the session, the catch-up never came, an edit could not be sent) while local edits were
+    /// still waiting for the room: hand them to the app ([`LiveApp::unmerged`]), as `Live` does
+    /// for the drops it makes, unless it already did in this pump.
+    fn hand_unmerged_on_break(&mut self, app: &mut impl LiveApp<K>) {
+        let edits = self.live.unconfirmed_edits();
+        if self.broken.is_none() || self.handed_unmerged || edits == 0 {
+            return;
+        }
+        if let Some(doc) = self.live.doc() {
+            log::warn!("live: the link ended with {edits} local edits the room does not have; handing them to the app");
+            app.unmerged(&doc.state(), edits);
+            self.handed_unmerged = true;
         }
     }
 
@@ -949,6 +1000,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::Lock(_) => {}
             // Local edits only this replica holds are about to be dropped: the app saves them.
             Work::Unmerged { state, edits } => {
+                self.handed_unmerged = true;
                 log::warn!("live: {edits} local edits the room does not have are about to be dropped; handing them to the app");
                 app.unmerged(&state, edits);
             }
@@ -1021,6 +1073,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         if !self.editable() {
             self.put_back(app, group);
             let why = self.not_editable();
+            self.lose_run_offline(&why);
             self.notices.push(why);
             return;
         }
@@ -1090,6 +1143,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             }
             drop(s);
             let why = self.not_editable();
+            self.lose_run_offline(&why);
             self.notices.push(why);
             return;
         }
@@ -1356,34 +1410,23 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
 }
 
 /// Make an edit on the replica with `f`, which returns its result and the updates it made,
-/// and send those. `Live` reaches its replica only through `Live::edit`, one update per call,
-/// so the first goes out from inside and the rest after. `None` when the replica takes no
-/// edit (broken, damaged); otherwise whether every update went out.
+/// and send those as one command (`Live::edit_all`). `None` when the replica takes no edit
+/// (broken, damaged, or past the buffer's hard stop); otherwise whether every update went out.
 fn edit_live<H: Hub, R: Replica, T>(live: &mut Live<Tap<H>, R>, f: impl FnOnce(&mut R) -> (T, Vec<Vec<u8>>)) -> Option<(T, bool)> {
     let mut out = None;
-    let mut rest = Vec::new();
-    let mut nothing = false;
-    let first = live.edit(|d| {
+    let sent = live.edit_all(|d| {
         let (r, updates) = f(d);
         out = Some(r);
-        let mut updates = updates.into_iter();
-        let first = updates.next();
-        rest = updates.collect();
-        nothing = first.is_none();
-        // Nothing to send: an error sends nothing and leaves the link as it was.
-        first.ok_or(LiveError::OutOfRange)
+        Ok(updates)
     });
     let r = out?;
-    let mut sent = nothing || first.is_ok();
-    if let (Err(e), false) = (&first, nothing) {
-        log::warn!("live: an update did not go out: {e}");
-    }
-    for update in rest {
-        if let Err(e) = live.edit(move |_| Ok(update)) {
+    let sent = match sent {
+        Ok(sent) => sent,
+        Err(e) => {
             log::warn!("live: an update did not go out: {e}");
-            sent = false;
+            false
         }
-    }
+    };
     Some((r, sent))
 }
 

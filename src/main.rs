@@ -68,6 +68,8 @@ mod e2e_reconnect;
 #[cfg(test)]
 mod e2e_schema;
 #[cfg(test)]
+mod e2e_space;
+#[cfg(test)]
 mod review_reverify2;
 
 #[cfg(test)]
@@ -278,6 +280,11 @@ struct Handshake {
     /// pins nothing.
     #[serde(default)]
     schema: Option<String>,
+    /// The id space a rejoining replica already mints in (it keeps it across reconnects). The
+    /// space counter is raised to at least this before the grant ([`Bus::next_space`]), so no
+    /// later connection is granted it. Absent on a fresh load and from older clients.
+    #[serde(default)]
+    space: Option<u32>,
 }
 
 /// The longest replica schema name a handshake may carry.
@@ -840,7 +847,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // each other's text.
     let space = {
         let mut bus = relay.bus.lock().await;
-        match bus.next_space(&room_key).await {
+        match bus.next_space(&room_key, handshake.space.unwrap_or(0)).await {
             Ok(s) => s,
             Err(e) => {
                 // Refuse rather than admit a peer with no space. Admitting it would mean

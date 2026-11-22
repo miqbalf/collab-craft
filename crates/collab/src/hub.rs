@@ -42,6 +42,14 @@ pub trait Hub {
     fn set_token(&mut self, token: String) {
         let _ = token;
     }
+
+    /// The replica on this link mints in id `space` and keeps it across reconnects. Every
+    /// rejoin names it (handshake `space`), so the relay raises its space counter past it and
+    /// never grants it to another connection, even after the counter went backwards. No-op by
+    /// default: a hub that cannot carry it leaves that guarantee to the counter alone.
+    fn set_space(&mut self, space: u32) {
+        let _ = space;
+    }
 }
 
 /// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back

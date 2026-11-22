@@ -202,6 +202,11 @@ impl Hub for WebHub {
         Reflect::get(&self.socket, &JsValue::from_str("connected")).ok().and_then(|value| value.as_bool()).unwrap_or(false)
     }
 
+    fn set_space(&mut self, space: u32) {
+        // socket.io-client sends this same `auth` object on every reconnect attempt.
+        let _ = Reflect::set(&self.auth, &JsValue::from_str("space"), &JsValue::from_f64(f64::from(space)));
+    }
+
     fn set_token(&mut self, token: String) {
         let _ = Reflect::set(&self.auth, &JsValue::from_str("token"), &JsValue::from_str(&token));
         let restart = {

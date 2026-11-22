@@ -79,11 +79,15 @@ pub struct Ordered<P> {
     released_early: bool,
     /// The replica broke: its edits will never be ordered, so nothing is left to wait for.
     broken: bool,
+    /// [`on_lock`](Self::on_lock) asked again since the last [`poll`](Self::poll): the events
+    /// it answered are taken after the pump that read a rejoin, so that request already goes
+    /// out on the new link and [`rejoined`](Self::rejoined) does not ask a second time.
+    asked: bool,
 }
 
 impl<P> Ordered<P> {
     pub fn new(scope: impl Into<String>) -> Self {
-        Ordered { scope: scope.into(), item: None, state: State::Idle, since: 0.0, released_early: false, broken: false }
+        Ordered { scope: scope.into(), item: None, state: State::Idle, since: 0.0, released_early: false, broken: false, asked: false }
     }
 
     pub fn scope(&self) -> &str {
@@ -141,6 +145,7 @@ impl<P> Ordered<P> {
                     self.state = State::Asking;
                     self.since = now_ms;
                     self.released_early = false;
+                    self.asked = true;
                     vec![Action::SendUnlock, Action::SendLock]
                 }
                 State::Running { held, told, token: Some(t), .. } if t == *token => {
@@ -154,6 +159,7 @@ impl<P> Ordered<P> {
                     State::Denied { .. } => {
                         self.state = State::Asking;
                         self.released_early = false;
+                        self.asked = true;
                         vec![Action::SendLock]
                     }
                     // Either the echo of our own unlock or a release that overtook our refusal.
@@ -170,6 +176,7 @@ impl<P> Ordered<P> {
 
     /// `Run` once granted and `applied >= grant seq`; `GaveUp` after [`GIVE_UP_MS`] waiting.
     pub fn poll(&mut self, applied: u64, now_ms: f64) -> Polled<P> {
+        self.asked = false;
         match &self.state {
             State::Granted { seq, token } if applied >= *seq => match self.item.take() {
                 Some(item) => {
@@ -238,6 +245,8 @@ impl<P> Ordered<P> {
 
     /// The link rejoined: drop the grant (the relay released it), keep the item, ask again. A
     /// fenced grant is given back first ([`Action::SendUnlock`], then [`Action::SendLock`]).
+    /// When the lock events taken with this rejoin already asked again (a `Lost` or a
+    /// `Released` since the last [`poll`](Self::poll)), it does not ask a second time.
     /// The wait for the lock starts over. Feed the lock events taken before the rejoin to
     /// [`on_lock`](Self::on_lock) first (`LiveEditing` already drops the old link's events, so
     /// the order cannot revive a stale grant).
@@ -263,6 +272,8 @@ impl<P> Ordered<P> {
                 self.released_early = false;
                 vec![Action::SendUnlock, Action::SendLock]
             }
+            // Asked again by the events read with this rejoin: that request is on the new link.
+            State::Asking if std::mem::take(&mut self.asked) => Vec::new(),
             State::Asking | State::Denied { .. } | State::Granted { .. } => {
                 self.state = State::Asking;
                 self.since = now_ms;

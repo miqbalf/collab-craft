@@ -41,6 +41,7 @@ struct Engine {
 enum Noted {
     Unmerged(Vec<u8>, usize),
     Reset,
+    Space(u32),
 }
 
 impl LiveApp<Lines> for Engine {
@@ -82,7 +83,9 @@ impl LiveApp<Lines> for Engine {
     fn unmerged(&mut self, state: &[u8], edits: usize) {
         self.seen.push(Noted::Unmerged(state.to_vec(), edits));
     }
-    fn set_space(&mut self, _: u32) {}
+    fn set_space(&mut self, space: u32) {
+        self.seen.push(Noted::Space(space));
+    }
     fn caret(&self, payload: &Value) -> Option<(u64, usize)> {
         let id = payload.get("id")?.as_u64()?;
         let at = usize::try_from(payload.get("at")?.as_u64()?).ok()?;
@@ -1656,4 +1659,141 @@ fn an_untaken_grant_dropped_by_a_rejoin_leaves_no_fence_behind() {
     a.set(1, "free again");
     settle(&mut [&mut a, &mut b]);
     assert_eq!(b.line(1), "free again");
+}
+
+// C9 fix round 1.
+
+/// C1: the relay's space counter goes back (a flush) while the room lives on. The replica that
+/// keeps its space names it on the rejoin, so a newcomer is never granted it.
+#[test]
+fn a_space_kept_across_a_rejoin_is_never_granted_again() {
+    let relay = MemRelay::new();
+    let mut x = Window::join(&relay, "xavier", Access::Edit);
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut x, &mut a]);
+    let kept = a.le.live().space().expect("granted");
+    relay.forget_spaces();
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut x, &mut a]);
+    assert_eq!(a.le.live().space(), Some(kept));
+    let mut c = Window::join(&relay, "carol", Access::Edit);
+    settle(&mut [&mut x, &mut a, &mut c]);
+    assert_ne!(c.le.live().space(), Some(kept), "two live replicas mint in one space");
+    assert!(relay.granted_space(c.le.hub()).is_some_and(|s| s > kept));
+}
+
+/// C1: a rejoin into a room that lost its history takes the new space: the app mints there and
+/// its undo history starts again, and the relay is told to keep that one free.
+#[test]
+fn a_history_lost_rejoin_takes_the_new_space() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    a.set(1, "uno");
+    settle(&mut [&mut a]);
+    let me = peer_of(&relay, &a);
+    a.engine.seen.clear();
+    relay.inject(
+        a.le.hub(),
+        ServerMsg::Joined {
+            doc: ROOM.into(),
+            peer: me,
+            seq: relay.seq(),
+            space: 99,
+            roster: Vec::new(),
+            locks: Vec::new(),
+            replay_until: Some(relay.seq()),
+            fallback: false,
+            text_cap: None,
+            heartbeat: false,
+            history_lost: true,
+        },
+    );
+    a.pump();
+    assert_eq!(a.le.live().space(), Some(99));
+    assert!(a.engine.seen.contains(&Noted::Space(99)), "{:?}", a.engine.seen);
+    assert!(!a.le.queue().history_hook()(false), "the undo history outlived the client id");
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    assert!(relay.granted_space(a.le.hub()).is_some_and(|s| s > 99), "the rejoin did not name the new space");
+}
+
+/// Minor 4: the link drops between the grant and the run. The run's edit is refused here, and
+/// the run ends as a failed ordered edit (`LockLost`), never as done.
+#[test]
+fn an_ordered_run_made_offline_fails() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("insert", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 1.0);
+    }
+    relay.drop_link(a.le.hub());
+    a.pump();
+    let Polled::Run(_) = q.poll(a.le.newest_seq(), 2.0) else { panic!("not granted") };
+    a.set(1, "ordered offline");
+    assert_eq!(a.line(1), "one");
+    assert!(a.le.take_notices().iter().any(|n| n == crate::ORDERED_OFFLINE));
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 3.0);
+    }
+    assert_eq!(q.poll(a.le.newest_seq(), 4.0), Polled::LockLost { scope: SCOPE.into() }, "the run read as done");
+    assert_eq!(q.finish(a.le.local_settled()), vec![Action::SendUnlock]);
+    a.le.unlock(SCOPE).unwrap();
+    a.set(2, "free offline");
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), ("one", "free offline"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// Minor 5: a `Lost` kept across a rejoin already asked again on the new link; the rejoin does
+/// not ask a second time.
+#[test]
+fn a_rejoin_does_not_ask_twice() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    q.on_lock(&fenced(1, 7), 1.0);
+    assert_eq!(q.on_lock(&lost(7), 2.0), vec![Action::SendUnlock, Action::SendLock]);
+    assert!(q.rejoined(2.0).is_empty(), "asked twice");
+    // A later rejoin, after a frame, asks again: that request went with the old link.
+    assert_eq!(q.poll(0, 3.0), Polled::Nothing);
+    assert_eq!(q.rejoined(4.0), vec![Action::SendLock]);
+}
+
+/// Minor 9: the service ends the session on the rejoin of a window that typed offline. Its
+/// edits never reach the room; the app gets them before the window breaks.
+#[test]
+fn a_session_ended_on_the_rejoin_hands_over_the_offline_edits() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    a.set(1, "typed offline");
+    a.engine.seen.clear();
+    relay.restore_link(a.le.hub());
+    relay.inject(
+        a.le.hub(),
+        ServerMsg::Ephemeral {
+            doc: ROOM.into(),
+            origin: format!("{SERVICE_UID}~1"),
+            kind: ENDED_KIND.into(),
+            payload: json!({"reason": "saving stopped"}),
+        },
+    );
+    a.pump();
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)));
+    let copy = a.engine.seen.iter().find_map(|n| match n {
+        Noted::Unmerged(state, _) => Some(state.clone()),
+        _ => None,
+    });
+    let copy = copy.expect("the offline edits were not handed over");
+    assert_eq!(LiveDoc::from_state(&copy).unwrap().block(1).unwrap().text, "typed offline");
 }

@@ -33,6 +33,8 @@ struct Conn {
     tokens: Vec<String>,
     /// Sends from this connection fail, as a link that broke under the sender.
     send_fails: bool,
+    /// The id space its replica keeps, named on every rejoin ([`Hub::set_space`]).
+    space: u32,
 }
 
 #[derive(Default)]
@@ -41,6 +43,8 @@ struct Relay {
     log: Vec<ServerMsg>,
     conns: Vec<Conn>,
     next_space: u32,
+    /// The space each connection was granted at its last join.
+    granted: std::collections::HashMap<usize, u32>,
     ephemeral: Vec<(String, String, Value)>,
     /// The holder (connection index) of each locked scope, and its grant's fencing token.
     locks: Vec<(String, usize, u64)>,
@@ -81,6 +85,7 @@ impl MemRelay {
             inbox: VecDeque::new(),
             tokens: Vec::new(),
             send_fails: false,
+            space: 0,
         });
         r.join(at);
         MemHub { relay: self.clone(), at }
@@ -158,6 +163,17 @@ impl MemRelay {
         }
     }
 
+    /// The space counter goes back to 0, as a Valkey flush loses it while the room's history
+    /// stays: later joins are granted 1, 2, … again, unless a rejoin names a higher floor.
+    pub fn forget_spaces(&self) {
+        self.0.borrow_mut().next_space = 0;
+    }
+
+    /// The id space `hub`'s connection was granted at its last join.
+    pub fn granted_space(&self, hub: &MemHub) -> Option<u32> {
+        self.0.borrow().granted.get(&hub.at).copied()
+    }
+
     /// The relay's sequence: the last op it ordered.
     pub fn seq(&self) -> u64 {
         self.0.borrow().seq
@@ -218,6 +234,12 @@ impl Hub for MemHub {
             c.tokens.push(token);
         }
     }
+
+    fn set_space(&mut self, space: u32) {
+        if let Some(c) = self.relay.0.borrow_mut().conns.get_mut(self.at) {
+            c.space = space;
+        }
+    }
 }
 
 impl Relay {
@@ -226,8 +248,11 @@ impl Relay {
     }
 
     fn join(&mut self, at: usize) {
-        self.next_space += 1;
+        // As the relay does: the counter is first raised to the space a rejoining replica keeps.
+        let floor = self.conns.get(at).map_or(0, |c| c.space);
+        self.next_space = self.next_space.max(floor) + 1;
         let space = self.next_space;
+        self.granted.insert(at, space);
         let roster = self.roster();
         let locks: Vec<LockState> = self
             .locks

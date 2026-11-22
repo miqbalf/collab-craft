@@ -32,6 +32,11 @@ use redis::aio::MultiplexedConnection;
 /// would be a fine key for somebody else too.
 const PREFIX: &str = "collabcraft";
 
+/// The highest space a rejoining replica may name as its floor ([`Bus::next_space`]). Spaces are
+/// granted one per connection, so a real one is far below; a larger claim is ignored, so a
+/// client cannot push the counter towards its wrap, where grants would collide again.
+pub const MAX_SPACE_FLOOR: u32 = 1 << 31;
+
 /// How long a sequence counter outlives its last edit.
 ///
 /// Long, because losing it is worse than keeping it. See [`Bus::next_seq`] for
@@ -204,27 +209,54 @@ impl Bus {
         Ok(v.unwrap_or(0))
     }
 
-    /// The next CRDT id space for a document.
+    /// The next CRDT id space for a document, above `floor`.
     ///
     /// One `INCR` per connection, from the same instance that hands out sequences, so two
     /// relays cannot grant the same space and a restart cannot hand out one twice. A client
     /// deriving its own space from its peer id could collide with another peer's, and the two
     /// would then mint the same character ids and drop each other's text.
     ///
+    /// `floor` is the space a rejoining replica already mints in (0 for none): it keeps that
+    /// space across reconnects. In the same script, the counter is first raised to at least
+    /// `floor`, so neither this grant nor any later one can equal a space a reconnected replica
+    /// still uses, even after the counter went backwards (a flush, an `everysec` AOF crash
+    /// window, a failover to a replica that lagged). A floor past [`MAX_SPACE_FLOOR`] is not
+    /// honoured, so a client cannot run the counter towards its wrap. A counter that is not a
+    /// number is left alone, and the `INCR` refuses it as before.
+    ///
     /// Space 0 is never granted. That space belongs to the text already in the file, which is
     /// how two peers loading the same string reach the same identities.
-    pub async fn next_space(&mut self, room: &str) -> Result<u32, BusError> {
+    pub async fn next_space(&mut self, room: &str, floor: u32) -> Result<u32, BusError> {
+        const SCRIPT: &str = r#"
+            local floor = tonumber(ARGV[1])
+            local raw = redis.call('GET', KEYS[1])
+            local current = 0
+            if raw then current = tonumber(raw) end
+            if current and current < floor then
+                redis.call('SET', KEYS[1], floor)
+            end
+            local granted = redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            return granted
+        "#;
         let key = format!("{PREFIX}:doc:{}:space", encode_key(room));
-        let next: u64 = match self.conn.incr(&key, 1i64).await {
+        let floor = if floor > MAX_SPACE_FLOOR { 0 } else { floor };
+        let next: u64 = match redis::Script::new(SCRIPT).key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async(&mut self.conn).await {
             Ok(v) => v,
             Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
             Err(e) => return Err(e.into()),
         };
-        let _: Result<bool, _> = self.conn.expire(&key, SEQ_TTL.as_secs() as i64).await;
         // Wrapped rather than refused. The counter would have to pass four billion
         // connections to one document, and a wrapped space collides only with a peer from
         // that many connections ago.
         Ok(((next - 1) % u64::from(u32::MAX)) as u32 + 1)
+    }
+
+    /// Forget the room's space counter, as a Valkey flush does, for a test of the floor.
+    #[cfg(test)]
+    pub async fn forget_spaces(&mut self, room: &str) {
+        let key = format!("{PREFIX}:doc:{}:space", encode_key(room));
+        let _: Result<i64, _> = self.conn.del(&key).await;
     }
 
     /// How long a lease lasts without a refresh.
