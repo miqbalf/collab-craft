@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Effect::LockHeld { scope, .. } => println!("LOCK    held {scope}"),
                     Effect::LockRefused { scope, holder } => println!("LOCK    {scope} refused, {holder} has it"),
                     Effect::LockDropped { scope } => println!("LOCK    dropped {scope}"),
+                    Effect::LockLost { scope, token } => println!("LOCK    lost {scope} (grant {token})"),
                     Effect::RemoteLocks { locks } => println!("LOCKS   {locks:?}"),
                     Effect::LockBusy { scope, holder } => println!("LOCK    {scope} taken by {holder}"),
                     Effect::Roster { roster } => {

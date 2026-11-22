@@ -9,7 +9,7 @@ use craft_collab::{BlockChange, Hub, LiveDoc, LockEvent, SeedBlock, ServerMsg};
 use serde_json::{Map, Value, json};
 
 use crate::ordered::{Action, GIVE_UP_MS, Ordered, Polled};
-use crate::testing::{MemHub, MemRelay, ROOM};
+use crate::testing::{LEASE_MS, MemHub, MemRelay, ROOM};
 use crate::{
     Access, CONNECTING, Change, ENDED_KIND, Landed, LiveApp, LiveEditing, LiveKind, LiveStatus, LocalError, NOTICE_KIND, SAVED_KIND, SERVICE_UID,
 };
@@ -305,7 +305,7 @@ fn a_late_catch_up_is_told_then_given_up() {
 const SCOPE: &str = "grid/struct";
 
 fn granted(seq: u64) -> LockEvent {
-    LockEvent::Granted { scope: SCOPE.into(), seq: Some(seq) }
+    LockEvent::Granted { scope: SCOPE.into(), seq: Some(seq), token: None }
 }
 
 fn denied(holder: &str) -> LockEvent {
@@ -332,7 +332,7 @@ fn a_free_lock_runs_after_the_grant_seq_is_applied() {
 fn a_grant_without_seq_runs_at_once() {
     let mut q = Ordered::<u8>::new(SCOPE);
     q.request(1, 0.0).unwrap();
-    q.on_lock(&LockEvent::Granted { scope: SCOPE.into(), seq: None }, 1.0);
+    q.on_lock(&LockEvent::Granted { scope: SCOPE.into(), seq: None, token: None }, 1.0);
     assert_eq!(q.poll(0, 2.0), Polled::Run(1));
 }
 
@@ -360,7 +360,7 @@ fn held_by_other_updates_the_holder_and_other_scopes_are_ignored() {
     assert_eq!(q.waiting_for(), Some("carol~3"));
     let other = "grid/other".to_owned();
     assert!(q.on_lock(&LockEvent::Released { scope: other.clone() }, 3.0).is_empty());
-    assert!(q.on_lock(&LockEvent::Granted { scope: other, seq: Some(1) }, 3.0).is_empty());
+    assert!(q.on_lock(&LockEvent::Granted { scope: other, seq: Some(1), token: None }, 3.0).is_empty());
     assert_eq!(q.waiting_for(), Some("carol~3"));
     assert_eq!(q.poll(99, 4.0), Polled::Nothing);
 }
@@ -463,7 +463,8 @@ fn mem_relay_serialises_two_holders() {
     settle(&mut [&mut a, &mut b]);
     let a_peer = peer_of(&relay, &a);
     lock_both(&mut a, &mut b);
-    assert_eq!(a.le.take_lock_events(), vec![granted(relay.seq())]);
+    let (_, token) = relay.holder(SCOPE).expect("A holds it");
+    assert_eq!(a.le.take_lock_events(), vec![LockEvent::Granted { scope: SCOPE.into(), seq: Some(relay.seq()), token: Some(token) }]);
     assert!(b.le.take_lock_events().contains(&LockEvent::HeldByOther { scope: SCOPE.into(), holder: a_peer.clone() }));
     // B asks while A holds: refused with A's peer id.
     b.le.lock(SCOPE).unwrap();
@@ -728,13 +729,13 @@ fn a_grant_before_the_join_in_one_poll_is_dropped() {
     let mut a = Window::join(&relay, "alice", Access::Edit);
     settle(&mut [&mut a]);
     // Old link's grant, then the rejoin, all unread: one poll gets both.
-    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(1) });
+    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(1), token: None, lease_ms: None });
     relay.restore_link(a.le.hub());
     a.pump();
     assert!(a.le.take_lock_events().is_empty(), "a stale grant survived the rejoin");
     // The new link's grant comes after its join and is kept, in order with what follows.
     relay.restore_link(a.le.hub());
-    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(2) });
+    relay.inject(a.le.hub(), ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(2), token: None, lease_ms: None });
     relay.inject(a.le.hub(), ServerMsg::LockReleased { doc: ROOM.into(), scope: SCOPE.into() });
     a.pump();
     assert_eq!(a.le.take_lock_events(), vec![granted(2), released()]);
@@ -836,4 +837,266 @@ fn taking_lock_events_empties_them() {
     settle(&mut [&mut a]);
     assert_eq!(a.le.take_lock_events().len(), 1);
     assert!(a.le.take_lock_events().is_empty());
+}
+
+// Fencing: edits made under a fenced grant are ordered only while the grant is current.
+
+fn fenced(seq: u64, token: u64) -> LockEvent {
+    LockEvent::Granted { scope: SCOPE.into(), seq: Some(seq), token: Some(token) }
+}
+
+fn lost(token: u64) -> LockEvent {
+    LockEvent::Lost { scope: SCOPE.into(), token }
+}
+
+/// The window's replica, as the lines it holds, read from the replica itself.
+fn replica_lines(w: &Window) -> Vec<(u64, String)> {
+    let doc = w.le.live().doc().expect("seeded");
+    doc.order().into_iter().map(|id| (id, doc.block(id).map(|b| b.text).unwrap_or_default())).collect()
+}
+
+/// The fencing token of the grant `w` was just answered with (what came before it, such as
+/// somebody else's earlier take, is dropped).
+fn take_grant(w: &mut Window) -> u64 {
+    let events = w.le.take_lock_events();
+    match events.last() {
+        Some(LockEvent::Granted { token: Some(token), .. }) => *token,
+        _ => panic!("not a fenced grant last: {events:?}"),
+    }
+}
+
+/// The paused holder: A holds the lock, freezes past its lease, the lease goes to B. A's edit
+/// under its old grant is refused by the relay and taken back out of A's replica; B's edit
+/// under the new grant is ordered; both windows end on the same document.
+#[test]
+fn a_paused_holder_whose_lease_went_to_another_is_refused_and_taken_back() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("rename", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 1.0);
+    }
+    let Polled::Run(_) = q.poll(a.le.newest_seq(), 2.0) else { panic!("not granted") };
+    let old = relay.holder(SCOPE).expect("A holds it").1;
+
+    // A is frozen: its lease lapses, and B is granted the scope under a newer token.
+    relay.lapse(SCOPE);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    let new = take_grant(&mut b);
+    assert!(new > old, "the token did not grow: {old} then {new}");
+
+    // A wakes up and makes its run's edit under the old grant: refused, never ordered.
+    let seq = relay.seq();
+    a.set(1, "alice was here");
+    assert_eq!(relay.seq(), seq, "the stale holder's edit was ordered");
+    // B's edit under the current grant is ordered.
+    b.set(2, "bob was here");
+    assert!(relay.seq() > seq, "the holder's edit was not ordered");
+    settle(&mut [&mut a, &mut b]);
+
+    let events = a.le.take_lock_events();
+    assert!(events.contains(&lost(old)), "A was not told it lost the lock: {events:?}");
+    for e in &events {
+        q.on_lock(e, 3.0);
+    }
+    assert_eq!(q.poll(a.le.newest_seq(), 4.0), Polled::LockLost { scope: SCOPE.into() });
+    assert!(q.finish(a.le.local_settled()).is_empty(), "an unlock owed for a lost grant");
+
+    // A's replica and engine are back at the room's state, with B's edit and without its own.
+    assert_eq!(a.line(1), "one");
+    assert_eq!(a.line(2), "bob was here");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+    assert!(a.le.local_settled() && a.le.editable());
+
+    // And A edits on from there, free: both windows still agree.
+    a.set(1, "uno");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "uno");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// An edit under the lock that the relay ordered before the grant was lost stays: only what the
+/// relay refused is taken back.
+#[test]
+fn a_refusal_takes_back_only_what_the_relay_did_not_order() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    a.set(1, "first");
+    settle(&mut [&mut a, &mut b]);
+    relay.lapse(SCOPE);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    a.set(2, "second");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((a.line(1), a.line(2)), ("first", "two"));
+    assert_eq!((b.line(1), b.line(2)), ("first", "two"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// A late unlock under a grant that lapsed and went to somebody else releases nothing.
+#[test]
+fn a_stale_unlock_is_ignored() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    relay.lapse(SCOPE);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    let token = take_grant(&mut b);
+    a.le.unlock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), Some((peer_of(&relay, &b), token)), "a stale unlock released the new holder's lock");
+    assert!(!b.le.take_lock_events().contains(&released()), "B was told its lock was released");
+    // The holder's own unlock, under its own token, does release it.
+    b.le.unlock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), None);
+}
+
+/// A run that is still going refreshes its lease at half the lease's length, so a long run does
+/// not lose its lock; once the grant is gone the refresh is answered and the run is lost.
+#[test]
+fn a_long_run_refreshes_its_lease() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let read = now.clone();
+    a.le.set_clock(Box::new(move || *read.lock().unwrap()));
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("macro", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    let token = relay.holder(SCOPE).expect("A holds it").1;
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 0.0);
+    }
+    let Polled::Run(_) = q.poll(a.le.newest_seq(), 0.0) else { panic!("not granted") };
+
+    let half = LEASE_MS as f64 / 2.0;
+    *now.lock().unwrap() += half - 1.0;
+    a.pump();
+    assert!(relay.refreshes().is_empty(), "refreshed before half the lease");
+    *now.lock().unwrap() += 2.0;
+    a.pump();
+    assert_eq!(relay.refreshes(), vec![(SCOPE.to_owned(), token)]);
+    *now.lock().unwrap() += half;
+    a.pump();
+    assert_eq!(relay.refreshes().len(), 2, "the run went on and the lease was not refreshed again");
+    assert!(a.le.take_lock_events().is_empty(), "the refresh lost a lock that was held");
+    a.set(1, "after a long run");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "after a long run", "the run's edit under a refreshed lease was not ordered");
+
+    // The lease goes after all: the next refresh says so, and the run is lost.
+    relay.lapse(SCOPE);
+    *now.lock().unwrap() += half;
+    a.pump();
+    a.pump();
+    let events = a.le.take_lock_events();
+    assert_eq!(events, vec![lost(token)]);
+    q.on_lock(&events[0], 1.0);
+    assert_eq!(q.poll(a.le.newest_seq(), 2.0), Polled::LockLost { scope: SCOPE.into() });
+    // Edits after the loss are free again, and nothing was taken back.
+    a.set(2, "free again");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), ("after a long run", "free again"));
+}
+
+/// Edits without a lock are not fenced, even while another window holds one.
+#[test]
+fn free_edits_are_not_fenced() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    assert_eq!(a.le.live().fence(), None);
+    a.set(1, "free");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "free");
+    assert!(b.le.live().fence().is_some(), "B's grant fences B's edits");
+}
+
+/// A fenced run that rejoins keeps going: a rejoin alone does not lose it, the relay's answer
+/// to its edits does. What it had ordered before the drop stays; here the relay released the
+/// grant with the old link and the scope went to B, so its next edit is refused and taken back.
+#[test]
+fn a_rejoin_during_a_fenced_run_is_decided_by_the_relay() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 1.0);
+    }
+    let Polled::Run(_) = q.poll(a.le.newest_seq(), 2.0) else { panic!("not granted") };
+    a.set(1, "before the drop");
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    b.pump();
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert!(q.rejoined(3.0).is_empty());
+    assert_eq!(q.poll(a.le.newest_seq(), 3.0), Polled::Nothing, "a rejoin alone lost a fenced run");
+    a.set(2, "after the rejoin");
+    settle(&mut [&mut a, &mut b]);
+    for e in a.le.take_lock_events() {
+        q.on_lock(&e, 4.0);
+    }
+    assert_eq!(q.poll(a.le.newest_seq(), 5.0), Polled::LockLost { scope: SCOPE.into() });
+    assert_eq!((a.line(1), a.line(2)), ("before the drop", "two"));
+    assert_eq!((b.line(1), b.line(2)), ("before the drop", "two"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// `Ordered` and a lost grant: before the run it asks again, during the run the run is lost,
+/// and a loss for another grant is ignored.
+#[test]
+fn a_lost_grant_asks_again_or_loses_the_run() {
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    q.on_lock(&fenced(5, 3), 1.0);
+    assert!(q.on_lock(&lost(2), 2.0).is_empty(), "an older grant's loss is not ours");
+    assert_eq!(q.on_lock(&lost(3), 2.0), vec![Action::SendLock], "lost before the run: ask again");
+    assert_eq!(q.poll(5, 3.0), Polled::Nothing);
+    q.on_lock(&fenced(6, 4), 4.0);
+    assert_eq!(q.poll(6, 5.0), Polled::Run("x"));
+    assert!(q.rejoined(6.0).is_empty());
+    assert_eq!(q.poll(6, 6.0), Polled::Nothing, "a rejoin lost a fenced run");
+    assert!(q.on_lock(&lost(4), 7.0).is_empty());
+    assert_eq!(q.poll(6, 8.0), Polled::LockLost { scope: SCOPE.into() });
+    assert_eq!(q.poll(6, 9.0), Polled::Nothing, "told twice");
+    assert!(q.finish(true).is_empty(), "an unlock owed for a lost grant");
+    // A fenced run that was not lost gives its lock back as before.
+    q.request("y", 10.0).unwrap();
+    q.on_lock(&fenced(7, 5), 11.0);
+    assert_eq!(q.poll(7, 12.0), Polled::Run("y"));
+    assert_eq!(q.finish(true), vec![Action::SendUnlock]);
 }

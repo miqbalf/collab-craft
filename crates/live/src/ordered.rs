@@ -4,6 +4,11 @@
 //! Pure: it holds no hub and no clock. The app feeds it [`LockEvent`]s, polls it each frame
 //! with how far the replica has applied and what time it is, and sends the [`Action`]s it
 //! returns through `LiveEditing::lock` and `unlock`.
+//!
+//! Against a relay that fences (its grants carry a token), the run's edits go out as ordered
+//! edits under the grant, and the relay refuses them once the grant is no longer this peer's.
+//! The run then ends as [`Polled::LockLost`], with the replica already back at the room's state.
+//! A rejoin alone no longer loses the run: the relay's answer to its edits decides.
 
 use craft_collab::LockEvent;
 
@@ -31,9 +36,14 @@ pub enum Polled<P> {
         item: P,
         holder: String,
     },
-    /// A rejoin released the lock while the item was running, so its edits go out unprotected:
-    /// another peer may take the scope and order its own edit first. Told once per run; the
-    /// app treats the ordered edit as failed and says so. `finish` still ends the run.
+    /// The run lost its lock. Told once per run; the app treats the ordered edit as failed and
+    /// says so. `finish` still ends the run (and owes no unlock).
+    ///
+    /// Against a fencing relay: the relay refused an edit made under the grant, or a lease
+    /// refresh found it gone ([`LockEvent::Lost`]). Every edit of the run the relay did not
+    /// order is already out of the replica (`LiveApp::reset` and `resync` ran), so the app
+    /// only tells the user. Against an older relay: a rejoin released the lock while the item
+    /// was running, so its edits went out unprotected.
     LockLost {
         scope: String,
     },
@@ -47,11 +57,12 @@ enum State {
     Asking,
     /// Refused: `holder` has it. Asked again when it is released.
     Denied { holder: String },
-    /// Granted at `seq`: the item waits for the replica to apply up to it.
-    Granted { seq: u64 },
-    /// The item ran; its edits are being flushed. `held` is false once a rejoin made the relay
-    /// drop the grant, so no unlock is owed; `told` is whether [`Polled::LockLost`] went out.
-    Running { held: bool, told: bool },
+    /// Granted at `seq`, under fencing `token` when the relay gave one: the item waits for the
+    /// replica to apply up to `seq`.
+    Granted { seq: u64, token: Option<u64> },
+    /// The item ran; its edits are being flushed. `held` is false once the grant is gone, so no
+    /// unlock is owed; `told` is whether [`Polled::LockLost`] went out; `token` the grant's.
+    Running { held: bool, told: bool, token: Option<u64> },
 }
 
 /// One ordered edit at a time under one relay scope.
@@ -90,11 +101,11 @@ impl<P> Ordered<P> {
 
     /// The relay's word on a lock. Events for other scopes are not ours; a release is broadcast
     /// to the whole room, ours included, so it only matters while a refused request waits.
-    pub fn on_lock(&mut self, event: &LockEvent, _now_ms: f64) -> Vec<Action> {
+    pub fn on_lock(&mut self, event: &LockEvent, now_ms: f64) -> Vec<Action> {
         match event {
-            LockEvent::Granted { scope, seq } if *scope == self.scope => match self.state {
+            LockEvent::Granted { scope, seq, token } if *scope == self.scope => match self.state {
                 State::Asking | State::Denied { .. } => {
-                    self.state = State::Granted { seq: seq.unwrap_or(0) };
+                    self.state = State::Granted { seq: seq.unwrap_or(0), token: *token };
                     Vec::new()
                 }
                 // A grant nobody waits for any more (we gave up while the request was out):
@@ -119,6 +130,21 @@ impl<P> Ordered<P> {
                 }
                 Vec::new()
             }
+            // The grant this queue holds is gone. Before the run, ask again; during it, the run
+            // is lost. A loss for another grant (an older one) is not ours.
+            LockEvent::Lost { scope, token } if *scope == self.scope => match self.state {
+                State::Granted { token: Some(t), .. } if t == *token => {
+                    self.state = State::Asking;
+                    self.since = now_ms;
+                    self.released_early = false;
+                    vec![Action::SendLock]
+                }
+                State::Running { held: true, told, token: Some(t) } if t == *token => {
+                    self.state = State::Running { held: false, told, token: Some(t) };
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            },
             LockEvent::Released { scope } if *scope == self.scope => {
                 match self.state {
                     State::Denied { .. } => {
@@ -141,9 +167,9 @@ impl<P> Ordered<P> {
     /// `Run` once granted and `applied >= grant seq`; `GaveUp` after [`GIVE_UP_MS`] waiting.
     pub fn poll(&mut self, applied: u64, now_ms: f64) -> Polled<P> {
         match &self.state {
-            State::Granted { seq } if applied >= *seq => match self.item.take() {
+            State::Granted { seq, token } if applied >= *seq => match self.item.take() {
                 Some(item) => {
-                    self.state = State::Running { held: true, told: false };
+                    self.state = State::Running { held: true, told: false, token: *token };
                     Polled::Run(item)
                 }
                 None => {
@@ -151,8 +177,8 @@ impl<P> Ordered<P> {
                     Polled::Nothing
                 }
             },
-            State::Running { held: false, told: false } => {
-                self.state = State::Running { held: false, told: true };
+            State::Running { held: false, told: false, token } => {
+                self.state = State::Running { held: false, told: true, token: *token };
                 Polled::LockLost { scope: self.scope.clone() }
             }
             State::Asking | State::Denied { .. } if now_ms - self.since > GIVE_UP_MS => {
@@ -190,8 +216,8 @@ impl<P> Ordered<P> {
     pub fn replica_broken(&mut self) -> Vec<Action> {
         self.broken = true;
         match self.state {
-            State::Running { held, .. } => {
-                self.state = State::Running { held: false, told: false };
+            State::Running { held, token, .. } => {
+                self.state = State::Running { held: false, told: false, token };
                 if held { vec![Action::SendUnlock] } else { Vec::new() }
             }
             _ => Vec::new(),
@@ -209,13 +235,17 @@ impl<P> Ordered<P> {
     /// The link rejoined: drop the grant (the relay released it), keep the item, ask again.
     /// The wait for the lock starts over. Feed the lock events taken before the rejoin to
     /// [`on_lock`](Self::on_lock) first (`LiveEditing` already drops the old link's events, so
-    /// the order cannot revive a stale grant). A run in progress keeps going without the lock:
-    /// [`poll`](Self::poll) reports [`Polled::LockLost`] once.
+    /// the order cannot revive a stale grant).
+    ///
+    /// A run in progress under a fenced grant is left to the relay: its edits are sent again
+    /// under the grant's token, ordered if the grant survived the rejoin and refused (the run
+    /// lost, [`LockEvent::Lost`]) if not. Under a grant with no token (an older relay) it keeps
+    /// going without the lock, and [`poll`](Self::poll) reports [`Polled::LockLost`] once.
     pub fn rejoined(&mut self, now_ms: f64) -> Vec<Action> {
         match self.state {
-            State::Idle => Vec::new(),
-            State::Running { told, .. } => {
-                self.state = State::Running { held: false, told };
+            State::Idle | State::Running { token: Some(_), .. } => Vec::new(),
+            State::Running { told, token: None, .. } => {
+                self.state = State::Running { held: false, told, token: None };
                 Vec::new()
             }
             State::Asking | State::Denied { .. } | State::Granted { .. } => {

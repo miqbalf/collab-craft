@@ -4,7 +4,9 @@
 //! It does what a host test needs and no more: numbers every submit and broadcasts it to the
 //! room (sender included), refuses edits from a read-only connection with the relay's wording,
 //! grants each join a fresh client space, holds one holder per lock scope (grant at the room's
-//! sequence, denial naming the holder, release on unlock or a dropped link), replays the ops so far to a joiner, keeps the newest
+//! sequence, denial naming the holder, release on unlock or a dropped link), fences ordered edits
+//! as the relay does (a fencing token per grant, a fenced submit or a refresh refused once the
+//! grant is gone, a stale unlock ignored; [`MemRelay::lapse`] lets a lease run out), replays the ops so far to a joiner, keeps the newest
 //! ephemeral (caret) per peer and kind, and can drop and restore a connection. It does not save:
 //! the crate's own pump tests cover the saver. Not for production use.
 
@@ -17,6 +19,9 @@ use serde_json::Value;
 
 /// The room every connection of a [`MemRelay`] is in.
 pub const ROOM: &str = "test:room:1";
+
+/// The lease a [`MemRelay`] grant names, as the relay's own default.
+pub const LEASE_MS: u64 = 60_000;
 
 struct Conn {
     pid: String,
@@ -37,8 +42,13 @@ struct Relay {
     conns: Vec<Conn>,
     next_space: u32,
     ephemeral: Vec<(String, String, Value)>,
-    /// The holder (connection index) of each locked scope.
-    locks: Vec<(String, usize)>,
+    /// The holder (connection index) of each locked scope, and its grant's fencing token.
+    locks: Vec<(String, usize, u64)>,
+    /// The last fencing token handed out, for any scope (the real relay counts per scope; one
+    /// counter is still increasing per scope).
+    tokens: u64,
+    /// Lease refreshes heard, `(scope, token)`, oldest first.
+    refreshes: Vec<(String, u64)>,
     /// How many of the next submits the relay refuses for now (the retry code).
     refuse_submits: usize,
 }
@@ -100,6 +110,23 @@ impl MemRelay {
         if let Some(c) = self.0.borrow_mut().conns.get_mut(hub.at) {
             c.send_fails = fail;
         }
+    }
+
+    /// The lease on `scope` runs out without a word to anyone, as a holder paused past its TTL
+    /// sees it: its grant is no longer current, and the scope is free to grant again.
+    pub fn lapse(&self, scope: &str) {
+        self.0.borrow_mut().locks.retain(|(s, _, _)| s != scope);
+    }
+
+    /// The lease refreshes heard so far, `(scope, token)`, oldest first.
+    pub fn refreshes(&self) -> Vec<(String, u64)> {
+        self.0.borrow().refreshes.clone()
+    }
+
+    /// Who holds `scope` (a peer id) and under which token.
+    pub fn holder(&self, scope: &str) -> Option<(String, u64)> {
+        let r = self.0.borrow();
+        r.locks.iter().find(|(s, _, _)| s == scope).and_then(|(_, h, t)| Some((r.conns.get(*h)?.pid.clone(), *t)))
     }
 
     /// `hub`'s relay peer id.
@@ -206,8 +233,8 @@ impl Relay {
         let locks: Vec<LockState> = self
             .locks
             .iter()
-            .filter(|(_, h)| *h != at)
-            .filter_map(|(scope, h)| Some(LockState { scope: scope.clone(), holder: self.conns.get(*h)?.pid.clone() }))
+            .filter(|(_, h, _)| *h != at)
+            .filter_map(|(scope, h, _)| Some(LockState { scope: scope.clone(), holder: self.conns.get(*h)?.pid.clone() }))
             .collect();
         let Some(pid) = self.conns.get(at).map(|c| c.pid.clone()) else { return };
         let joined = ServerMsg::Joined {
@@ -246,8 +273,8 @@ impl Relay {
 
     /// A connection's locks end with its link (or its unlock): everyone is told.
     fn release_locks_of(&mut self, at: usize) {
-        let held: Vec<String> = self.locks.iter().filter(|(_, h)| *h == at).map(|(s, _)| s.clone()).collect();
-        self.locks.retain(|(_, h)| *h != at);
+        let held: Vec<String> = self.locks.iter().filter(|(_, h, _)| *h == at).map(|(s, _, _)| s.clone()).collect();
+        self.locks.retain(|(_, h, _)| *h != at);
         for scope in held {
             self.broadcast(&ServerMsg::LockReleased { doc: ROOM.into(), scope }, Some(at));
         }
@@ -264,7 +291,7 @@ impl Relay {
     fn handle(&mut self, at: usize, msg: ClientMsg) {
         let Some(conn) = self.conns.get_mut(at).filter(|c| c.connected) else { return };
         match msg {
-            ClientMsg::Submit { local, command, params, .. } => {
+            ClientMsg::Submit { local, command, params, fence, .. } => {
                 if !conn.may_edit {
                     conn.inbox.push_back(ServerMsg::Error {
                         doc: ROOM.into(),
@@ -284,6 +311,20 @@ impl Relay {
                     });
                     return;
                 }
+                if let Some(fence) = fence
+                    && !self.locks.iter().any(|(s, h, t)| *s == fence.scope && *h == at && *t == fence.token)
+                {
+                    if let Some(c) = self.conns.get_mut(at) {
+                        c.inbox.push_back(ServerMsg::Error {
+                            doc: ROOM.into(),
+                            detail: format!("you no longer hold {}; that change was not shared", fence.scope),
+                            local: Some(local),
+                            code: Some(craft_collab::FENCED.into()),
+                        });
+                    }
+                    return;
+                }
+                let Some(conn) = self.conns.get_mut(at) else { return };
                 let origin = conn.pid.clone();
                 self.seq += 1;
                 let op = ServerMsg::Op { doc: ROOM.into(), seq: self.seq, origin, local: Some(local), command, params, scope: None };
@@ -307,7 +348,7 @@ impl Relay {
                     return;
                 }
                 let me = conn.pid.clone();
-                let holder = self.locks.iter().find(|(s, _)| *s == scope).map(|(_, h)| *h);
+                let holder = self.locks.iter().find(|(s, _, _)| *s == scope).map(|(_, h, _)| *h);
                 match holder {
                     Some(h) if h != at => {
                         let holder = self.conns.get(h).map(|c| c.pid.clone()).unwrap_or_default();
@@ -316,13 +357,23 @@ impl Relay {
                         }
                     }
                     _ => {
+                        // Every grant, a re-grant to the holder too, takes a new token.
+                        self.tokens += 1;
+                        let token = self.tokens;
                         if holder.is_none() {
-                            self.locks.push((scope.clone(), at));
                             self.broadcast(&ServerMsg::PresenceLock { doc: ROOM.into(), scope: scope.clone(), holder: me }, Some(at));
                         }
+                        self.locks.retain(|(s, _, _)| *s != scope);
+                        self.locks.push((scope.clone(), at, token));
                         let seq = self.seq;
                         if let Some(c) = self.conns.get_mut(at) {
-                            c.inbox.push_back(ServerMsg::LockGranted { doc: ROOM.into(), scope, seq: Some(seq) });
+                            c.inbox.push_back(ServerMsg::LockGranted {
+                                doc: ROOM.into(),
+                                scope,
+                                seq: Some(seq),
+                                token: Some(token),
+                                lease_ms: Some(LEASE_MS),
+                            });
                         }
                     }
                 }
@@ -332,10 +383,19 @@ impl Relay {
                 conn.inbox.push_back(ServerMsg::SavedAck { doc, seq });
             }
             // The whole room hears the release, the releaser too, as the real relay does. A peer
-            // that does not hold the scope releases nothing.
-            ClientMsg::Unlock { scope, .. } if self.locks.iter().any(|(s, h)| *s == scope && *h == at) => {
-                self.locks.retain(|(s, _)| *s != scope);
+            // that does not hold the scope, or holds it under another grant than the token
+            // names, releases nothing.
+            ClientMsg::Unlock { scope, token, .. } if self.locks.iter().any(|(s, h, t)| *s == scope && *h == at && token.is_none_or(|token| token == *t)) => {
+                self.locks.retain(|(s, _, _)| *s != scope);
                 self.broadcast(&ServerMsg::LockReleased { doc: ROOM.into(), scope }, None);
+            }
+            ClientMsg::Refresh { scope, token, .. } => {
+                self.refreshes.push((scope.clone(), token));
+                if !self.locks.iter().any(|(s, h, t)| *s == scope && *h == at && *t == token)
+                    && let Some(c) = self.conns.get_mut(at)
+                {
+                    c.inbox.push_back(ServerMsg::LockLost { doc: ROOM.into(), scope, token });
+                }
             }
             _ => {}
         }

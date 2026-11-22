@@ -84,7 +84,7 @@ use socketioxide::SocketIo;
 use socketioxide::extract::{Data, SocketRef, State};
 use tokio::sync::Mutex;
 
-use bus::{Bus, LockOutcome};
+use bus::{Bus, LockOutcome, Released};
 use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, is_crdt_command};
 
 /// Bytes one opaque frame may carry, base64 included.
@@ -166,6 +166,12 @@ const CODE_SCHEMA: &str = "schema";
 /// [`ErrorMsg::code`] on a refused submit whose update is not a valid document update for the
 /// room's replica schema. Nothing was ordered or kept; sending it again cannot help.
 const CODE_INVALID: &str = "invalid";
+
+/// [`ErrorMsg::code`] on a refused fenced submit (one naming `fence: {scope, token}`): this peer
+/// does not hold `scope` under `token` now (the lease lapsed, or was granted again since).
+/// Nothing was ordered or kept, and the token never becomes current again, so sending it again
+/// cannot help: the sender drops the edit and goes back to the room's state.
+const CODE_FENCED: &str = "fenced";
 use token::Claims;
 
 const DEFAULT_VALKEY: &str = "redis://valkey:6379/6";
@@ -377,11 +383,38 @@ struct SubmitMsg {
     params: serde_json::Value,
     #[serde(default)]
     scope: Option<String>,
+    /// An ordered edit's fence: ordered only while this peer holds `scope` under `token`.
+    #[serde(default)]
+    fence: Option<FenceMsg>,
+}
+
+/// The lock an ordered edit is made under, and the grant's fencing token.
+#[derive(Debug, Deserialize)]
+struct FenceMsg {
+    scope: String,
+    token: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct ScopeMsg {
     scope: String,
+}
+
+/// An unlock. `token` is the grant's fencing token; with it only that grant is released, so a
+/// stale unlock cannot release a newer grant. Without it (a client from before fencing) the
+/// peer alone is compared.
+#[derive(Debug, Deserialize)]
+struct UnlockMsg {
+    scope: String,
+    #[serde(default)]
+    token: Option<u64>,
+}
+
+/// A holder extending its lease while its ordered run goes on.
+#[derive(Debug, Deserialize)]
+struct RefreshMsg {
+    scope: String,
+    token: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -782,6 +815,7 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     socket.on("submit", on_submit);
     socket.on("lock", on_lock);
     socket.on("unlock", on_unlock);
+    socket.on("refresh", on_refresh);
     socket.on("resync", on_resync);
     socket.on("frame", on_frame);
     socket.on("ephemeral", on_ephemeral);
@@ -1156,6 +1190,35 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     let gate = relay.gate(&claims.rm);
     let ordered = gate.lock().await;
 
+    // A fenced submit (an ordered edit) is ordered only while its sender holds the scope under
+    // the grant's token. Checked on the bus, inside the gate and before the sequence: a holder
+    // that was paused or cut off past its lease, and whose scope was granted again since, is
+    // refused here and its edit is never numbered, ordered or replayed. The check extends the
+    // lease, so nobody can be granted the scope between it and the op being recorded.
+    if let Some(fence) = &msg.fence {
+        let held = {
+            let mut bus = relay.bus.lock().await;
+            bus.check_fence(&claims.rm, &fence.scope, &claims.pid, fence.token).await
+        };
+        match held {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(ordered);
+                tracing::info!(room = %claims.rm, peer = %claims.pid, scope = %fence.scope, token = fence.token, "refused a fenced edit from a peer that no longer holds the lock");
+                let detail = format!("you no longer hold {}; that change was not shared", fence.scope);
+                let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail, local, code: Some(CODE_FENCED) });
+                return;
+            }
+            Err(e) => {
+                drop(ordered);
+                tracing::error!(error = %e, room = %claims.rm, "could not check a fence");
+                let _ = socket
+                    .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
+                return;
+            }
+        }
+    }
+
     // The sequence comes from Valkey, so two relay instances cannot hand out
     // the same number.
     let floor = {
@@ -1251,13 +1314,13 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
         return;
     }
 
-    let outcome = {
+    let (outcome, lease) = {
         let mut bus = relay.bus.lock().await;
-        bus.try_lock(&claims.rm, &msg.scope, &claims.pid).await
+        (bus.try_lock(&claims.rm, &msg.scope, &claims.pid).await, bus.lock_ttl())
     };
 
     match outcome {
-        Ok(LockOutcome::Granted) => {
+        Ok(LockOutcome::Granted { token }) => {
             // The room's sequence at the moment of the grant, read in the same rooms lock that
             // records the holder. The ordering gate is held across the read, so an op that was
             // numbered before this grant is recorded, and counted, before the seq is read: the
@@ -1282,10 +1345,16 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
             };
             let Some(seq) = seq else {
                 let mut bus = relay.bus.lock().await;
-                let _ = bus.release(&claims.rm, &msg.scope, &claims.pid).await;
+                let _ = bus.release_fenced(&claims.rm, &msg.scope, &claims.pid, token).await;
                 return;
             };
-            let _ = socket.emit("lock_granted", &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq }));
+            // `token` fences the holder's ordered edits (see `on_submit`); `lease_ms` is how long
+            // the lease lasts unrefreshed, so the holder knows when to refresh it.
+            let lease_ms = u64::try_from(lease.as_millis()).unwrap_or(u64::MAX);
+            let _ = socket.emit(
+                "lock_granted",
+                &serde_json::json!({ "doc": room_name, "scope": msg.scope, "seq": seq, "token": token, "lease_ms": lease_ms }),
+            );
             emit_live(
                 socket.to(room_name.clone()),
                 "presence_lock",
@@ -1309,13 +1378,22 @@ async fn on_lock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): Sta
     }
 }
 
-async fn on_unlock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): State<Arc<Relay>>) {
+async fn on_unlock(socket: SocketRef, Data(msg): Data<UnlockMsg>, State(relay): State<Arc<Relay>>) {
     let Some(claims) = live_claims(&socket) else { return };
     let room_name = claims.room();
 
     let bus_released = {
         let mut bus = relay.bus.lock().await;
-        bus.release(&claims.rm, &msg.scope, &claims.pid).await.unwrap_or(false)
+        match msg.token {
+            // Fenced: only the grant named. A stale unlock for a scope this peer holds again
+            // under a newer token releases nothing, on the bus or in the mirror.
+            Some(token) => match bus.release_fenced(&claims.rm, &msg.scope, &claims.pid, token).await {
+                Ok(Released::Released) => true,
+                Ok(Released::Absent) => false,
+                Ok(Released::NotYours) | Err(_) => return,
+            },
+            None => bus.release(&claims.rm, &msg.scope, &claims.pid).await.unwrap_or(false),
+        }
     };
     let mirror_released = {
         let mut rooms = relay.rooms.lock().await;
@@ -1332,6 +1410,26 @@ async fn on_unlock(socket: SocketRef, Data(msg): Data<ScopeMsg>, State(relay): S
     // scope somebody else has since claimed a no-op.
     if bus_released || mirror_released {
         emit_live(socket.within(room_name.clone()), "lock_released", &serde_json::json!({ "doc": room_name, "scope": msg.scope }));
+    }
+}
+
+/// A holder extends its lease while an ordered run goes on, so a long run (a macro) does not
+/// lose the lock. Fenced like a submit: extended only while this peer holds the scope under
+/// `token`. When it does not, the holder is told (`lock_lost`), so it stops treating the run as
+/// protected before its next edit is refused.
+async fn on_refresh(socket: SocketRef, Data(msg): Data<RefreshMsg>, State(relay): State<Arc<Relay>>) {
+    let Some(claims) = live_claims(&socket) else { return };
+    let held = {
+        let mut bus = relay.bus.lock().await;
+        bus.check_fence(&claims.rm, &msg.scope, &claims.pid, msg.token).await
+    };
+    match held {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = socket.emit("lock_lost", &serde_json::json!({ "doc": claims.room(), "scope": msg.scope, "token": msg.token }));
+        }
+        // Not known either way. The next refresh, or the fenced submit, asks again.
+        Err(e) => tracing::warn!(error = %e, room = %claims.rm, scope = %msg.scope, "could not refresh a lease"),
     }
 }
 

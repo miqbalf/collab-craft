@@ -337,7 +337,9 @@ impl Seen {
             self.confirmed = self.confirmed.max(Some(*seq));
         }
         match m {
-            ServerMsg::LockGranted { scope, seq, .. } => self.lock_events.push(LockEvent::Granted { scope: scope.clone(), seq: *seq }),
+            ServerMsg::LockGranted { scope, seq, token, .. } => {
+                self.lock_events.push(LockEvent::Granted { scope: scope.clone(), seq: *seq, token: *token });
+            }
             ServerMsg::LockDenied { scope, holder, .. } => self.lock_events.push(LockEvent::Denied { scope: scope.clone(), holder: holder.clone() }),
             ServerMsg::LockReleased { scope, .. } => self.lock_events.push(LockEvent::Released { scope: scope.clone() }),
             // This peer's own take is not somebody else's.
@@ -571,6 +573,9 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     pub fn pump(&mut self, app: &mut impl LiveApp<K>) -> Vec<Peer<K::Pos>> {
         self.flush(app);
         let works = self.live.pump();
+        if let Some(now) = self.clock.as_mut().map(|c| c()) {
+            self.live.refresh_lease(now);
+        }
         self.note_join(app);
         for work in works {
             self.act(work, app);
@@ -632,12 +637,22 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     }
 
     /// Ask the relay for `scope`; the answer comes back through [`take_lock_events`](Self::take_lock_events).
+    ///
+    /// From a fenced grant (`LockEvent::Granted` with a `token`) until [`unlock`](Self::unlock),
+    /// every edit this window shares is an ordered edit under that grant: the relay orders it
+    /// only while the grant is still this window's. If the relay refuses one (the lease lapsed
+    /// while this window was paused or cut off, and may have gone to somebody else), the run is
+    /// taken back: the replica returns to the room's state, the app is reset and resynced from
+    /// it ([`LiveApp::reset`]), and `LockEvent::Lost` follows. The lease is refreshed at half its
+    /// length while held, on the host's clock ([`set_clock`](Self::set_clock)).
     pub fn lock(&mut self, scope: &str) -> craft_collab::Result<()> {
         self.live.lock(scope)
     }
 
     /// Give `scope` back. Do it only once [`local_settled`](Self::local_settled): a lock released
-    /// ahead of the holder's own edit lets the next holder run on stale state.
+    /// ahead of the holder's own edit lets the next holder run on stale state. The grant's
+    /// fencing token goes with it, so a late unlock never releases a newer grant; edits are free
+    /// again from here.
     pub fn unlock(&mut self, scope: &str) -> craft_collab::Result<()> {
         self.live.unlock(scope)
     }
@@ -809,6 +824,9 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
+            // A lost grant is `Live`'s own word (a fenced edit refused, a refresh answered), not
+            // a lock answer on the wire, so it joins the events here.
+            Work::Lock(event @ LockEvent::Lost { .. }) => lock(&self.seen).lock_events.push(event),
             // Lock answers are read off the wire in `Seen`, in order with the joins.
             Work::Lock(_) => {}
             // The relay lost the room's history. A replica that held a settled state goes on

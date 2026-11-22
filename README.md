@@ -338,6 +338,37 @@ Public items added to the Rust crates, additive on the wire (an older relay or c
   (`X-Craft-Base-Sha256` is checked), keeping the file's name and ETag so the first write stays
   `If-Match` on the file. A missing or mismatched base closes the room.
 
+## Live API notes: fenced ordered edits (C8)
+
+A lock holder that is paused or cut off past its lease (60 s) must never order an edit after
+somebody else was granted the lock. Every grant now carries a fencing token, and edits made under
+it are ordered only while it is still the current grant. Additive on the wire; in Rust, struct
+variants gained fields (see below), so literals and exhaustive matches need updating.
+
+- **Wire.** `lock_granted` carries `token` (per room and scope, strictly increasing, a re-grant to
+  the same holder included) and `lease_ms`. `submit` may carry `fence: {scope, token}`: the relay
+  orders it only while the sender holds `scope` under `token` (checked on the bus, inside the
+  room's gate, before the sequence; the check extends the lease), and otherwise refuses it with
+  `error {code: "fenced", local}`, never numbered, retained or replayed. `unlock` may carry
+  `token`: then only that grant is released, so a stale unlock is a no-op. New `refresh {scope,
+  token}` extends the lease; when the grant is not current it is answered with `lock_lost {scope,
+  token}` to the sender. Submits without `fence` (free edits) are unchanged.
+- **`craft-collab`.** `Fence { scope, token }`, `FENCED`. `ClientMsg::Submit` gained `fence`,
+  `ClientMsg::Unlock` gained `token`, new `ClientMsg::Refresh`. `ServerMsg::LockGranted` gained
+  `token` and `lease_ms`, new `ServerMsg::LockLost`. `Effect::LockHeld` gained `token` and
+  `lease_ms`, new `Effect::LockLost`. `LockEvent::Granted` gained `token`, new `LockEvent::Lost {
+  scope, token }`. `Session::submit_fenced`, `release_grant`, `refresh_lock`. `Live` fences by
+  itself: from a fenced grant until `Live::unlock(scope)` (which sends the token) every local edit
+  goes out under the fence; a fenced refusal takes the run back (the replica is rebuilt from its
+  state at the grant plus everything the room ordered since, `Work::Reset`) and reports
+  `LockEvent::Lost`. `Live::fence()` and `Live::refresh_lease(now_ms)`.
+- **`craft-live`.** `LiveEditing::pump` refreshes the lease at half its length on the host clock
+  (`set_clock`) and passes `LockEvent::Lost` through `take_lock_events()`. `Ordered`: a `Lost`
+  for its grant before the run asks again, during the run ends it as `Polled::LockLost`; a rejoin
+  no longer loses a fenced run by itself (the relay's answer to its edits decides). `MemRelay`
+  fences like the relay, and `MemRelay::lapse(scope)`, `refreshes()` and `holder(scope)` let a
+  test run a lease out.
+
 ## Known limits
 
 Phase 1 of live co-editing ships with these. Each is a decision, not an oversight.

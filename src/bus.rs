@@ -62,14 +62,30 @@ pub enum BusError {
 /// Whether a scope was granted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LockOutcome {
-    Granted,
+    /// Granted, with the grant's fencing token: higher than every token granted for this scope
+    /// before, re-grants to the same holder included.
+    Granted { token: u64 },
     Held { holder: String },
+}
+
+/// What a fenced release ([`Bus::release_fenced`]) found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Released {
+    /// The lease was this peer's under this token, and is gone now.
+    Released,
+    /// Somebody holds the scope, but not this peer under this token (another peer, or this
+    /// peer under a newer grant). Nothing changed.
+    NotYours,
+    /// Nobody holds the scope: the lease lapsed on its own.
+    Absent,
 }
 
 /// A connection to the shared Valkey.
 #[derive(Clone)]
 pub struct Bus {
     conn: MultiplexedConnection,
+    /// How long a lease lasts without a refresh. [`LOCK_TTL`] unless a test shortens it.
+    lock_ttl: Duration,
     /// Fail this many [`Bus::next_seq`] calls, as a bus that did not answer in time, before
     /// working again. For the tests of what a transient failure does.
     #[cfg(test)]
@@ -104,6 +120,7 @@ impl Bus {
         let conn = client.get_multiplexed_async_connection_with_config(&config).await?;
         Ok(Bus {
             conn,
+            lock_ttl: LOCK_TTL,
             #[cfg(test)]
             fail_next_seq: 0,
         })
@@ -206,37 +223,95 @@ impl Bus {
         Ok(((next - 1) % u64::from(u32::MAX)) as u32 + 1)
     }
 
+    /// How long a lease lasts without a refresh.
+    pub fn lock_ttl(&self) -> Duration {
+        self.lock_ttl
+    }
+
+    /// Shorten (or lengthen) the lease, for a test that needs one to lapse.
+    #[cfg(test)]
+    pub fn set_lock_ttl(&mut self, ttl: Duration) {
+        self.lock_ttl = ttl;
+    }
+
+    fn ttl_ms(&self) -> i64 {
+        i64::try_from(self.lock_ttl.as_millis()).unwrap_or(i64::MAX)
+    }
+
     /// Claim a scope, or report who holds it.
     ///
-    /// `SET NX EX` in one round trip, which is what makes this safe with more
-    /// than one relay. Re-granting to the current holder keeps it idempotent,
-    /// which a client retrying after a reconnect relies on.
+    /// One script, so the claim and the fencing token are one step: `SET NX PX` on the lease,
+    /// or a refresh when this peer already holds it, then `INCR` of the scope's token counter.
+    /// Atomic, which is what makes this safe with more than one relay. Re-granting to the
+    /// current holder keeps it idempotent for a client retrying after a reconnect, but hands
+    /// out a new token: a run under the old one must not pass for a run under the new one.
+    ///
+    /// The token counter outlives the lease ([`SEQ_TTL`]), so tokens only grow while a document
+    /// is in use; a stale holder's token is never handed out again.
     pub async fn try_lock(&mut self, room: &str, scope: &str, peer: &str) -> Result<LockOutcome, BusError> {
-        let key = self.lock_key(room, scope);
-
-        let claimed: Option<String> =
-            match redis::cmd("SET").arg(&key).arg(peer).arg("NX").arg("EX").arg(LOCK_TTL.as_secs() as i64).query_async(&mut self.conn).await {
-                Ok(v) => v,
-                Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
-                Err(e) => return Err(e.into()),
-            };
-
-        if claimed.is_some() {
-            return Ok(LockOutcome::Granted);
+        const SCRIPT: &str = r#"
+            local claimed = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+            if not claimed then
+                local holder = redis.call('GET', KEYS[1])
+                if holder and holder ~= ARGV[1] then
+                    return {0, holder}
+                end
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+            end
+            local token = redis.call('INCR', KEYS[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[3])
+            return {1, tostring(token)}
+        "#;
+        let (granted, value): (i64, String) = match redis::Script::new(SCRIPT)
+            .key(self.lock_key(room, scope))
+            .key(self.fence_key(room, scope))
+            .arg(peer)
+            .arg(self.ttl_ms())
+            .arg(SEQ_TTL.as_secs() as i64)
+            .invoke_async(&mut self.conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
+            Err(e) => return Err(e.into()),
+        };
+        if granted == 1 {
+            let token = value
+                .parse()
+                .map_err(|_| redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, "the fencing token is not a number")))?;
+            Ok(LockOutcome::Granted { token })
+        } else {
+            Ok(LockOutcome::Held { holder: value })
         }
+    }
 
-        let holder: Option<String> = self.conn.get(&key).await?;
-        match holder {
-            Some(h) if h == peer => {
-                // Ours already. Refresh so holding it does not expire under us.
-                let _: Result<bool, _> = self.conn.expire(&key, LOCK_TTL.as_secs() as i64).await;
-                Ok(LockOutcome::Granted)
-            }
-            Some(h) => Ok(LockOutcome::Held { holder: h }),
-            // It expired between the SET and the GET. Treat as free and let the
-            // caller retry rather than inventing a holder.
-            None => Ok(LockOutcome::Granted),
-        }
+    /// Whether `peer` holds `scope` under fencing token `token` now, and if so extend the lease.
+    ///
+    /// One script: the holder and the token are compared and the lease extended in one step, so
+    /// nobody can be granted the scope between the check and the edit it lets through (the
+    /// lease is a full TTL from here). A lease that lapsed is not revived: `false`.
+    pub async fn check_fence(&mut self, room: &str, scope: &str, peer: &str, token: u64) -> Result<bool, BusError> {
+        const SCRIPT: &str = r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] and redis.call('GET', KEYS[2]) == ARGV[2] then
+                redis.call('PEXPIRE', KEYS[1], ARGV[3])
+                return 1
+            end
+            return 0
+        "#;
+        let held: i64 = match redis::Script::new(SCRIPT)
+            .key(self.lock_key(room, scope))
+            .key(self.fence_key(room, scope))
+            .arg(peer)
+            .arg(token.to_string())
+            .arg(self.ttl_ms())
+            .invoke_async(&mut self.conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(held == 1)
     }
 
     /// Who currently holds a scope, read directly rather than through [`Bus::holders`]' `SCAN`.
@@ -261,7 +336,8 @@ impl Bus {
         if holder.as_deref() != Some(peer) {
             return Ok(false);
         }
-        let _: Result<bool, _> = self.conn.expire(&key, LOCK_TTL.as_secs() as i64).await;
+        let ttl = self.ttl_ms();
+        let _: Result<bool, _> = self.conn.pexpire(&key, ttl).await;
         Ok(true)
     }
 
@@ -285,6 +361,41 @@ impl Bus {
             Err(e) => return Err(e.into()),
         };
         Ok(deleted > 0)
+    }
+
+    /// Release a scope only when this peer holds it under fencing token `token`.
+    ///
+    /// A stale unlock (from a run whose lease lapsed and was granted again, to somebody else or
+    /// to this peer under a newer token) must not release the newer holder's lock, which a
+    /// compare on the peer alone would.
+    pub async fn release_fenced(&mut self, room: &str, scope: &str, peer: &str, token: u64) -> Result<Released, BusError> {
+        const SCRIPT: &str = r#"
+            local holder = redis.call('GET', KEYS[1])
+            if not holder then
+                return -1
+            end
+            if holder == ARGV[1] and redis.call('GET', KEYS[2]) == ARGV[2] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+        "#;
+        let outcome: i64 = match redis::Script::new(SCRIPT)
+            .key(self.lock_key(room, scope))
+            .key(self.fence_key(room, scope))
+            .arg(peer)
+            .arg(token.to_string())
+            .invoke_async(&mut self.conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(match outcome {
+            -1 => Released::Absent,
+            0 => Released::NotYours,
+            _ => Released::Released,
+        })
     }
 
     /// Every held scope for a document, for a join payload.
@@ -324,6 +435,12 @@ impl Bus {
 
     fn lock_key(&self, room: &str, scope: &str) -> String {
         format!("{PREFIX}:doc:{}:lock:{}", encode_key(room), encode_key(scope))
+    }
+
+    /// The scope's fencing token counter. Outside the `lock:` family, so [`Bus::holders`]'
+    /// scan never reads it as a held scope.
+    fn fence_key(&self, room: &str, scope: &str) -> String {
+        format!("{PREFIX}:doc:{}:fence:{}", encode_key(room), encode_key(scope))
     }
 }
 

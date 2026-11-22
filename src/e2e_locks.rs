@@ -29,7 +29,7 @@ impl Wire {
     async fn connect(url: &str, room: &str, pid: &str) -> Wire {
         let (tx, heard) = unbounded_channel();
         let mut builder = ClientBuilder::new(url.to_owned()).reconnect(false).transport_type(TransportType::Websocket);
-        for event in ["op", "lock_granted", "lock_denied", "lock_released", "joined"] {
+        for event in ["op", "lock_granted", "lock_denied", "lock_released", "lock_lost", "error", "joined"] {
             let tx = tx.clone();
             builder = builder.on(event, move |payload, _| {
                 let tx = tx.clone();
@@ -69,6 +69,20 @@ impl Wire {
 
     async fn submit(&self, local: u64, params: Value) {
         self.send("submit", json!({ "local": local, "command": craft_collab::CRDT_TEXT, "params": params })).await;
+    }
+
+    /// An ordered edit under the grant `token` of `STRUCT`.
+    async fn submit_fenced(&self, local: u64, params: Value, token: u64) {
+        let fence = json!({ "scope": STRUCT, "token": token });
+        self.send("submit", json!({ "local": local, "command": craft_collab::CRDT_TEXT, "params": params, "fence": fence })).await;
+    }
+
+    /// Ask for `STRUCT` and return the grant's fencing token.
+    async fn take(&mut self) -> u64 {
+        self.send("lock", json!({ "scope": STRUCT })).await;
+        let granted = self.next("lock_granted").await;
+        assert!(granted["lease_ms"].as_u64().is_some_and(|ms| ms > 0), "the grant names no lease: {granted}");
+        granted["token"].as_u64().expect("the grant carries a fencing token")
     }
 }
 
@@ -206,4 +220,106 @@ async fn a_grant_waits_for_an_op_that_is_being_ordered() {
 
     let granted = seq_in(&b.next("lock_granted").await);
     assert!(granted >= seq && seq > before, "grant seq {granted} does not count the op {seq}");
+}
+
+/// The fencing tests' lease: short, so a test can let one lapse.
+const SHORT_LEASE: Duration = Duration::from_millis(1000);
+
+/// A holder frozen past its lease, whose scope was granted to another peer since, is refused
+/// when it wakes and submits under its old grant: code `fenced`, its counter echoed, nothing
+/// numbered. The new holder's edit under the new grant is ordered, and is the only op anyone
+/// sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_paused_holder_is_fenced_out_once_its_lease_went_to_another() {
+    let Some(h) = start().await else { return };
+    h.relay.bus.lock().await.set_lock_ttl(SHORT_LEASE);
+    let (room, mut a, mut b) = pair(&h, "fence-paused").await;
+    let old = a.take().await;
+    // A sends a fenced edit while it holds the grant: ordered.
+    let mut text = Replica::seeded(1, "hello");
+    a.submit_fenced(1, text.insert(0, "a"), old).await;
+    let first = seq_in(&b.next("op").await);
+
+    // A is paused past its lease; B is granted the scope under a newer token.
+    tokio::time::sleep(SHORT_LEASE + Duration::from_millis(300)).await;
+    let new = b.take().await;
+    assert!(new > old, "the token did not grow: {old} then {new}");
+
+    let before = seq_of(&h, &room).await;
+    a.submit_fenced(2, text.insert(0, "b"), old).await;
+    let refused = a.next("error").await;
+    assert_eq!(refused["code"], "fenced", "{refused}");
+    assert_eq!(refused["local"], 2, "{refused}");
+    assert_eq!(seq_of(&h, &room).await, before, "the stale holder's edit was numbered");
+
+    let mut theirs = Replica::seeded(2, "hello");
+    b.submit_fenced(1, theirs.insert(5, "!"), new).await;
+    let op = a.next("op").await;
+    assert_eq!(op["origin"], "bob", "the next op anyone sees is not the new holder's: {op}");
+    assert!(seq_in(&op) > first);
+    assert_eq!(seq_of(&h, &room).await, before + 1);
+    // Nothing of A's refused edit was kept for a joiner either.
+    let rooms = h.relay.rooms.lock().await;
+    let since = rooms.get(&room).and_then(|r| r.since(0)).expect("the history reaches back");
+    assert!(since.iter().all(|op| op.origin == "bob" || op.local == Some(1)), "the refused edit was recorded");
+}
+
+/// A fenced unlock under a grant that is no longer current releases nothing, even from the peer
+/// that holds the scope now under a newer grant; the current grant's own unlock does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_stale_unlock_releases_nothing() {
+    let Some(h) = start().await else { return };
+    h.relay.bus.lock().await.set_lock_ttl(SHORT_LEASE);
+    let (room, mut a, mut b) = pair(&h, "fence-unlock").await;
+    let old = a.take().await;
+    tokio::time::sleep(SHORT_LEASE + Duration::from_millis(300)).await;
+    let new = b.take().await;
+
+    a.send("unlock", json!({ "scope": STRUCT, "token": old })).await;
+    // The same peer, after taking the scope again: its old grant's unlock is stale too.
+    b.send("unlock", json!({ "scope": STRUCT, "token": old })).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(lease(&h, &room).await.as_deref(), Some("bob"), "a stale unlock released the current grant");
+    assert_eq!(h.relay.rooms.lock().await.get(&room).and_then(|r| r.holder_of(STRUCT)), Some("bob"));
+
+    b.send("unlock", json!({ "scope": STRUCT, "token": new })).await;
+    b.next("lock_released").await;
+    assert_eq!(lease(&h, &room).await, None);
+}
+
+/// A holder that refreshes its lease keeps the scope past the lease's length (a long run), and
+/// its edit is ordered at the end of it; a refresh under a grant that is not current is
+/// answered with `lock_lost`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_refreshed_lease_outlives_its_length() {
+    let Some(h) = start().await else { return };
+    h.relay.bus.lock().await.set_lock_ttl(SHORT_LEASE);
+    let (room, mut a, mut b) = pair(&h, "fence-refresh").await;
+    let token = a.take().await;
+    for _ in 0..6 {
+        tokio::time::sleep(SHORT_LEASE / 3).await;
+        a.send("refresh", json!({ "scope": STRUCT, "token": token })).await;
+    }
+    // Twice the lease has passed.
+    b.send("lock", json!({ "scope": STRUCT })).await;
+    let denied = b.next("lock_denied").await;
+    assert_eq!(denied["holder"], "alice");
+    let before = seq_of(&h, &room).await;
+    a.submit_fenced(1, Replica::seeded(1, "hello").insert(0, "x"), token).await;
+    assert_eq!(seq_in(&a.next("op").await), before + 1);
+
+    a.send("refresh", json!({ "scope": STRUCT, "token": token + 1000 })).await;
+    let lost = a.next("lock_lost").await;
+    assert_eq!(lost["scope"], STRUCT);
+    assert_eq!(lost["token"], token + 1000);
+    assert_eq!(lease(&h, &room).await.as_deref(), Some("alice"), "a stale refresh changed the lease");
+
+    // Without refreshes the lease lapses, and a refresh after that is answered too.
+    tokio::time::sleep(SHORT_LEASE + Duration::from_millis(300)).await;
+    a.send("refresh", json!({ "scope": STRUCT, "token": token })).await;
+    a.next("lock_lost").await;
+    assert_eq!(lease(&h, &room).await, None, "a refresh revived a lapsed lease");
 }

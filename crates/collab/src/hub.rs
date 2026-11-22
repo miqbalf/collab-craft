@@ -132,12 +132,13 @@ impl Endpoint {
 /// Listed explicitly because a Socket.IO client registers one callback per event name, so a hub
 /// has to know the whole set before anything arrives. An event missing from here is an event
 /// nobody is listening for, which looks like a relay that connects and then says nothing.
-pub const EVENTS: [&str; 14] = [
+pub const EVENTS: [&str; 15] = [
     "joined",
     "op",
     "lock_granted",
     "lock_denied",
     "lock_released",
+    "lock_lost",
     "presence_lock",
     "presence",
     "snapshot",
@@ -180,11 +181,14 @@ pub fn emit(msg: &ClientMsg) -> (&'static str, serde_json::Value) {
     match msg {
         ClientMsg::Join { display, .. } => ("join", serde_json::json!({ "display": display })),
         ClientMsg::Leave { .. } => ("leave", serde_json::Value::Null),
-        ClientMsg::Submit { local, command, params, scope, .. } => {
-            ("submit", serde_json::json!({ "local": local, "command": command, "params": params, "scope": scope }))
-        }
+        ClientMsg::Submit { local, command, params, scope, fence, .. } => match fence {
+            Some(fence) => ("submit", serde_json::json!({ "local": local, "command": command, "params": params, "scope": scope, "fence": fence })),
+            None => ("submit", serde_json::json!({ "local": local, "command": command, "params": params, "scope": scope })),
+        },
         ClientMsg::Lock { scope, .. } => ("lock", serde_json::json!({ "scope": scope })),
-        ClientMsg::Unlock { scope, .. } => ("unlock", serde_json::json!({ "scope": scope })),
+        ClientMsg::Unlock { scope, token: Some(token), .. } => ("unlock", serde_json::json!({ "scope": scope, "token": token })),
+        ClientMsg::Unlock { scope, token: None, .. } => ("unlock", serde_json::json!({ "scope": scope })),
+        ClientMsg::Refresh { scope, token, .. } => ("refresh", serde_json::json!({ "scope": scope, "token": token })),
         ClientMsg::Resync { have, .. } => ("resync", serde_json::json!({ "have": have })),
         ClientMsg::Frame { payload, .. } => ("frame", serde_json::json!({ "payload": payload })),
         ClientMsg::Ephemeral { kind, payload, .. } => ("ephemeral", serde_json::json!({ "kind": kind, "payload": payload })),
@@ -240,7 +244,11 @@ pub(crate) enum WhileDown {
 pub(crate) fn while_down(msg: &ClientMsg) -> WhileDown {
     match msg {
         ClientMsg::Submit { command, .. } if crate::proto::is_crdt_command(command) => WhileDown::Drop,
-        ClientMsg::Saved { .. } | ClientMsg::Ephemeral { .. } | ClientMsg::Frame { .. } | ClientMsg::Resync { .. } => WhileDown::Drop,
+        // A refresh is for the link it was sent on: the relay releases a holder's locks with its
+        // link, and the next refresh is due anyway.
+        ClientMsg::Saved { .. } | ClientMsg::Ephemeral { .. } | ClientMsg::Frame { .. } | ClientMsg::Resync { .. } | ClientMsg::Refresh { .. } => {
+            WhileDown::Drop
+        }
         _ => WhileDown::Queue,
     }
 }

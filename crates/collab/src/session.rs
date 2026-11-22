@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use crate::proto::{ClientMsg, DocId, LockState, PeerId, Presence, Scope, ServerMsg};
+use crate::proto::{ClientMsg, DocId, Fence, LockState, PeerId, Presence, Scope, ServerMsg};
 
 /// Ops held past this many waiting for a gap to fill. Beyond it the session asks for a resync,
 /// because a gap that wide means something was lost rather than reordered.
@@ -37,8 +37,11 @@ pub enum Effect {
     /// Replace the whole document, then continue from `seq`.
     Replace { document: Value, seq: u64 },
     /// A lock request succeeded. The app may now edit that scope. `seq` is the room's sequence
-    /// when it was granted, when the relay says.
-    LockHeld { scope: Scope, seq: Option<u64> },
+    /// when it was granted, when the relay says; `token` the grant's fencing token and
+    /// `lease_ms` how long the lease lasts unrefreshed, when the relay fences.
+    LockHeld { scope: Scope, seq: Option<u64>, token: Option<u64>, lease_ms: Option<u64> },
+    /// This client no longer holds `scope` under `token` (a refresh found the lease gone).
+    LockLost { scope: Scope, token: u64 },
     /// A lock request failed. `holder` is who has it.
     LockRefused { scope: Scope, holder: PeerId },
     /// A scope this client held is no longer held.
@@ -189,9 +192,20 @@ impl Session {
 
     /// Give a scope back. Dropping it locally is immediate, because a release cannot be refused.
     pub fn release_lock(&mut self, scope: impl Into<Scope>) -> ClientMsg {
+        self.release_grant(scope, None)
+    }
+
+    /// Give back the grant of `scope` with fencing token `token` (any grant of this peer's when
+    /// `None`). The relay releases nothing for a token that is not the current grant's.
+    pub fn release_grant(&mut self, scope: impl Into<Scope>, token: Option<u64>) -> ClientMsg {
         let scope = scope.into();
         self.held.remove(&scope);
-        ClientMsg::Unlock { doc: self.doc.clone(), scope }
+        ClientMsg::Unlock { doc: self.doc.clone(), scope, token }
+    }
+
+    /// Extend the lease on `scope`, held under `token`.
+    pub fn refresh_lock(&self, scope: impl Into<Scope>, token: u64) -> ClientMsg {
+        ClientMsg::Refresh { doc: self.doc.clone(), scope: scope.into(), token }
     }
 
     /// Offer a local edit for ordering.
@@ -202,7 +216,18 @@ impl Session {
     pub fn submit(&mut self, command: impl Into<String>, params: Value, scope: Option<Scope>) -> ClientMsg {
         self.local += 1;
         self.inflight.insert(self.local);
-        ClientMsg::Submit { doc: self.doc.clone(), local: self.local, command: command.into(), params, scope }
+        ClientMsg::Submit { doc: self.doc.clone(), local: self.local, command: command.into(), params, scope, fence: None }
+    }
+
+    /// Offer an ordered edit: ordered only while this client holds `fence.scope` under
+    /// `fence.token`, refused with [`crate::FENCED`] otherwise. Lock-free in the sense of
+    /// [`Session::submit_crdt`] (no `scope`); the fence is what guards it.
+    pub fn submit_fenced(&mut self, command: impl Into<String>, params: Value, fence: Option<Fence>) -> ClientMsg {
+        let mut msg = self.submit(command, params, None);
+        if let ClientMsg::Submit { fence: f, .. } = &mut msg {
+            *f = fence;
+        }
+        msg
     }
 
     /// Offer a CRDT operation. Always lock-free: `scope` is omitted even if the
@@ -283,10 +308,15 @@ impl Session {
                 vec![Effect::Replace { document, seq }]
             }
 
-            ServerMsg::LockGranted { scope, seq, .. } => {
+            ServerMsg::LockGranted { scope, seq, token, lease_ms, .. } => {
                 self.remote_locks.remove(&scope);
                 self.held.insert(scope.clone());
-                vec![Effect::LockHeld { scope, seq }]
+                vec![Effect::LockHeld { scope, seq, token, lease_ms }]
+            }
+
+            ServerMsg::LockLost { scope, token, .. } => {
+                self.held.remove(&scope);
+                vec![Effect::LockLost { scope, token }]
             }
 
             ServerMsg::LockDenied { scope, holder, .. } => {
@@ -327,7 +357,8 @@ impl Session {
 
             ServerMsg::Error { detail, local, code, .. } => match local {
                 // A transient failure is not news for the user: the edit is sent again.
-                Some(local) if code.as_deref() == Some(crate::proto::RETRY) => {
+                // Nor is a fenced refusal: the caller says what it means for the run.
+                Some(local) if code.as_deref() == Some(crate::proto::RETRY) || code.as_deref() == Some(crate::proto::FENCED) => {
                     self.inflight.remove(&local);
                     vec![Effect::SubmitRefused { local, detail, code }]
                 }

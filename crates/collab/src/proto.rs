@@ -65,6 +65,12 @@ pub const REFUSED_SCHEMA: &str = "schema";
 /// the connection itself ([`ServerMsg::refuses_connection`]).
 pub const RETRY: &str = "retry";
 
+/// [`ServerMsg::Error`] `code` on a refused fenced submit ([`ClientMsg::Submit::fence`]): this
+/// peer does not hold the fence's scope under its token now (the lease lapsed, or the scope was
+/// granted again since). Nothing was ordered, and the token never becomes current again, so a
+/// resend cannot help. [`crate::Live`] drops the run's edits and goes back to the room's state.
+pub const FENCED: &str = "fenced";
+
 /// Insert or move a sibling by fractional key. Payload is a position change.
 pub const CRDT_POS: &str = "crdt.pos";
 
@@ -74,6 +80,15 @@ pub struct Presence {
     pub peer: PeerId,
     /// Shown in the UI. A display name, not an identity.
     pub display: String,
+}
+
+/// The lock an ordered edit is made under: the scope, and the fencing token of the grant
+/// ([`ServerMsg::LockGranted::token`]). The relay orders a submit carrying one only while the
+/// sender holds `scope` under `token`, and refuses it with [`FENCED`] otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fence {
+    pub scope: Scope,
+    pub token: u64,
 }
 
 /// A held lock, as the relay sees it.
@@ -105,11 +120,25 @@ pub enum ClientMsg {
         /// `crdt.*` commands; the relay strips it if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<Scope>,
+        /// Set on an ordered edit: the relay orders it only while this peer holds the fence's
+        /// scope under its token, and refuses it with [`FENCED`] otherwise. Unlike `scope`, kept
+        /// on `crdt.*` commands. Absent on a free edit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence: Option<Fence>,
     },
     /// Ask for a scope. Answered by [`ServerMsg::LockGranted`] or [`ServerMsg::LockDenied`].
     Lock { doc: DocId, scope: Scope },
-    /// Give a scope back.
-    Unlock { doc: DocId, scope: Scope },
+    /// Give a scope back. With `token` only that grant is released, so a stale unlock cannot
+    /// release a newer grant (to another peer, or to this one again).
+    Unlock {
+        doc: DocId,
+        scope: Scope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<u64>,
+    },
+    /// Extend the lease on `scope`, held under `token`, while an ordered run goes on. Answered
+    /// only when the lease is no longer this grant's, with [`ServerMsg::LockLost`].
+    Refresh { doc: DocId, scope: Scope, token: u64 },
     /// Ask for everything after `have`. The relay answers with ops, or with
     /// [`ServerMsg::Snapshot`] when it can no longer reach that far back.
     Resync { doc: DocId, have: u64 },
@@ -249,6 +278,14 @@ pub enum ServerMsg {
         /// The room's sequence when the lock was granted. Absent from an older relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seq: Option<u64>,
+        /// The grant's fencing token, higher than every earlier grant's for this scope. Edits
+        /// made under the lock carry it ([`Fence`]). Absent from a relay that does not fence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<u64>,
+        /// How long the lease lasts without a refresh, in milliseconds. Absent from an older
+        /// relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_ms: Option<u64>,
     },
     /// Refused, with whoever holds it so the UI can say who.
     LockDenied {
@@ -259,6 +296,13 @@ pub enum ServerMsg {
     LockReleased {
         doc: DocId,
         scope: Scope,
+    },
+    /// This peer no longer holds `scope` under `token`: a [`ClientMsg::Refresh`] found the
+    /// lease lapsed or granted again. Sent to that peer alone.
+    LockLost {
+        doc: DocId,
+        scope: Scope,
+        token: u64,
     },
     /// Somebody else in the room took a scope.
     ///
@@ -324,6 +368,7 @@ impl ServerMsg {
             | ServerMsg::LockGranted { doc, .. }
             | ServerMsg::LockDenied { doc, .. }
             | ServerMsg::LockReleased { doc, .. }
+            | ServerMsg::LockLost { doc, .. }
             | ServerMsg::PresenceLock { doc, .. }
             | ServerMsg::Presence { doc, .. }
             | ServerMsg::Snapshot { doc, .. }

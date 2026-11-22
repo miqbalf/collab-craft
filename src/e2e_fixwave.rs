@@ -389,7 +389,7 @@ async fn e2e_an_editor_may_not_report_a_save() {
 
     // A checkpoint snapshot from the editor is refused the same way, as before.
     let snapshot = serde_json::to_value(TextPayload::snapshot(&w.live.doc().unwrap().state())).unwrap();
-    editor.send(ClientMsg::Submit { doc, local: 1, command: craft_collab::CRDT_TEXT.to_owned(), params: snapshot, scope: None }).expect("sent");
+    editor.send(ClientMsg::Submit { doc, local: 1, command: craft_collab::CRDT_TEXT.to_owned(), params: snapshot, scope: None, fence: None }).expect("sent");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(editor.poll().iter().any(|m| matches!(m, ServerMsg::Error { local: Some(1), .. })));
 }

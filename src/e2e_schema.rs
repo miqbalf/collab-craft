@@ -103,6 +103,7 @@ fn text_op(doc: &str, local: u64, op: &str) -> ClientMsg {
         command: craft_collab::CRDT_TEXT.to_owned(),
         params: serde_json::json!({ "scope": craft_collab::DOC_SCOPE, "ops": [op] }),
         scope: None,
+        fence: None,
     }
 }
 

@@ -312,8 +312,8 @@ fn a_snapshot_replaces_everything_and_resets() {
 #[test]
 fn a_granted_lock_is_held() {
     let mut s = session();
-    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
-    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: None }]);
+    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None, token: None, lease_ms: None });
+    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: None, token: None, lease_ms: None }]);
     assert!(s.holds("B2"));
     assert!(s.may_edit("B2"));
 }
@@ -321,14 +321,14 @@ fn a_granted_lock_is_held() {
 #[test]
 fn a_grant_carries_the_room_seq_into_the_effect() {
     let mut s = session();
-    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: Some(7) });
-    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: Some(7) }]);
+    let out = s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: Some(7), token: None, lease_ms: None });
+    assert_eq!(out, vec![Effect::LockHeld { scope: "B2".to_owned(), seq: Some(7), token: None, lease_ms: None }]);
 }
 
 #[test]
 fn lock_granted_without_seq_still_parses() {
     let m = decode(&format!(r#"{{"t":"lock_granted","doc":"{DOC}","scope":"B2"}}"#)).expect("decodes");
-    assert_eq!(m, ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
+    assert_eq!(m, ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None, token: None, lease_ms: None });
     let text = encode_server(&m);
     assert!(!text.contains("seq"), "an absent seq is omitted: {text}");
 }
@@ -346,10 +346,10 @@ fn a_denied_lock_records_the_holder() {
 #[test]
 fn releasing_a_lock_drops_it_locally_at_once() {
     let mut s = session();
-    s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None });
+    s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None, token: None, lease_ms: None });
     let msg = s.release_lock("B2");
     assert!(!s.holds("B2"), "a release cannot be refused, so it applies immediately");
-    assert_eq!(msg, ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned() });
+    assert_eq!(msg, ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned(), token: None });
 }
 
 #[test]
@@ -403,9 +403,10 @@ fn client_messages_round_trip() {
             command: "cell.set".to_owned(),
             params: json!({"cell": "B2"}),
             scope: Some("B2".to_owned()),
+            fence: None,
         },
         ClientMsg::Lock { doc: DOC.to_owned(), scope: "B2".to_owned() },
-        ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned() },
+        ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned(), token: None },
         ClientMsg::Resync { doc: DOC.to_owned(), have: 12 },
     ];
     for m in msgs {
@@ -420,7 +421,7 @@ fn server_messages_round_trip() {
     let msgs = vec![
         joined(3),
         op(4, "bob", Some(1), "B2"),
-        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None },
+        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None, token: None, lease_ms: None },
         ServerMsg::LockDenied { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "bob".to_owned() },
         ServerMsg::LockReleased { doc: DOC.to_owned(), scope: "B2".to_owned() },
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
@@ -442,7 +443,7 @@ fn the_tag_field_is_what_discriminates() {
 
 #[test]
 fn an_absent_scope_is_omitted_from_the_wire() {
-    let m = ClientMsg::Submit { doc: DOC.to_owned(), local: 1, command: "c".to_owned(), params: json!({}), scope: None };
+    let m = ClientMsg::Submit { doc: DOC.to_owned(), local: 1, command: "c".to_owned(), params: json!({}), scope: None, fence: None };
     let text = encode(&m).expect("encodes");
     assert!(!text.contains("scope"), "None must not serialise a null: {text}");
 }
@@ -478,9 +479,10 @@ fn every_client_message_has_an_event_name() {
             command: "cell.set".to_owned(),
             params: json!({"cell": "B2"}),
             scope: Some("B2".to_owned()),
+            fence: None,
         },
         ClientMsg::Lock { doc: DOC.to_owned(), scope: "B2".to_owned() },
-        ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned() },
+        ClientMsg::Unlock { doc: DOC.to_owned(), scope: "B2".to_owned(), token: None },
         ClientMsg::Resync { doc: DOC.to_owned(), have: 9 },
         ClientMsg::Frame { doc: DOC.to_owned(), payload: "c2lnbmVk".to_owned() },
         ClientMsg::Ephemeral { doc: DOC.to_owned(), kind: "camera".to_owned(), payload: json!({"eye": [0, 0, 1]}) },
@@ -497,6 +499,7 @@ fn a_submit_carries_the_command_the_parameters_the_scope_and_the_local_counter()
         command: "cell.set".to_owned(),
         params: json!({"cell": "B2"}),
         scope: Some("B2".to_owned()),
+        fence: None,
     };
     let (event, body) = emit(&msg);
     assert_eq!(event, "submit");
@@ -518,9 +521,10 @@ fn every_event_name_carries_exactly_one_server_message() {
     let msgs = vec![
         joined(0),
         op(1, "other", None, "B2"),
-        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None },
+        ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "B2".to_owned(), seq: None, token: None, lease_ms: None },
         ServerMsg::LockDenied { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::LockReleased { doc: DOC.to_owned(), scope: "B2".to_owned() },
+        ServerMsg::LockLost { doc: DOC.to_owned(), scope: "B2".to_owned(), token: 3 },
         ServerMsg::PresenceLock { doc: DOC.to_owned(), scope: "B2".to_owned(), holder: "other".to_owned() },
         ServerMsg::Presence { doc: DOC.to_owned(), roster: Vec::new() },
         ServerMsg::Snapshot { doc: DOC.to_owned(), seq: 9, document: json!({}) },
@@ -586,4 +590,60 @@ fn a_relay_url_names_its_socket_io_path() {
 
 fn encode_server(m: &ServerMsg) -> String {
     serde_json::to_string(m).expect("encodes")
+}
+
+// ---- fencing ---------------------------------------------------------------
+
+#[test]
+fn a_fenced_grant_carries_its_token_and_lease() {
+    let m = receive("lock_granted", json!({ "doc": DOC, "scope": "grid/struct", "seq": 4, "token": 9, "lease_ms": 60000 })).expect("reads");
+    let mut s = session();
+    assert_eq!(
+        s.handle(m),
+        vec![Effect::LockHeld { scope: "grid/struct".to_owned(), seq: Some(4), token: Some(9), lease_ms: Some(60_000) }]
+    );
+}
+
+#[test]
+fn a_fenced_submit_names_its_fence_on_the_wire_and_a_free_one_does_not() {
+    let mut s = session();
+    let fence = crate::Fence { scope: "grid/struct".to_owned(), token: 9 };
+    let (event, body) = emit(&s.submit_fenced(crate::CRDT_TEXT, json!({ "ops": [] }), Some(fence.clone())));
+    assert_eq!(event, "submit");
+    assert_eq!(body["fence"], json!({ "scope": "grid/struct", "token": 9 }));
+    assert!(body["scope"].is_null(), "a fence is not a scope");
+    let (_, free) = emit(&s.submit_crdt(crate::CRDT_TEXT, json!({ "ops": [] })));
+    assert!(free.get("fence").is_none(), "a free edit named a fence: {free}");
+    let msg = s.submit_fenced(crate::CRDT_TEXT, json!({}), Some(fence));
+    assert_eq!(decode_client(&encode(&msg).expect("encodes")), msg);
+}
+
+fn decode_client(text: &str) -> ClientMsg {
+    serde_json::from_str(text).expect("decodes")
+}
+
+#[test]
+fn unlock_carries_the_grant_token_and_refresh_names_it() {
+    let mut s = session();
+    assert_eq!(emit(&s.release_grant("grid/struct", Some(9))), ("unlock", json!({ "scope": "grid/struct", "token": 9 })));
+    assert_eq!(emit(&s.release_lock("grid/struct")), ("unlock", json!({ "scope": "grid/struct" })));
+    assert_eq!(emit(&s.refresh_lock("grid/struct", 9)), ("refresh", json!({ "scope": "grid/struct", "token": 9 })));
+}
+
+#[test]
+fn a_lost_lock_and_a_fenced_refusal_reach_the_caller_alone() {
+    assert!(EVENTS.contains(&"lock_lost"));
+    let mut s = session();
+    s.handle(ServerMsg::LockGranted { doc: DOC.to_owned(), scope: "grid/struct".to_owned(), seq: None, token: Some(3), lease_ms: None });
+    let lost = receive("lock_lost", json!({ "doc": DOC, "scope": "grid/struct", "token": 3 })).expect("reads");
+    assert_eq!(s.handle(lost), vec![Effect::LockLost { scope: "grid/struct".to_owned(), token: 3 }]);
+    assert!(!s.holds("grid/struct"));
+    // A fenced refusal is the caller's to explain: no notice of its own.
+    let refused =
+        ServerMsg::Error { doc: DOC.to_owned(), detail: "you no longer hold grid/struct".to_owned(), local: Some(4), code: Some(crate::FENCED.to_owned()) };
+    assert!(refused.refuses_connection().is_none(), "a fenced refusal read as a refused connection");
+    assert_eq!(
+        s.handle(refused),
+        vec![Effect::SubmitRefused { local: 4, detail: "you no longer hold grid/struct".to_owned(), code: Some(crate::FENCED.to_owned()) }]
+    );
 }
