@@ -114,3 +114,9 @@ craft-collab = { workspace = true, features = ["native-hub"] }
 # The lock e2e tests read the wire itself, for a field the client library does not name yet.
 rust_socketio = { version = "0.6", features = ["async"] }
 futures-util = "0.3"
+
+# Junk bytes that decode can trip a debug assertion or an id-range overflow inside yrs. Release
+# builds wrap and `integrate` catches panics, so keep debug builds behaving the same.
+[profile.dev.package.yrs]
+debug-assertions = false
+overflow-checks = false

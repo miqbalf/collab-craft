@@ -187,6 +187,16 @@ impl LiveDoc {
         Ok(())
     }
 
+    /// Catch up after [`needs_resync`](Self::needs_resync): replace the document with a fresh one
+    /// (same client id) built from `state`, a full state from the room, and clear the mark.
+    /// The undo history starts again. On error this replica is unchanged.
+    pub fn resync_from_state(&mut self, state: &[u8]) -> Result<(), LiveError> {
+        let doc = self.y.rebuilt_from_state(state)?;
+        let client = self.y.client();
+        *self = assemble(doc, client);
+        Ok(())
+    }
+
     /// A replica restored from a full state, such as a checkpoint snapshot.
     ///
     /// Like [`seeded`](Self::seeded) it has no client id yet, so local edits wait for

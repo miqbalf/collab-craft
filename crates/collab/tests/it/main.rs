@@ -1845,3 +1845,25 @@ fn livedoc_shuffled_delivery_equals_in_order_delivery() {
         }
     }
 }
+
+/// A withheld dependency overflows the held buffer; `resync_from_state` then rebuilds the
+/// replica from the author's full state and it converges.
+#[test]
+fn livedoc_withheld_dependency_raises_resync_and_a_rebuild_converges() {
+    let mut author = replica(&sample(), 1);
+    let mut updates = Vec::new();
+    for i in 0..2200 {
+        updates.push(author.insert_text(1, 0, &format!("{}", i % 10), &Map::new()).unwrap());
+    }
+    let mut d = replica(&sample(), 2);
+    for u in &updates[1..] {
+        d.apply(u).unwrap();
+    }
+    assert!(d.needs_resync());
+    assert!(!d.damaged());
+    d.resync_from_state(&author.state()).unwrap();
+    assert!(!d.needs_resync());
+    assert_eq!(d.block(1), author.block(1));
+    assert_eq!(d.order(), author.order());
+    d.insert_text(1, 0, "!", &Map::new()).unwrap();
+}

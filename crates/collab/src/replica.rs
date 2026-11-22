@@ -146,7 +146,7 @@ impl YReplica {
 
     /// Whether updates were dropped because too many were waiting for dependencies that never
     /// came (see [`MAX_PENDING_UPDATES`]). The replica is sound but behind: ask the room for its
-    /// full state and apply it with [`apply_full_state`](Self::apply_full_state).
+    /// full state and rebuild from it with [`rebuilt_from_state`](Self::rebuilt_from_state).
     #[must_use]
     pub fn needs_resync(&self) -> bool {
         self.resync
@@ -194,15 +194,21 @@ impl YReplica {
         Ok(())
     }
 
-    /// Apply a full state (a checkpoint, or [`state`](Self::state) of a peer that is ahead) to
-    /// catch up after [`needs_resync`](Self::needs_resync). Once nothing is left held the mark
-    /// is cleared.
-    pub fn apply_full_state(&mut self, state: &[u8]) -> Result<(), LiveError> {
-        self.apply(state)?;
-        if !self.doc.transact().has_missing_updates() {
-            self.resync = false;
+    /// A fresh document with this replica's client id holding exactly `state` (a checkpoint, or
+    /// the full state of a peer that is ahead), to catch up after
+    /// [`needs_resync`](Self::needs_resync). It is built from nothing rather than applied onto
+    /// this document, because yrs's own held-update buffer is not bounded by our caps and a
+    /// stuck document would carry it along. The schema [`assemble`](Self::assemble)s the result
+    /// again with the same client, which also clears the resync mark. Refused when the state
+    /// does not decode or itself leaves updates waiting for dependencies; this replica is
+    /// unchanged then.
+    pub fn rebuilt_from_state(&self, state: &[u8]) -> Result<Doc, LiveError> {
+        let doc = build_doc(self.doc.client_id().get());
+        integrate(&doc, state).map_err(LiveError::from)?;
+        if doc.transact().has_missing_updates() {
+            return Err(LiveError::Decode);
         }
-        Ok(())
+        Ok(doc)
     }
 
     /// After an apply: retry what yrs holds when the apply advanced the state vector, then
@@ -520,6 +526,12 @@ mod tests {
         (YReplica::assemble(doc, Some(client), move |doc, undo| undo.expand_scope(doc, &t)), text)
     }
 
+    fn rebuild(doc: Doc, client: u32) -> (YReplica, yrs::TextRef) {
+        let text = doc.get_or_insert_text("t");
+        let t = text.clone();
+        (YReplica::assemble(doc, Some(client), move |doc, undo| undo.expand_scope(doc, &t)), text)
+    }
+
     fn held_bytes(y: &YReplica) -> usize {
         let txn = y.doc().transact();
         txn.store().pending_update().map_or(0, |p| p.update.encode_v1().len())
@@ -646,9 +658,11 @@ mod tests {
         // Bounded: after the drop at most the 49 updates that came since are held.
         let held = held_bytes(&y);
         assert!(held < 1024, "held {held} bytes");
-        assert!(y.apply_full_state(&state).is_ok());
+        let doc = y.rebuilt_from_state(&state).unwrap();
+        let (mut y, _) = rebuild(doc, 99);
         assert!(!y.needs_resync());
         assert!(!pending(&y));
+        let _ = &mut y;
         let (mut z, _) = peer(98);
         z.apply(&first).unwrap();
         for u in &rest {
@@ -669,9 +683,48 @@ mod tests {
         assert!(y.needs_resync(), "two of {big} bytes pass the cap");
         let held = held_bytes(&y);
         assert!(held < MAX_PENDING_BYTES, "held {held} bytes after the drop");
-        y.apply_full_state(&state).unwrap();
+        let (y, _) = rebuild(y.rebuilt_from_state(&state).unwrap(), 99);
         assert!(!y.needs_resync());
         assert_eq!(read(&y).len(), 2 + 3 * (big + 1), "all text arrived");
+    }
+
+    /// Resync builds a new document with the same client id and drops everything held.
+    #[test]
+    fn rebuild_from_state_keeps_the_client_and_refuses_junk() {
+        let (_, rest, state) = withheld(&[1, 1, 1]);
+        let (y, _) = peer(99);
+        let doc = y.rebuilt_from_state(&state).unwrap();
+        assert_eq!(doc.client_id(), y.doc().client_id());
+        assert_eq!(y.rebuilt_from_state(&[0xff, 1, 2]).err(), Some(LiveError::Decode));
+        // A state that itself waits on a missing dependency is not a full state.
+        assert_eq!(y.rebuilt_from_state(&rest[1]).err(), Some(LiveError::Decode));
+    }
+
+    /// Junk and corrupted updates, many seeds: never a panic out of `apply`, never a hang, and
+    /// whatever panics inside yrs is caught and marks the replica damaged.
+    #[test]
+    fn junk_updates_never_panic_out() {
+        let all = history(7, 3, 40);
+        let start = std::time::Instant::now();
+        for seed in 0..200_u64 {
+            let mut rng = Lcg(seed);
+            let (mut y, _) = peer(99);
+            for u in &all[..10] {
+                y.apply(u).unwrap();
+            }
+            let mut junk = all[rng.below(all.len())].clone();
+            if seed % 3 == 0 {
+                junk = (0..rng.below(64) + 1).map(|_| u8::try_from(rng.below(256)).unwrap()).collect();
+            } else {
+                for _ in 0..=rng.below(4) {
+                    let at = rng.below(junk.len());
+                    junk[at] = u8::try_from(rng.below(256)).unwrap();
+                }
+            }
+            let _ = y.apply(&junk);
+            let _ = y.state();
+        }
+        assert!(start.elapsed().as_secs() < 30, "junk took {:?}", start.elapsed());
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.
