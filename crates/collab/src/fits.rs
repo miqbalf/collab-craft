@@ -112,25 +112,25 @@ fn class_of_byte(b: u8) -> Class {
 /// #749). No Craft app nests more than a few levels.
 pub(crate) const MAX_NESTING: usize = 64;
 
-/// The most items one check takes; past it, an update is refused as too large to check
-/// ([`too_many`]), not as content that does not fit.
+/// The most blocks an update from a peer may hold; past it, the walk stops listing them
+/// (before allocating more) and the update is refused as too large to check, not as content
+/// that does not fit. See [`MAX_STATE_ITEMS`] for checkpoints.
 ///
-/// Sized so no update an honest peer can send reaches it. Every v1 block costs at least two
-/// bytes (a GC or skip block: info and length; an item: info, origin and content), so an update
-/// holds at most half its length in blocks. The largest the relay carries is one client frame
-/// (16 MiB, a checkpoint of the largest document it retains), at most 8.4 M blocks; held
-/// updates add at most 1 MiB (0.5 M). A 1 MiB document, or a 1 MiB offline batch or seed, has
-/// tens of thousands. 2^24 (16.8 M) is past all of these. What it bounds is a check's work:
-/// a few ordered-map lookups per item, about 1 µs each in release.
-pub(crate) const MAX_ITEMS: usize = 1 << 24;
+/// Measured on honest updates (`replica::tests::honest_updates_stay_far_below_the_item_caps`):
+/// a 1 MiB offline bundle of single-letter edits at scattered places, and a 1 MiB paste of
+/// short paragraphs, each hold well under 2^20; see the report for the numbers. Every block
+/// costs at least two bytes, so a hostile 16 MiB update could list 8.4 M; this cap stops it
+/// at 2^20 (about 100 MiB of listing at most, under a second).
+pub(crate) const MAX_ITEMS: usize = 1 << 20;
 
-/// Whether `items` are past what one check takes ([`MAX_ITEMS`]).
-pub(crate) fn too_many(items: usize) -> bool {
-    if items > MAX_ITEMS {
-        log::warn!("collab: an update of {items} items is past the {MAX_ITEMS} a check takes; refused as too large");
-        return true;
-    }
-    false
+/// The most blocks a checkpoint snapshot (a full state the document service wrote; the relay
+/// orders snapshots only from it) or a restore from one may hold. Higher than [`MAX_ITEMS`]
+/// because a checkpoint holds the whole document, up to the 16 MiB the relay retains.
+pub(crate) const MAX_STATE_ITEMS: usize = 1 << 22;
+
+/// Log that an update was past `cap` blocks; it is refused as too large.
+pub(crate) fn too_many(cap: usize) {
+    log::warn!("collab: an update is past the {cap} blocks a check takes; refused as too large");
 }
 
 /// Whether content of kind `kind` may go under `class` (`keyed`: as a map entry of it).
@@ -330,8 +330,8 @@ pub(crate) fn check<T: ReadTxn>(txn: &T, items: &[Placed], seen: &mut Seen) -> V
     let sv = txn.state_vector();
     let items = trimmed(items, &sv);
     seen.staged.clear();
-    // The callers ask [`too_many`] first and report it as such; this is the backstop.
-    if items.len() > MAX_ITEMS {
+    // The callers walk under a cap first and report it as too large; this is the backstop.
+    if items.len() > MAX_STATE_ITEMS {
         return Verdict::Refused;
     }
     let mut ctx = Ctx { txn, sv, seen, rebuilt: false };

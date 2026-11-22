@@ -2017,20 +2017,27 @@ mod relay_proto {
     const ARRAY: [u8; 13] = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
     const STRING_IN_ARRAY: [u8; 12] = [1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
 
-    /// The shadow copy refuses a submit whose second update does not fit, and keeps none of it:
-    /// the updates are tried one at a time, as replicas apply them, and the first is rolled
-    /// back, so a resend of the first alone lands.
+    /// A document-scope submit carries one update (every client sends one). Two are refused
+    /// before the copy is touched, so a submit of a valid and an invalid update costs no
+    /// rebuild however often a user sends it, over any number of reconnects.
     #[tokio::test]
-    async fn the_shadow_keeps_a_submit_whole_or_not_at_all() {
+    async fn a_document_submit_of_two_updates_is_refused_without_a_rebuild() {
         use crate::ShadowStop;
-        use craft_collab::shadow::{Shadow, ShadowRefusal};
+        use craft_collab::shadow::ShadowRefusal;
         let gates = crate::Gates::default();
         let mut gate = crate::Gate::default();
-        let refused = crate::admit_on_shadow(&gates, &mut gate, "c", None, vec![ARRAY.to_vec(), STRING_IN_ARRAY.to_vec()]).await;
-        assert_eq!(refused, Err(ShadowStop::Refused(ShadowRefusal::Invalid)));
+        assert!(crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await.is_ok());
+        let state = gate.shadow.as_ref().expect("a copy").state();
+        for _ in 0..10 {
+            let refused = crate::admit_on_shadow(&gates, &mut gate, ("r", "eve"), None, vec![ARRAY.to_vec(), STRING_IN_ARRAY.to_vec()], false).await;
+            assert_eq!(refused, Err(ShadowStop::Refused(ShadowRefusal::Invalid)));
+        }
         let shadow = gate.shadow.as_ref().expect("a copy");
-        assert_eq!(shadow.state(), Shadow::new(None).state(), "the first update was kept");
-        assert!(crate::admit_on_shadow(&gates, &mut gate, "c", None, vec![ARRAY.to_vec()]).await.is_ok());
+        assert_eq!((shadow.rebuilds(), shadow.state()), (0, state), "the copy was touched");
+        // A single update that does not fit is refused before yrs sees it: no rebuild either.
+        let refused = crate::admit_on_shadow(&gates, &mut gate, ("r", "eve"), None, vec![STRING_IN_ARRAY.to_vec()], false).await;
+        assert!(matches!(refused, Err(ShadowStop::Refused(_))), "{refused:?}");
+        assert_eq!(gate.shadow.as_ref().map(craft_collab::shadow::Shadow::rebuilds), Some(0));
     }
 
     /// Only the document scope is copied: replicas ignore other scopes, so a peer that invents
@@ -2046,28 +2053,38 @@ mod relay_proto {
         }
     }
 
-    /// A connection whose ops cost the copy rebuilds is paused alone: the room's other
-    /// connections go on, and rollbacks the relay makes (the bus did not answer) count against
-    /// nobody.
+    /// Strikes are kept per room and user, not per socket: a user that struck MAX_STRIKES
+    /// times is paused in that room whatever connection it sends from, and only there; the
+    /// room's other users go on, and rollbacks the relay makes (the bus did not answer) count
+    /// against nobody.
     #[tokio::test]
-    async fn a_connection_whose_ops_cost_rebuilds_is_paused_alone() {
+    async fn a_user_whose_ops_cost_rebuilds_is_paused_in_that_room_alone() {
         use crate::{MAX_STRIKES, ShadowStop};
         let gates = crate::Gates::default();
         let mut gate = crate::Gate::default();
         for _ in 0..2 * MAX_STRIKES {
-            let mark = crate::admit_on_shadow(&gates, &mut gate, "alice", None, vec![ARRAY.to_vec()]).await.expect("lands");
+            let mark = crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await.expect("lands");
             crate::unadmit(&gates, &mut gate, mark);
         }
+        assert!(gates.strikes().is_empty(), "a relay rollback struck");
+        let now = std::time::Instant::now();
         for _ in 0..MAX_STRIKES {
-            let refused = crate::admit_on_shadow(&gates, &mut gate, "eve", None, vec![ARRAY.to_vec(), STRING_IN_ARRAY.to_vec()]).await;
-            assert!(matches!(refused, Err(ShadowStop::Refused(_))), "{refused:?}");
+            crate::strike(&gates, ("r".to_owned(), "eve".to_owned()), now);
         }
-        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, "eve", None, vec![ARRAY.to_vec()]).await, Err(ShadowStop::Busy));
-        assert!(crate::admit_on_shadow(&gates, &mut gate, "alice", None, vec![ARRAY.to_vec()]).await.is_ok(), "another connection was paused");
-        if let Some(s) = gate.strikes.get_mut("eve") {
+        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, ("r", "eve"), None, vec![ARRAY.to_vec()], false).await, Err(ShadowStop::Busy));
+        assert!(
+            crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await.is_ok(),
+            "another user was paused"
+        );
+        let mut elsewhere = crate::Gate::default();
+        assert!(
+            crate::admit_on_shadow(&gates, &mut elsewhere, ("s", "eve"), None, vec![ARRAY.to_vec()], false).await.is_ok(),
+            "another room was paused"
+        );
+        if let Some(s) = gates.strikes().get_mut(&("r".to_owned(), "eve".to_owned())) {
             s.paused_until = Some(std::time::Instant::now());
         }
-        assert!(crate::admit_on_shadow(&gates, &mut gate, "eve", None, vec![ARRAY.to_vec()]).await.is_ok(), "the pause ends");
+        assert!(crate::admit_on_shadow(&gates, &mut gate, ("r", "eve"), None, vec![ARRAY.to_vec()], false).await.is_ok(), "the pause ends");
     }
 
     fn big_state() -> Vec<u8> {
@@ -2078,36 +2095,78 @@ mod relay_proto {
         big.transact().encode_state_as_update_v1(&craft_collab::yrs::StateVector::default())
     }
 
-    /// The caps never refuse an op as invalid and never stop other rooms: an op past the room
-    /// cap alone is too large; a room past its cap waits (`retry`); past the relay-wide cap only
-    /// a room above its fair share waits, and the others go on. The total follows each copy.
+    /// A text of `bytes` letters, as one full state.
+    fn text_state(bytes: usize) -> Vec<u8> {
+        use craft_collab::yrs::{ReadTxn, Text, Transact};
+        let doc = craft_collab::YReplica::seed_doc();
+        let t = doc.get_or_insert_text("t");
+        t.insert(&mut doc.transact_mut(), 0, &"x".repeat(bytes));
+        doc.transact().encode_state_as_update_v1(&craft_collab::yrs::StateVector::default())
+    }
+
+    /// The caps never refuse an op as invalid: an op past the room cap alone is too large; a
+    /// room past its cap waits (`retry`); and the relay-wide total follows each copy.
     #[tokio::test]
-    async fn the_shadow_byte_caps_refuse_for_now_and_only_the_room_over() {
+    async fn the_shadow_byte_caps_refuse_for_now() {
         use crate::ShadowStop;
         use std::sync::atomic::Ordering::Relaxed;
         let state = big_state();
         let gates = crate::Gates::new(true, state.len() - 1, 1 << 30);
         let mut gate = crate::Gate::default();
-        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, "c", None, vec![state.clone()]).await, Err(ShadowStop::TooLarge), "the op alone");
+        assert_eq!(
+            crate::admit_on_shadow(&gates, &mut gate, ("r", "c"), None, vec![state.clone()], false).await,
+            Err(ShadowStop::TooLarge),
+            "the op alone"
+        );
         let gates = crate::Gates::new(true, state.len() + 10, 1 << 30);
-        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, "c", None, vec![state.clone()]).await, Err(ShadowStop::Busy), "the room cap");
+        assert_eq!(
+            crate::admit_on_shadow(&gates, &mut gate, ("r", "c"), None, vec![state.clone()], false).await,
+            Err(ShadowStop::Busy),
+            "the room cap"
+        );
 
-        // Ten rooms hold 10 000 bytes against a cap of 1 000: each one's share is 100.
-        let gates = crate::Gates::new(true, 1 << 20, 1_000);
-        gates.shadow_bytes.fetch_add(10_000, Relaxed);
-        gates.shadowed.fetch_add(9, Relaxed);
-        let (mut large, mut small) = (crate::Gate::default(), crate::Gate::default());
-        assert_eq!(crate::admit_on_shadow(&gates, &mut large, "c", None, vec![state.clone()]).await, Err(ShadowStop::Busy), "above its share");
-        assert!(crate::admit_on_shadow(&gates, &mut small, "c", None, vec![ARRAY.to_vec()]).await.is_ok(), "a small room was stopped");
-
-        let (gates, mut gate) = (crate::Gates::default(), crate::Gate::default());
-        assert!(crate::admit_on_shadow(&gates, &mut gate, "c", None, vec![state]).await.is_ok());
+        let (gates, mut gate) = (crate::Gates::default().with_floor(16), crate::Gate::default());
+        assert!(crate::admit_on_shadow(&gates, &mut gate, ("r", "c"), None, vec![state], false).await.is_ok());
         let held = gates.shadow_bytes.load(Relaxed);
         assert!(held > 0 && held == gate.bytes, "{held} vs {}", gate.bytes);
-        assert_eq!(gates.shadowed.load(Relaxed), 1);
+        assert_eq!(gates.over_floor.load(Relaxed), 1);
         crate::lose_copy(&gates, &mut gate, "test");
-        assert_eq!((gates.shadow_bytes.load(Relaxed), gates.shadowed.load(Relaxed)), (0, 0));
+        assert_eq!((gates.shadow_bytes.load(Relaxed), gates.over_floor.load(Relaxed)), (0, 0));
         assert!(crate::SHADOW_LOST.load(Relaxed) >= 1, "a lost copy is counted");
+    }
+
+    /// No room of ordinary size waits because of other rooms. With a thousand small rooms and
+    /// a few large ones past the relay-wide cap, a room with a 1 MiB document (a copy of about
+    /// 2 MiB, under the floor) has its ops taken; the small rooms do not count toward the
+    /// share; and past the cap only a copy over the floor and its share waits.
+    #[tokio::test]
+    async fn an_ordinary_room_goes_on_whatever_other_rooms_hold() {
+        use crate::ShadowStop;
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let gates = crate::Gates::new(true, 1 << 30, 64 * MIB);
+        let mut small: Vec<crate::Gate> = (0..1000).map(|_| crate::Gate::default()).collect();
+        for (n, gate) in small.iter_mut().enumerate() {
+            let room = format!("tiny-{n}");
+            assert!(crate::admit_on_shadow(&gates, gate, (&room, "mallory"), None, vec![ARRAY.to_vec()], false).await.is_ok());
+        }
+        assert_eq!(gates.over_floor.load(Relaxed), 0, "small rooms count toward the share");
+        // Three large rooms, together far past the cap.
+        gates.shadow_bytes.fetch_add(3 * 256 * MIB, Relaxed);
+        gates.over_floor.fetch_add(3, Relaxed);
+
+        let mut ordinary = crate::Gate::default();
+        let who = ("ordinary", "alice");
+        assert!(crate::admit_on_shadow(&gates, &mut ordinary, who, None, vec![text_state(MIB)], false).await.is_ok(), "the document");
+        assert!(ordinary.bytes >= 2 * MIB && ordinary.bytes <= gates.floor, "{}", ordinary.bytes);
+        assert!(crate::admit_on_shadow(&gates, &mut ordinary, who, None, vec![ARRAY.to_vec()], false).await.is_ok(), "an edit");
+
+        // With a floor under that copy, it is one of the largest and past its share: it waits.
+        let gates = crate::Gates::new(true, 1 << 30, 8 * MIB).with_floor(MIB);
+        gates.shadow_bytes.fetch_add(3 * 256 * MIB, Relaxed);
+        gates.over_floor.fetch_add(3, Relaxed);
+        let mut large = crate::Gate::default();
+        assert_eq!(crate::admit_on_shadow(&gates, &mut large, who, None, vec![text_state(2 * MIB)], false).await, Err(ShadowStop::Busy));
     }
 
     /// The room is asked before the copy: what it would refuse (read-only, too large) never

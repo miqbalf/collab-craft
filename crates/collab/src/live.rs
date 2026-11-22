@@ -1284,10 +1284,12 @@ impl<H: Hub, R: Replica> Live<H, R> {
         // seeded once the room is known to have checkpointed past it. So is the first one a
         // replica waiting after a lost history sees.
         let restart = restart || (snap && self.awaiting_snapshot);
+        // Whether `updates` still starts with the snapshot (checked under the state cap).
+        let mut snapshot_first = snap && !updates.is_empty();
         if snap && !updates.is_empty() && (restart || self.doc.is_none()) {
             let snapshot = updates.remove(0);
             match self.restart_from(snapshot, &scope, work) {
-                Restart::Done => {}
+                Restart::Done => snapshot_first = false,
                 Restart::Refused => return,
                 Restart::Ordinary(snapshot) => updates.insert(0, snapshot),
             }
@@ -1319,11 +1321,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         let mut changes = Vec::new();
         let mut damaged = false;
-        for update in updates {
+        for (i, update) in updates.into_iter().enumerate() {
             if let Some(f) = self.fence.as_mut() {
                 f.record(&update);
             }
-            match doc.apply(&update) {
+            // A snapshot is the payload's only op, and holds the whole document.
+            let applied = if snapshot_first && i == 0 { doc.apply_state(&update) } else { doc.apply(&update) };
+            match applied {
                 Ok(found) => merge_changes(&mut changes, found),
                 Err(e) => {
                     log::warn!("collab: an update did not apply: {e}");

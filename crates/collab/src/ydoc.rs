@@ -237,9 +237,23 @@ impl LiveDoc {
     /// arrived yet is held and lands when they do (up to a bound, past which
     /// [`needs_resync`](Self::needs_resync) is raised).
     pub fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        self.apply_with(update, false)
+    }
+
+    /// [`apply`](Self::apply) for a checkpoint snapshot the room ordered (see
+    /// [`YReplica::apply_state`]).
+    pub fn apply_state(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        self.apply_with(update, true)
+    }
+
+    fn apply_with(&mut self, update: &[u8], state: bool) -> Result<Vec<BlockChange>, LiveError> {
         let before = self.order();
         self.drain_seen();
-        self.y.apply(update)?;
+        if state {
+            self.y.apply_state(update)?;
+        } else {
+            self.y.apply(update)?;
+        }
         let after = self.order();
         let seen = self.drain_seen();
 
@@ -505,6 +519,9 @@ impl Replica for LiveDoc {
     }
     fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
         LiveDoc::apply(self, update)
+    }
+    fn apply_state(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        LiveDoc::apply_state(self, update)
     }
     fn state(&self) -> Vec<u8> {
         LiveDoc::state(self)

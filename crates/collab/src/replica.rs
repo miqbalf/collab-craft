@@ -63,6 +63,12 @@ pub trait Replica: Sized + Send {
     fn from_state(state: &[u8]) -> Result<Self, LiveError>;
     fn set_client(&mut self, space: u32) -> Result<(), LiveError>;
     fn apply(&mut self, update: &[u8]) -> Result<Vec<Self::Change>, LiveError>;
+    /// [`apply`](Self::apply) for a checkpoint snapshot the room ordered, which holds the
+    /// whole document: a schema on [`YReplica`] checks it with [`YReplica::apply_state`]'s
+    /// higher item cap. By default the same as `apply`.
+    fn apply_state(&mut self, update: &[u8]) -> Result<Vec<Self::Change>, LiveError> {
+        self.apply(update)
+    }
     fn state(&self) -> Vec<u8>;
     fn undo(&mut self) -> Option<Vec<u8>>;
     fn redo(&mut self) -> Option<Vec<u8>>;
@@ -225,7 +231,19 @@ impl YReplica {
     /// advanced the state vector, the held part is taken out ([`WriteTxn::prune_pending`]) and
     /// applied again, until nothing more lands.
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
-        match readiness(&self.doc, update, &mut self.seen) {
+        self.apply_capped(update, crate::fits::MAX_ITEMS)
+    }
+
+    /// [`apply`](Self::apply) for a checkpoint snapshot (a full state the document service
+    /// wrote, which the relay orders only from it): checked under the higher
+    /// [`MAX_STATE_ITEMS`](crate::fits::MAX_STATE_ITEMS), because a checkpoint holds the whole
+    /// document.
+    pub fn apply_state(&mut self, update: &[u8]) -> Result<(), LiveError> {
+        self.apply_capped(update, crate::fits::MAX_STATE_ITEMS)
+    }
+
+    fn apply_capped(&mut self, update: &[u8], cap: usize) -> Result<(), LiveError> {
+        match readiness(&self.doc, update, &mut self.seen, cap) {
             Ready::Refused => return Err(LiveError::Decode),
             Ready::TooLarge => return Err(LiveError::TooLarge),
             Ready::Waiting(need) => {
@@ -277,7 +295,8 @@ impl YReplica {
                     keep.push((u, need));
                     continue;
                 }
-                match readiness(&self.doc, &u, &mut self.seen) {
+                // Already read under its cap when it arrived.
+                match readiness(&self.doc, &u, &mut self.seen, crate::fits::MAX_STATE_ITEMS) {
                     Ready::Waiting(need) => keep.push((u, need)),
                     Ready::Refused | Ready::TooLarge => log::warn!("collab: a waiting update does not fit the document; dropped"),
                     Ready::Now => {
@@ -297,7 +316,7 @@ impl YReplica {
     /// Hand one ready update to yrs.
     fn apply_now(&mut self, update: &[u8]) -> Result<(), LiveError> {
         let before = self.doc.transact().state_vector();
-        let first = integrate_checked(&self.doc, update, true, &mut self.seen);
+        let first = integrate_checked(&self.doc, update, true, &mut self.seen, crate::fits::MAX_STATE_ITEMS);
         if first.is_ok() {
             self.seen.commit(&self.doc.transact());
         }
@@ -537,20 +556,24 @@ impl From<Integrate> for LiveError {
 /// what yrs already holds for missing dependencies, that held part is dropped (yrs would apply it
 /// along with this update) and this update is applied.
 pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
-    integrate_checked(doc, update, false, &mut crate::fits::Seen::default()).map(|_| ())
+    integrate_checked(doc, update, false, &mut crate::fits::Seen::default(), crate::fits::MAX_STATE_ITEMS).map(|_| ())
 }
 
 /// [`integrate`]; `Ok(true)` when held updates were dropped because they did not fit.
 /// `checked`: the update alone was already checked against this document ([`readiness`]), so
 /// it is only checked again together with what yrs holds, if anything.
-fn integrate_checked(doc: &Doc, update: &[u8], checked: bool, seen: &mut crate::fits::Seen) -> Result<bool, Integrate> {
+fn integrate_checked(doc: &Doc, update: &[u8], checked: bool, seen: &mut crate::fits::Seen, cap: usize) -> Result<bool, Integrate> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The walk first: it refuses counts the bytes cannot back (an allocation bomb, which
         // aborts rather than unwinds) before yrs's decoder sizes anything by them.
-        let Some((_, incoming)) = crate::walk::items(update) else { return Err(Integrate::Refused) };
-        if crate::fits::too_many(incoming.len()) {
-            return Err(Integrate::TooLarge);
-        }
+        let incoming = match crate::walk::items_capped(update, cap) {
+            crate::walk::Walked::Items(_, items) => items,
+            crate::walk::Walked::Unread => return Err(Integrate::Refused),
+            crate::walk::Walked::TooMany => {
+                crate::fits::too_many(cap);
+                return Err(Integrate::TooLarge);
+            }
+        };
         let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
         let mut txn = doc.transact_mut_with(REMOTE);
         let mut dropped = false;
@@ -605,12 +628,16 @@ enum Ready {
 /// or an item does not fit its parent (see the `fits` module), [`Ready::Waiting`] when it starts
 /// past a client's clock in `doc`, skips clocks, names an item `doc` lacks, or deletes past what
 /// `doc` and the update hold.
-fn readiness(doc: &Doc, update: &[u8], seen: &mut crate::fits::Seen) -> Ready {
+fn readiness(doc: &Doc, update: &[u8], seen: &mut crate::fits::Seen, cap: usize) -> Ready {
     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let Some((shape, items)) = crate::walk::items(update) else { return Ready::Refused };
-        if crate::fits::too_many(items.len()) {
-            return Ready::TooLarge;
-        }
+        let (shape, items) = match crate::walk::items_capped(update, cap) {
+            crate::walk::Walked::Items(shape, items) => (shape, items),
+            crate::walk::Walked::Unread => return Ready::Refused,
+            crate::walk::Walked::TooMany => {
+                crate::fits::too_many(cap);
+                return Ready::TooLarge;
+            }
+        };
         let txn = doc.transact();
         let fits = crate::fits::check(&txn, &items, seen);
         if fits == crate::fits::Verdict::Refused {
@@ -655,6 +682,21 @@ fn with_held<T: ReadTxn>(txn: &T, incoming: &[crate::walk::Placed]) -> Vec<crate
         }
     }
     all
+}
+
+/// The most blocks a peer's update may write: past it, the update is refused as too large to
+/// check (and not as invalid). See the `fits` module for how it was sized.
+pub const MAX_OP_BLOCKS: usize = crate::fits::MAX_ITEMS;
+
+/// The most blocks a checkpoint snapshot from the document service may write.
+pub const MAX_STATE_BLOCKS: usize = crate::fits::MAX_STATE_ITEMS;
+
+/// How many blocks `bytes` write, read without allocating per block; `None` when the byte
+/// reader does not take them. For a relay to refuse an update past [`MAX_OP_BLOCKS`] as too
+/// large before anything decodes it.
+#[must_use]
+pub fn update_blocks(bytes: &[u8]) -> Option<usize> {
+    std::panic::catch_unwind(|| crate::walk::read(bytes).map(|shape| shape.count)).ok().flatten()
 }
 
 /// Whether `bytes` are a yrs update (v1) that decodes and whose ids are sane: no block or delete
@@ -1489,15 +1531,63 @@ mod tests {
         out.push(n as u8);
     }
 
-    /// The item cap is past any update an honest peer can send (one 16 MiB client frame, at
-    /// most half its bytes in blocks, plus 1 MiB of held updates), and past it an update is
-    /// refused as too large to check, not as content that does not fit.
+    /// An update of millions of two-byte blocks (16 MiB of GC blocks of one clock each, which
+    /// fit anywhere) is refused as too large to check, fast and without listing a block: the
+    /// walk counts them first. A relay counts them the same way before it decodes anything.
     #[test]
-    fn the_item_cap_is_past_any_honest_update() {
-        const { assert!(crate::fits::MAX_ITEMS >= (16 << 20) / 2 + (1 << 20) / 2) };
-        assert!(!crate::fits::too_many(crate::fits::MAX_ITEMS));
-        assert!(crate::fits::too_many(crate::fits::MAX_ITEMS + 1));
+    fn a_flood_of_tiny_blocks_is_refused_as_too_large_before_it_is_listed() {
+        const BLOCKS: u64 = 8 << 20;
+        let mut bomb = vec![1];
+        varint(&mut bomb, BLOCKS);
+        bomb.extend([0x7f, 0]);
+        for _ in 0..BLOCKS {
+            bomb.extend([0, 1]);
+        }
+        bomb.push(0);
+        assert!(bomb.len() >= 16 << 20);
+        let doc = YReplica::seed_doc();
+        doc.get_or_insert_array("a");
+        let mut y = YReplica::assemble(doc, None, |_, _| {});
+        crate::walk::LISTED.with(|n| n.set(0));
+        let t = std::time::Instant::now();
+        assert_eq!(y.apply(&bomb), Err(LiveError::TooLarge));
+        let took = t.elapsed();
+        assert_eq!(y.apply_state(&bomb), Err(LiveError::TooLarge), "past the state cap too");
+        assert_eq!(integrate(&YReplica::seed_doc(), &bomb), Err(Integrate::TooLarge));
+        assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0, "blocks were listed");
+        assert_eq!(update_blocks(&bomb), Some(BLOCKS as usize));
+        assert!(took < std::time::Duration::from_secs(1), "the refusals took {took:?}");
         assert_eq!(LiveError::from(Integrate::TooLarge), LiveError::TooLarge);
+    }
+
+    /// How many blocks the largest honest updates write, against the caps. A 1 MiB offline
+    /// bundle of single letters each typed apart from the last (the densest a client makes:
+    /// none merge), and a 1 MiB seed of short paragraphs (a paste of a whole file).
+    #[test]
+    #[ignore = "measurement (about 90 s in debug); run with --ignored --nocapture"]
+    fn honest_updates_stay_far_below_the_item_caps() {
+        use yrs::{ReadTxn, Text};
+        let typist = yrs::Doc::with_client_id(5);
+        let t = typist.get_or_insert_text("t");
+        {
+            let mut txn = typist.transact_mut();
+            // At the front each time: no two letters merge into one item.
+            for _ in 0..(1 << 20) / 8 {
+                t.insert(&mut txn, 0, "x");
+            }
+        }
+        let bundle = typist.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let paragraphs: Vec<crate::SeedBlock> =
+            (0..(1 << 20) / 24).map(|i| crate::SeedBlock { id: i + 1, text: format!("paragraph {i:>8}"), ..crate::SeedBlock::default() }).collect();
+        let seed = crate::LiveDoc::seeded(&paragraphs).unwrap().state();
+        for (name, update) in [("offline letters", &bundle), ("seeded paragraphs", &seed)] {
+            let blocks = update_blocks(update).unwrap();
+            let per_mib = blocks as f64 / (update.len() as f64 / f64::from(1 << 20));
+            println!("C7 {name}: {} bytes, {blocks} blocks, {per_mib:.0} per MiB", update.len());
+            assert!(update.len() >= 1 << 19, "{name} is only {} bytes", update.len());
+            assert!(per_mib < crate::fits::MAX_ITEMS as f64 / 2.0, "{name}: {per_mib:.0} blocks per MiB");
+            assert!(per_mib * 16.0 < crate::fits::MAX_STATE_ITEMS as f64, "{name}: a 16 MiB checkpoint this dense");
+        }
     }
 
     /// The fit check costs about the same per item however far into a long array an op lands:

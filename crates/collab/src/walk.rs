@@ -60,6 +60,8 @@ pub(crate) struct Shape {
     pub(crate) upper: BTreeMap<u64, u32>,
     /// The delete set, each client's ranges in written order (`Update::delete_set`).
     pub(crate) deletes: BTreeMap<u64, Ranges>,
+    /// How many blocks the update writes, skips included.
+    pub(crate) count: usize,
 }
 
 impl Shape {
@@ -70,11 +72,36 @@ impl Shape {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Blocks this thread's walks listed (a test's measure of what a walk allocated).
+    pub(crate) static LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
     /// Where each item goes, when the caller asked ([`items`]).
     items: Option<Vec<Placed>>,
+    /// The most items to list; past it the read stops before listing more, and `over` is set.
+    cap: usize,
+    over: bool,
+}
+
+impl Reader<'_> {
+    /// List `p`, or stop the read (`None`) once the list holds `cap` items.
+    fn list(&mut self, p: Placed) -> Option<()> {
+        if let Some(items) = &mut self.items {
+            #[cfg(test)]
+            LISTED.with(|n| n.set(n.get() + 1));
+            if items.len() >= self.cap {
+                self.over = true;
+                return None;
+            }
+            items.push(p);
+        }
+        Some(())
+    }
 }
 
 /// Where an item says it goes: a root by name, a parent item, or beside its origin (or, without
@@ -245,13 +272,13 @@ impl Reader<'_> {
         let type_ref = (kind == 7).then(|| self.bytes.get(self.at).copied()).flatten();
         let start = self.at;
         let len = self.content(kind)?;
-        if let Some(items) = &mut self.items {
+        if self.items.is_some() {
             // An embed's JSON follows its length; a string's starts with a quote.
             let string_embed = kind == 5 && {
-                let mut peek = Reader { bytes: self.bytes, at: start, items: None };
+                let mut peek = Reader { bytes: self.bytes, at: start, items: None, cap: 0, over: false };
                 peek.u32().is_some() && self.bytes[peek.at..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'"')
             };
-            items.push(Placed { id, len, kind, type_ref, under, sub: keyed, string_embed });
+            self.list(Placed { id, len, kind, type_ref, under, sub: keyed, string_embed })?;
         }
         Some(len)
     }
@@ -311,15 +338,47 @@ impl Reader<'_> {
 /// past it, a client with two sections or two delete entries, an id naming a clock past it, a
 /// delete range past it, an empty block, trailing bytes, and anything this reader cannot parse.
 pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
-    read_into(Reader { bytes, at: 0, items: None }).map(|(shape, _)| shape)
+    read_into(&mut Reader { bytes, at: 0, items: None, cap: 0, over: false })
 }
 
-/// [`read`], and where every item goes, in the order written.
+/// [`read`], and where every item goes, in the order written. For updates already bounded by
+/// what produced them (a document's own state, a local edit, held updates); an update from a
+/// peer goes through [`items_capped`].
 pub(crate) fn items(bytes: &[u8]) -> Option<(Shape, Vec<Placed>)> {
-    read_into(Reader { bytes, at: 0, items: Some(Vec::new()) }).map(|(shape, items)| (shape, items.unwrap_or_default()))
+    match items_capped(bytes, usize::MAX) {
+        Walked::Items(shape, items) => Some((shape, items)),
+        Walked::Unread | Walked::TooMany => None,
+    }
 }
 
-fn read_into(mut r: Reader<'_>) -> Option<(Shape, Option<Vec<Placed>>)> {
+/// What [`items_capped`] made of an update.
+pub(crate) enum Walked {
+    Items(Shape, Vec<Placed>),
+    /// The reader does not take it.
+    Unread,
+    /// It holds more than the cap of blocks; the read stopped there, so the list never grew
+    /// past the cap (a 16 MiB update of two-byte blocks would list 8 M).
+    TooMany,
+}
+
+/// [`items`], refusing an update of more than `cap` blocks before listing any: the blocks are
+/// counted first by a read that keeps nothing per block (a GC run, say, is one range), so an
+/// update of millions of two-byte blocks costs one pass and no allocation per block.
+pub(crate) fn items_capped(bytes: &[u8], cap: usize) -> Walked {
+    match read(bytes) {
+        None => return Walked::Unread,
+        Some(shape) if shape.count > cap => return Walked::TooMany,
+        Some(_) => {}
+    }
+    let mut r = Reader { bytes, at: 0, items: Some(Vec::new()), cap, over: false };
+    match read_into(&mut r) {
+        Some(shape) => Walked::Items(shape, r.items.take().unwrap_or_default()),
+        None if r.over => Walked::TooMany,
+        None => Walked::Unread,
+    }
+}
+
+fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
     let bytes = r.bytes;
     let mut shape = Shape::default();
     let mut seen = HashSet::new();
@@ -335,20 +394,19 @@ fn read_into(mut r: Reader<'_>) -> Option<(Shape, Option<Vec<Placed>>)> {
         let mut ranges = Ranges::new();
         for _ in 0..blocks {
             // yrs: exactly 0 is garbage-collected and 10 is a skip; any other byte is an item.
+            shape.count += 1;
             let (len, skip) = match r.byte()? {
                 0 => {
                     let len = r.u32()?;
-                    if let Some(items) = &mut r.items {
-                        items.push(Placed {
-                            id: (client, clock),
-                            len,
-                            kind: 0,
-                            type_ref: None,
-                            under: Under::Beside(None, None),
-                            sub: None,
-                            string_embed: false,
-                        });
-                    }
+                    r.list(Placed {
+                        id: (client, clock),
+                        len,
+                        kind: 0,
+                        type_ref: None,
+                        under: Under::Beside(None, None),
+                        sub: None,
+                        string_embed: false,
+                    })?;
                     (len, false)
                 }
                 10 => (r.u32()?, true),
@@ -394,7 +452,7 @@ fn read_into(mut r: Reader<'_>) -> Option<(Shape, Option<Vec<Placed>>)> {
             return None;
         }
     }
-    (r.at == bytes.len()).then_some((shape, r.items))
+    (r.at == bytes.len()).then_some(shape)
 }
 
 /// Whether yrs's parse of an update, `update`, is the one [`read`] made of the same bytes,

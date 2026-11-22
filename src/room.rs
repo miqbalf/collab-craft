@@ -336,6 +336,26 @@ pub fn crdt_ops_sound(command: &str, params: &serde_json::Value) -> bool {
     ops.iter().all(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()).is_some_and(|bytes| craft_collab::update_is_sound(&bytes)))
 }
 
+/// Whether an op of a `crdt.*` payload writes more blocks than a check takes: past
+/// [`craft_collab::MAX_OP_BLOCKS`], or [`craft_collab::MAX_STATE_BLOCKS`] for a checkpoint
+/// snapshot (`snap`, ordered only from the document service). Asked before
+/// [`crdt_ops_sound`], which decodes, and answered by counting, so a 16 MiB op of two-byte
+/// blocks is refused as too large without listing them.
+#[must_use]
+pub fn crdt_ops_too_large(command: &str, params: &serde_json::Value) -> bool {
+    if !is_crdt_command(command) {
+        return false;
+    }
+    let snap = params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let cap = if snap { craft_collab::MAX_STATE_BLOCKS } else { craft_collab::MAX_OP_BLOCKS };
+    let Some(ops) = params.get("ops").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    ops.iter()
+        .filter_map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()))
+        .any(|bytes| craft_collab::update_blocks(&bytes).is_some_and(|n| n > cap))
+}
+
 /// Commands whose payload is a CRDT operation. They never take a region lock.
 #[must_use]
 pub fn is_crdt_command(command: &str) -> bool {

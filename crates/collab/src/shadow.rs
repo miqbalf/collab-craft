@@ -97,6 +97,12 @@ impl Shadow {
         self.admit_all(std::slice::from_ref(&update))
     }
 
+    /// [`admit`](Self::admit) for a checkpoint snapshot from the document service: checked
+    /// under the higher state item cap (see [`YReplica::apply_state`]).
+    pub fn admit_state(&mut self, state: &[u8]) -> Result<(), ShadowRefusal> {
+        self.admit_one(state, true)
+    }
+
     /// Try one submit's updates and keep them all or none, because the relay refuses the whole
     /// submit. They are tried one at a time, in order, each under `catch_unwind`, as every
     /// replica applies them: a merged update is not the same thing (yrs's merge writes a
@@ -106,7 +112,7 @@ impl Shadow {
     pub fn admit_all<U: AsRef<[u8]>>(&mut self, updates: &[U]) -> Result<(), ShadowRefusal> {
         let mark = self.mark();
         for update in updates {
-            if let Err(refusal) = self.admit_one(update.as_ref()) {
+            if let Err(refusal) = self.admit_one(update.as_ref(), false) {
                 self.rollback(mark);
                 return Err(refusal);
             }
@@ -167,9 +173,10 @@ impl Shadow {
         }
     }
 
-    fn admit_one(&mut self, update: &[u8]) -> Result<(), ShadowRefusal> {
+    fn admit_one(&mut self, update: &[u8], state: bool) -> Result<(), ShadowRefusal> {
         let before: StateVector = self.y.doc().transact().state_vector();
-        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.y.apply(update)));
+        let applied =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if state { self.y.apply_state(update) } else { self.y.apply(update) }));
         match applied {
             Ok(_) if self.y.damaged() => {
                 self.rebuild();
@@ -225,10 +232,11 @@ impl Shadow {
         let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut y = fresh(self.schema.as_deref());
             if !self.base.is_empty() {
-                let _ = y.apply(&self.base);
+                let _ = y.apply_state(&self.base);
             }
             for op in &self.log {
-                let _ = y.apply(op);
+                // Each was admitted already, a snapshot under the state cap.
+                let _ = y.apply_state(op);
             }
             y
         }));
