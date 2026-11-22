@@ -88,8 +88,8 @@ pub struct YReplica {
     untracked: bool,
     /// Updates were dropped because dependencies never came ([`YReplica::needs_resync`]).
     resync: bool,
-    /// How many updates have been held, as is, since nothing was last pending: applies that
-    /// advanced nothing (duplicates of a held update count again).
+    /// How many applies have left something held since nothing was last pending (an apply that
+    /// partly landed counts too; duplicates of a held update count again).
     held: usize,
     /// The encoded size of those updates, from their incoming sizes.
     held_bytes: usize,
@@ -197,7 +197,7 @@ impl YReplica {
         }
         // Also after a refusal: yrs may have integrated part of the update first, which can
         // make a held one ready.
-        if self.settle(before.clone(), update.len()) == Err(Integrate::Panicked) {
+        if self.settle(before.clone(), if first.is_ok() { update.len() } else { 0 }, first.is_ok()) == Err(Integrate::Panicked) {
             self.damaged = true;
             return Err(LiveError::Decode);
         }
@@ -245,8 +245,7 @@ impl YReplica {
     /// Failing part way through a retry means some held updates were taken out and not all went
     /// back in, so this replica is behind without knowing it: resync is raised, and the apply
     /// that triggered it still counts as done.
-    fn settle(&mut self, mut before: StateVector, incoming: usize) -> Result<(), Integrate> {
-        let mut advanced = false;
+    fn settle(&mut self, mut before: StateVector, incoming: usize, decoded: bool) -> Result<(), Integrate> {
         loop {
             let txn = self.doc.transact();
             if !txn.has_missing_updates() {
@@ -259,7 +258,6 @@ impl YReplica {
             if now == before {
                 break;
             }
-            advanced = true;
             before = now;
             match integrate_held(&self.doc) {
                 Ok(()) => {}
@@ -271,7 +269,11 @@ impl YReplica {
                 }
             }
         }
-        if !advanced {
+        // Whatever is still held after this apply is counted against it, whether or not it also
+        // advanced the state vector: an update with one block that applies and one that waits
+        // would otherwise grow what yrs holds without ever being counted. (An apply that did not
+        // decode touched nothing and is not counted.)
+        if decoded {
             self.held += 1;
             self.held_bytes += incoming;
         }
@@ -401,10 +403,12 @@ pub fn update_is_sound(bytes: &[u8]) -> bool {
             return false;
         };
         let ranges_ok = |set: &yrs::IdSet| set.iter().all(|(_, ranges)| ranges.iter().all(|r| r.start <= r.end));
-        // The end of a client's blocks (clock + len, which wraps where overflow checks are off)
-        // can never be before where they start.
-        let (ends, starts) = (update.state_vector(), update.state_vector_lower());
-        ranges_ok(update.delete_set()) && ranges_ok(&update.insertions(true)) && starts.iter().all(|(client, start)| ends.get(client) >= *start)
+        // A block whose clock + len overflows is dropped from `insertions` (wrapped), so every
+        // client with blocks must still list a range starting at its first block.
+        let (starts, inserted) = (update.state_vector_lower(), update.insertions(true));
+        ranges_ok(update.delete_set())
+            && ranges_ok(&inserted)
+            && starts.iter().all(|(client, start)| inserted.get(client).is_some_and(|r| r.iter().next().is_some_and(|(r, _)| r.start == *start)))
     })
     .unwrap_or(false)
 }
@@ -902,6 +906,56 @@ mod tests {
         y.apply(&first).unwrap();
         println!("COST clients {n}: worst {worst:?} mean {:?} release {:?} resync {}", total / n, t.elapsed(), y.needs_resync());
         assert!(worst.as_millis() < 2000);
+    }
+
+    /// Each update applies one block and leaves one waiting on a missing item. Counting only
+    /// updates that advanced nothing would never trip the cap while yrs's pending grew.
+    #[test]
+    fn mixed_updates_that_half_apply_still_hit_the_cap() {
+        let (_, _, _) = withheld(&[1, 1]);
+        let (mut y, _) = peer(99);
+        let start = std::time::Instant::now();
+        let mut n = 0_u32;
+        let mut worst = std::time::Duration::ZERO;
+        while !y.needs_resync() && n < u32::try_from(MAX_PENDING_UPDATES).unwrap() + 10 {
+            let mut u = vec![2, 1];
+            varuint(2000, &mut u);
+            varuint(n, &mut u);
+            u.extend([0x04, 1, 1, b't', 1, b'a']);
+            u.push(1);
+            varuint(3000 + n, &mut u);
+            u.extend([0, 0x04, 0, 1, 0, 1, b'a', 0]);
+            let t = std::time::Instant::now();
+            y.apply(&u).unwrap();
+            worst = worst.max(t.elapsed());
+            if n == 3 {
+                assert!(pending(&y), "the orphan half is held");
+                assert!(read(&y).len() >= 4, "the other half applied");
+            }
+            n += 1;
+        }
+        println!("COST mixed {n} updates: worst {worst:?} total {:?}", start.elapsed());
+        assert!(y.needs_resync(), "raised before {n} updates");
+        assert!(usize::try_from(n).unwrap() <= MAX_PENDING_UPDATES + 1);
+        assert!(held_bytes(&y) < MAX_PENDING_BYTES);
+        assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+    }
+
+    /// Every update an honest peer makes, deletes and full states included, passes the relay's
+    /// soundness check.
+    #[test]
+    fn honest_updates_are_sound() {
+        for seed in SEEDS {
+            let all = history(seed, 3, 60);
+            for (i, u) in all.iter().enumerate() {
+                assert!(update_is_sound(u), "seed {seed} update {i}");
+            }
+            assert!(update_is_sound(&in_order(&all).state()), "seed {seed} state");
+        }
+        let (_, rest, state) = withheld(&[1, 1, 1]);
+        assert!(update_is_sound(&state));
+        assert!(rest.iter().all(|u| update_is_sound(u)));
+        assert!(update_is_sound(&[0, 0]), "the empty update");
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.

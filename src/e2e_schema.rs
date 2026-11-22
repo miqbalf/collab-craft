@@ -127,14 +127,25 @@ fn ops(seen: &[ServerMsg]) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn e2e_a_junk_op_is_refused_before_it_is_ordered() {
+    junk_op_round(Some("gridcraft/1")).await;
+}
+
+/// The same with a room nobody named a schema for, which is how WordCraft-web joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_junk_op_is_refused_in_a_room_with_no_schema() {
+    junk_op_round(None).await;
+}
+
+async fn junk_op_round(schema: Option<&str>) {
     use base64::Engine as _;
     let wire = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
     let Some(h) = start().await else { return };
-    let room = unique_room("junk-op");
-    let mut alice = connect(&h.url, &room, "alice", Some("gridcraft/1")).await;
+    let room = unique_room("junk-op-round");
+    let mut alice = connect(&h.url, &room, "alice", schema).await;
     let seen = answer(&mut alice).await;
     let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
-    let mut bob = connect(&h.url, &room, "bob", Some("gridcraft/1")).await;
+    let mut bob = connect(&h.url, &room, "bob", schema).await;
     answer(&mut bob).await;
     let before = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
 
@@ -161,7 +172,7 @@ async fn e2e_a_junk_op_is_refused_before_it_is_ordered() {
     let after = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
     assert_eq!(after - before, 1, "junk burned no sequence number");
 
-    let mut carol = connect(&h.url, &room, "carol", Some("gridcraft/1")).await;
+    let mut carol = connect(&h.url, &room, "carol", schema).await;
     let mut replay = answer(&mut carol).await;
     replay.extend(listen(&mut carol, 500).await);
     let replayed: Vec<String> = replay

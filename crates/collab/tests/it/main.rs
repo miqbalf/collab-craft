@@ -1867,3 +1867,33 @@ fn livedoc_withheld_dependency_raises_resync_and_a_rebuild_converges() {
     assert_eq!(d.order(), author.order());
     d.insert_text(1, 0, "!", &Map::new()).unwrap();
 }
+
+/// A submit the relay refused as `invalid` is never sent again: the edit is dropped from the
+/// resend queue and counted abandoned, the replica stops, and the app is told.
+#[test]
+fn an_invalid_refusal_is_permanent() {
+    let hub = FakeHub::default();
+    let mut live = Live::new(hub.clone(), "d");
+    live.seed(&sample()).unwrap();
+    hub.0.borrow_mut().inbox.push(joined_at("alice", 1, 0, Some(0)));
+    live.pump();
+    live.edit(|d| d.insert_text(1, 0, "x", &Map::new())).unwrap();
+    let (local, _) = last_submit(&hub);
+    let sent = hub.0.borrow().sent.len();
+    live.notices.clear();
+    hub.0.borrow_mut().inbox.push(ServerMsg::Error {
+        doc: "d".to_owned(),
+        detail: "that change is not a valid document update".to_owned(),
+        local: Some(local),
+        code: Some("invalid".to_owned()),
+    });
+    let work = live.pump();
+    assert!(work.iter().any(|w| matches!(w, Work::TextIncomplete { .. })), "{work:?}");
+    assert!(!live.notices.is_empty(), "the app is told");
+    assert_eq!(live.unconfirmed_edits(), 1, "counted abandoned, never read as saved");
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        live.pump();
+    }
+    assert_eq!(hub.0.borrow().sent.len(), sent, "nothing was sent again");
+}

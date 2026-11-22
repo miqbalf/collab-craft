@@ -310,20 +310,19 @@ impl TextLog {
     }
 }
 
-/// Replica schemas whose `crdt.*` ops carry yrs updates (base64 in `params.ops`), which
-/// [`crdt_ops_sound`] checks before the relay orders them. A room with another schema, or none,
-/// is not looked into.
-const YRS_SCHEMAS: [&str; 2] = ["wordcraft/", "gridcraft/"];
-
-/// Whether a submit may be ordered: for a room pinned to a yrs schema, every op in a `crdt.*`
-/// payload must be base64 of a yrs update that decodes with sane ids
-/// ([`craft_collab::update_is_sound`], under `catch_unwind`). A crafted op would otherwise be
-/// ordered, replayed to every joiner and abort each browser replica that decodes it (a yrs panic
-/// aborts on wasm32). Anything else is let through unread: other schemas, other commands, and a
-/// payload without an `ops` list.
+/// Whether a submit may be ordered: every op in a `crdt.*` payload that carries an `ops` list
+/// must be base64 of a yrs update that decodes with sane ids ([`craft_collab::update_is_sound`],
+/// under `catch_unwind`). A crafted op would otherwise be ordered, replayed to every joiner and
+/// abort each browser replica that decodes it (a yrs panic aborts on wasm32).
+///
+/// Fails closed: it does not depend on the room's replica schema, because the clients that
+/// matter (WordCraft-web, the live worker, GridCraft) join without naming one. That is safe
+/// because the only `crdt.*` payload in the code base is [`craft_collab::CRDT_TEXT`], whose
+/// `ops` are yrs updates by definition; a `crdt.*` payload without an `ops` list, and every
+/// other command, is let through unread.
 #[must_use]
-pub fn crdt_ops_sound(schema: Option<&str>, command: &str, params: &serde_json::Value) -> bool {
-    if !is_crdt_command(command) || !schema.is_some_and(|s| YRS_SCHEMAS.iter().any(|p| s.starts_with(p))) {
+pub fn crdt_ops_sound(command: &str, params: &serde_json::Value) -> bool {
+    if !is_crdt_command(command) {
         return true;
     }
     let Some(ops) = params.get("ops").and_then(serde_json::Value::as_array) else {
@@ -542,6 +541,7 @@ impl Room {
     }
 
     /// The replica schema the room is pinned to, if any.
+    #[cfg(test)]
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
@@ -990,35 +990,24 @@ mod tests {
         wire(&d.insert_text(1, 0, "x", &serde_json::Map::new()).unwrap())
     }
 
-    /// The gate lets valid updates through, refuses junk for a yrs schema, and leaves other
-    /// schemas, other commands and other payload shapes alone.
+    /// The gate lets valid updates through and refuses junk whatever the room's schema, and
+    /// leaves other commands and other payload shapes alone.
     #[test]
-    fn the_crdt_gate_refuses_junk_only_for_yrs_schemas() {
-        let ok = |schema, command, ops: serde_json::Value| crdt_ops_sound(schema, command, &serde_json::json!({ "scope": "doc", "ops": ops }));
+    fn the_crdt_gate_refuses_junk() {
+        let ok = |command, ops: serde_json::Value| crdt_ops_sound(command, &serde_json::json!({ "scope": "doc", "ops": ops }));
         let good = good_update();
-        for schema in ["wordcraft/1", "gridcraft/1"] {
-            assert!(ok(Some(schema), "crdt.text", serde_json::json!([good])), "{schema}: valid");
-            assert!(ok(Some(schema), "crdt.text", serde_json::json!([])), "{schema}: empty batch");
-            assert!(!ok(Some(schema), "crdt.text", serde_json::json!(["!!not base64!!"])));
-            assert!(!ok(Some(schema), "crdt.text", serde_json::json!([wire(&[0xff, 0x01, 0x02])])));
-            assert!(!ok(Some(schema), "crdt.text", serde_json::json!([good, 7])), "a non-string op");
-            assert!(
-                !ok(
-                    Some(schema),
-                    "crdt.text",
-                    serde_json::json!([good, wire(&[1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x04, 1, 1, b't', 2, b'a', b'b', 0])])
-                ),
-                "block clock + len overflows"
-            );
-            assert!(
-                !ok(Some(schema), "crdt.text", serde_json::json!([wire(&[0, 1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0x0f, 2])])),
-                "delete range overflows"
-            );
-        }
-        assert!(ok(Some("deckcraft/1"), "crdt.text", serde_json::json!(["!!"])), "another schema is not read");
-        assert!(ok(None, "crdt.text", serde_json::json!(["!!"])), "a room with no schema is not read");
-        assert!(ok(Some("gridcraft/1"), "cell.set", serde_json::json!(["!!"])), "not a crdt command");
-        assert!(crdt_ops_sound(Some("gridcraft/1"), "crdt.text", &serde_json::json!({ "scope": "doc" })), "no ops list");
+        assert!(ok("crdt.text", serde_json::json!([good])), "valid");
+        assert!(ok("crdt.text", serde_json::json!([])), "empty batch");
+        assert!(!ok("crdt.text", serde_json::json!(["!!not base64!!"])));
+        assert!(!ok("crdt.text", serde_json::json!([wire(&[0xff, 0x01, 0x02])])));
+        assert!(!ok("crdt.text", serde_json::json!([good, 7])), "a non-string op");
+        assert!(
+            !ok("crdt.text", serde_json::json!([good, wire(&[1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x04, 1, 1, b't', 2, b'a', b'b', 0])])),
+            "block clock + len overflows"
+        );
+        assert!(!ok("crdt.text", serde_json::json!([wire(&[0, 1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0x0f, 2])])), "delete range overflows");
+        assert!(ok("cell.set", serde_json::json!(["!!"])), "not a crdt command");
+        assert!(crdt_ops_sound("crdt.text", &serde_json::json!({ "scope": "doc" })), "no ops list");
     }
 
     fn crdt_sub(peer: &str, scope: &str) -> Submission {

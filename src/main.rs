@@ -1131,8 +1131,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     // A yrs update that does not decode, or whose ids overflow, is refused here: ordered, it
     // would be replayed to every joiner and abort the browser replicas that decode it. Before
     // the sequence number, so nothing is burned.
-    let schema = relay.rooms.lock().await.get(&claims.rm).and_then(|r| r.schema().map(str::to_owned));
-    if !crdt_ops_sound(schema.as_deref(), &msg.command, &msg.params) {
+    if !crdt_ops_sound(&msg.command, &msg.params) {
         tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op that is not a valid document update");
         let _ = socket.emit(
             "error",

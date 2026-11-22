@@ -193,7 +193,15 @@ pub fn refusal_is_permanent(detail: &str) -> bool {
         || detail.starts_with("only the document service may checkpoint")
         || detail.contains("more than this relay will carry")
         || detail.contains("too large to retain")
+        || detail.contains(INVALID_UPDATE)
 }
+
+/// The relay's wording (with `code: "invalid"`) for an update it will not order: it does not
+/// decode, or its ids overflow. The same bytes would be refused again.
+const INVALID_UPDATE: &str = "not a valid document update";
+
+/// [`ServerMsg::Error`]'s `code` for it.
+const INVALID: &str = "invalid";
 
 /// The most local edit bytes a replica holds unconfirmed before it gives up on the link.
 const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
@@ -1263,7 +1271,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             Effect::SubmitRefused { local, detail, code } => {
                 // The relay refused one of this client's submits by its counter. It is the
                 // checkpoint's own only while that has not been ordered.
-                let retry = code.as_deref() == Some(RETRY) || !refusal_is_permanent(&detail);
+                let retry = code.as_deref() == Some(RETRY) || !(refusal_is_permanent(&detail) || code.as_deref() == Some(INVALID));
                 if self.checkpoint.as_ref().is_some_and(|p| p.local == local && p.ordered.is_none()) {
                     self.refuse_checkpoint(work, &detail);
                 } else if self.unconfirmed.contains_key(&local) && !self.broken && retry {
