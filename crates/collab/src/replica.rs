@@ -22,7 +22,8 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use yrs::undo::UndoManager;
 use yrs::updates::decoder::Decode;
-use yrs::{Any, ClientID, Doc, MapRef, Number, OffsetKind, Options, Origin, ReadTxn, StateVector, Transact, TransactionMut, Update};
+use yrs::updates::encoder::Encode;
+use yrs::{Any, ClientID, Doc, MapRef, Number, OffsetKind, Options, Origin, ReadTxn, StateVector, Transact, TransactionMut, Update, WriteTxn};
 
 use crate::ydoc::LiveError;
 
@@ -34,6 +35,13 @@ pub const REMOTE: &str = "craft-collab/remote";
 /// The origin of this replica's own edits made through [`YReplica::untracked`]: sent like any
 /// local edit, never undone.
 pub const UNTRACKED: &str = "craft-collab/untracked";
+
+/// How many applied updates may be waiting on missing dependencies before the replica gives up
+/// and raises [`YReplica::needs_resync`].
+pub const MAX_PENDING_UPDATES: usize = 2048;
+/// How many encoded bytes of waiting updates the replica keeps before it gives up and raises
+/// [`YReplica::needs_resync`].
+pub const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 /// One yrs replica with a fixed schema, as [`Live`](crate::Live) drives it.
 ///
@@ -60,6 +68,11 @@ pub trait Replica: Sized + Send {
     fn undo(&mut self) -> Option<Vec<u8>>;
     fn redo(&mut self) -> Option<Vec<u8>>;
     fn damaged(&self) -> bool;
+    /// Updates were dropped because their dependencies never came ([`YReplica::needs_resync`]):
+    /// the replica is sound but behind, and wants the room's full state.
+    fn needs_resync(&self) -> bool {
+        false
+    }
 }
 
 /// The part of a replica every yrs schema shares: the document, its undo history, its client
@@ -74,6 +87,10 @@ pub struct YReplica {
     damaged: bool,
     /// Local edits are made outside the undo history ([`YReplica::untracked`]).
     untracked: bool,
+    /// Updates were dropped because dependencies never came ([`YReplica::needs_resync`]).
+    resync: bool,
+    /// How many applies since the last time nothing was pending have left something pending.
+    held: usize,
 }
 
 impl YReplica {
@@ -99,7 +116,7 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false }
+        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0 }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -127,6 +144,19 @@ impl YReplica {
         self.client
     }
 
+    /// Whether updates were dropped because too many were waiting for dependencies that never
+    /// came (see [`MAX_PENDING_UPDATES`]). The replica is sound but behind: ask the room for its
+    /// full state and apply it with [`apply_full_state`](Self::apply_full_state).
+    #[must_use]
+    pub fn needs_resync(&self) -> bool {
+        self.resync
+    }
+
+    /// Carry the resync mark across a rebuild, or set it (a test).
+    pub fn set_needs_resync(&mut self, resync: bool) {
+        self.resync = resync;
+    }
+
     /// Whether yrs panicked during an earlier apply.
     #[must_use]
     pub fn damaged(&self) -> bool {
@@ -139,12 +169,69 @@ impl YReplica {
     }
 
     /// Merge an update from another replica. A yrs panic marks this replica damaged.
+    ///
+    /// Updates may arrive in any order. One whose dependencies are missing is held by yrs. yrs
+    /// 0.28 does not always apply a held update once its dependencies land (it only looks at the
+    /// client ids of the update that just arrived), so whenever an apply advanced the state
+    /// vector and something is still held, the held part is taken out ([`WriteTxn::prune_pending`])
+    /// and applied again, until nothing more lands. What stays held is bounded by
+    /// [`MAX_PENDING_UPDATES`] and [`MAX_PENDING_BYTES`]; past either it is dropped and
+    /// [`needs_resync`](Self::needs_resync) is raised.
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
+        let before = self.doc.transact().state_vector();
         if let Err(e) = integrate(&self.doc, update) {
             if e == Integrate::Panicked {
                 self.damaged = true;
             }
             return Err(LiveError::Decode);
+        }
+        if let Err(e) = self.settle(before) {
+            if e == Integrate::Panicked {
+                self.damaged = true;
+            }
+            return Err(LiveError::Decode);
+        }
+        Ok(())
+    }
+
+    /// Apply a full state (a checkpoint, or [`state`](Self::state) of a peer that is ahead) to
+    /// catch up after [`needs_resync`](Self::needs_resync). Once nothing is left held the mark
+    /// is cleared.
+    pub fn apply_full_state(&mut self, state: &[u8]) -> Result<(), LiveError> {
+        self.apply(state)?;
+        if !self.doc.transact().has_missing_updates() {
+            self.resync = false;
+        }
+        Ok(())
+    }
+
+    /// After an apply: retry what yrs holds when the apply advanced the state vector, then
+    /// enforce the bounds on what is still held.
+    fn settle(&mut self, mut before: StateVector) -> Result<(), Integrate> {
+        loop {
+            let txn = self.doc.transact();
+            if !txn.has_missing_updates() {
+                self.held = 0;
+                return Ok(());
+            }
+            let now = txn.state_vector();
+            drop(txn);
+            if now == before {
+                break;
+            }
+            before = now;
+            integrate_held(&self.doc)?;
+        }
+        self.held += 1;
+        let txn = self.doc.transact();
+        let store = txn.store();
+        let bytes = store.pending_update().map_or(0, |p| p.update.encode_v1().len()) + store.pending_ds().map_or(0, |d| d.encode_v1().len());
+        drop(txn);
+        if self.held > MAX_PENDING_UPDATES || bytes > MAX_PENDING_BYTES {
+            log::warn!("collab: {} updates ({bytes} bytes) are waiting for dependencies that did not come; dropped, resync needed", self.held);
+            drop(self.doc.transact_mut_with(REMOTE).prune_pending());
+            self.held = 0;
+            self.resync = true;
         }
         Ok(())
     }
@@ -241,6 +328,22 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
             Err(Integrate::Panicked)
         }
     }
+}
+
+/// Take what yrs holds for missing dependencies out and apply it again, under `catch_unwind`
+/// for the same reason as [`integrate`]. What still lacks a dependency goes back to being held.
+fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut txn = doc.transact_mut_with(REMOTE);
+        match txn.prune_pending() {
+            Some(held) => txn.apply_update(held).map_err(|_| Integrate::Refused),
+            None => Ok(()),
+        }
+    }))
+    .unwrap_or_else(|_| {
+        log::warn!("collab: yrs panicked on held updates");
+        Err(Integrate::Panicked)
+    })
 }
 
 fn build_doc(client: u64) -> Doc {
@@ -387,6 +490,188 @@ mod tests {
         let again = doc.get_or_insert_text("t");
         assert_eq!(again.get_string(&doc.transact()), "kept");
         assert_ne!(doc.client_id(), y.doc().client_id());
+    }
+
+    /// A tiny deterministic generator, so the shuffles below are the same on every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next()).unwrap() % n
+        }
+
+        fn shuffle<T>(&mut self, items: &mut [T]) {
+            for i in (1..items.len()).rev() {
+                items.swap(i, self.below(i + 1));
+            }
+        }
+    }
+
+    /// Like `replica`, but the document really mints under `client`, as a granted space does.
+    fn peer(client: u32) -> (YReplica, yrs::TextRef) {
+        let doc = build_doc(u64::from(client));
+        let text = doc.get_or_insert_text("t");
+        let t = text.clone();
+        (YReplica::assemble(doc, Some(client), move |doc, undo| undo.expand_scope(doc, &t)), text)
+    }
+
+    fn held_bytes(y: &YReplica) -> usize {
+        let txn = y.doc().transact();
+        txn.store().pending_update().map_or(0, |p| p.update.encode_v1().len())
+    }
+
+    fn pending(y: &YReplica) -> bool {
+        y.doc().transact().has_missing_updates()
+    }
+
+    fn read(y: &YReplica) -> String {
+        y.doc().get_or_insert_text("t").get_string(&y.doc().transact())
+    }
+
+    /// Updates from `peers` peers in one causal order: before each edit the peer may catch up on
+    /// everything made so far (applied in order), so edits are concurrent but a peer's own
+    /// dependencies always come earlier in the list.
+    fn history(seed: u64, peers: usize, steps: usize) -> Vec<Vec<u8>> {
+        let mut rng = Lcg(seed);
+        let mut reps: Vec<(YReplica, yrs::TextRef)> = (0..peers).map(|i| peer(u32::try_from(i).unwrap() + 1)).collect();
+        let mut seen = vec![0usize; peers];
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for step in 0..steps {
+            let p = rng.below(peers);
+            if rng.below(2) == 0 {
+                for u in &all[seen[p]..] {
+                    reps[p].0.apply(u).unwrap();
+                }
+                seen[p] = all.len();
+            }
+            let len = u32::try_from(read(&reps[p].0).chars().count()).unwrap();
+            let text = reps[p].1.clone();
+            let mark = u8::try_from(step % 26).unwrap();
+            let delete = len > 3 && rng.below(4) == 0;
+            let at = u32::try_from(rng.below(usize::try_from(len).unwrap() + 1)).unwrap();
+            let update = reps[p]
+                .0
+                .local(|txn| {
+                    if delete {
+                        let at = at.min(len - 1);
+                        text.remove_range(txn, at, 1);
+                    } else {
+                        text.insert(txn, at, &char::from(b'a' + mark).to_string());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            // Local edits already sit in the author's replica; its own cursor moves past them
+            // only once it has caught up on the others, which `apply` of its own update undoes.
+            all.push(update);
+        }
+        all
+    }
+
+    fn in_order(all: &[Vec<u8>]) -> YReplica {
+        let (mut y, _) = peer(99);
+        for u in all {
+            y.apply(u).unwrap();
+        }
+        y
+    }
+
+    const SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 13, 17, 42];
+
+    /// Any delivery order reaches the in-order state, and nothing is left pending.
+    #[test]
+    fn shuffled_delivery_equals_in_order_delivery() {
+        for peers in [2, 3] {
+            for seed in SEEDS {
+                let all = history(seed, peers, 60);
+                let expect = in_order(&all);
+                assert!(!pending(&expect));
+                for round in 0..20 {
+                    let mut order = all.clone();
+                    Lcg(seed * 1000 + round).shuffle(&mut order);
+                    let (mut y, _) = peer(99);
+                    for u in &order {
+                        y.apply(u).unwrap();
+                    }
+                    assert_eq!(read(&y), read(&expect), "peers {peers} seed {seed} round {round}");
+                    assert!(!pending(&y), "pending left: peers {peers} seed {seed} round {round}");
+                    assert!(!y.needs_resync());
+                }
+            }
+        }
+    }
+
+    /// Two peers edit; `peer 1`'s first update is withheld from `y`, so every later one from it
+    /// stays held. Returns the withheld update, the rest, and the author's full state.
+    fn withheld(extra: &[usize]) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        let (mut a, text) = peer(1);
+        let mut all = Vec::new();
+        for (i, size) in extra.iter().enumerate() {
+            let chunk = "x".repeat(*size);
+            let at = u32::try_from(read(&a).len()).unwrap();
+            let t = text.clone();
+            all.push(
+                a.local(|txn| {
+                    t.insert(txn, at, &format!("{i}{chunk}"));
+                    Ok(())
+                })
+                .unwrap(),
+            );
+        }
+        let first = all.remove(0);
+        let state = a.state();
+        (first, all, state)
+    }
+
+    /// Past the entry cap the held updates are dropped and the resync mark is raised; a full
+    /// state then brings the replica level.
+    #[test]
+    fn too_many_held_updates_raise_resync_and_a_full_state_recovers() {
+        let sizes = vec![1; MAX_PENDING_UPDATES + 50];
+        let (first, rest, state) = withheld(&sizes);
+        let (mut y, _) = peer(99);
+        for (i, u) in rest.iter().enumerate() {
+            y.apply(u).unwrap();
+            if i < MAX_PENDING_UPDATES {
+                assert!(!y.needs_resync(), "raised early at {i}");
+            }
+        }
+        assert!(y.needs_resync());
+        assert!(rest.len() > MAX_PENDING_UPDATES);
+        // Bounded: after the drop at most the 49 updates that came since are held.
+        let held = held_bytes(&y);
+        assert!(held < 1024, "held {held} bytes");
+        assert!(y.apply_full_state(&state).is_ok());
+        assert!(!y.needs_resync());
+        assert!(!pending(&y));
+        let (mut z, _) = peer(98);
+        z.apply(&first).unwrap();
+        for u in &rest {
+            z.apply(u).unwrap();
+        }
+        assert_eq!(read(&y), read(&z));
+    }
+
+    /// The byte cap works too, with a handful of large updates.
+    #[test]
+    fn too_many_held_bytes_raise_resync() {
+        let big = MAX_PENDING_BYTES / 2 + 1024;
+        let (_, rest, state) = withheld(&[1, big, big, big]);
+        let (mut y, _) = peer(99);
+        y.apply(&rest[0]).unwrap();
+        assert!(!y.needs_resync());
+        y.apply(&rest[1]).unwrap();
+        assert!(y.needs_resync(), "two of {big} bytes pass the cap");
+        let held = held_bytes(&y);
+        assert!(held < MAX_PENDING_BYTES, "held {held} bytes after the drop");
+        y.apply_full_state(&state).unwrap();
+        assert!(!y.needs_resync());
+        assert_eq!(read(&y).len(), 2 + 3 * (big + 1), "all text arrived");
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.

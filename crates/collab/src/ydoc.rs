@@ -180,8 +180,10 @@ impl LiveDoc {
         }
         let doc = self.y.rebuilt(space)?;
         let damaged = self.y.damaged();
+        let resync = self.y.needs_resync();
         *self = assemble(doc, Some(space));
         self.y.set_damaged(damaged);
+        self.y.set_needs_resync(resync);
         Ok(())
     }
 
@@ -204,10 +206,19 @@ impl LiveDoc {
         self.y.damaged()
     }
 
+    /// Whether updates were dropped because their dependencies never came (the replica holds
+    /// bounded numbers of waiting updates, see [`YReplica::needs_resync`]). It is sound but
+    /// behind; it needs the room's full state.
+    #[must_use]
+    pub fn needs_resync(&self) -> bool {
+        self.y.needs_resync()
+    }
+
     /// Merge an update from another replica, and say what it changed.
     ///
     /// Updates may arrive in any order and more than once. One whose dependencies have not
-    /// arrived yet is held by yrs and lands when they do.
+    /// arrived yet is held and lands when they do (up to a bound, past which
+    /// [`needs_resync`](Self::needs_resync) is raised).
     pub fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
         let before = self.order();
         self.drain_seen();
@@ -483,6 +494,9 @@ impl Replica for LiveDoc {
     }
     fn damaged(&self) -> bool {
         LiveDoc::damaged(self)
+    }
+    fn needs_resync(&self) -> bool {
+        LiveDoc::needs_resync(self)
     }
 }
 

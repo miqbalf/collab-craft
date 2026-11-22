@@ -1022,6 +1022,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         if !changes.is_empty() {
             work.push(Work::Doc { changes });
         }
+        if doc.needs_resync() && !std::mem::replace(&mut self.told_incomplete, true) {
+            // Updates this replica was holding for missing dependencies were dropped to stay
+            // within bounds, so it is behind with no way to catch up from the ops alone.
+            log::warn!("collab: too many updates waited for dependencies that did not come in {scope}");
+            self.notices.push(format!("{scope} has changes this session cannot rebuild; reopen the file"));
+            work.push(Work::TextIncomplete { scope: scope.clone() });
+        }
         if damaged {
             work.push(Work::TextIncomplete { scope });
         }

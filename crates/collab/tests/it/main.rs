@@ -1790,3 +1790,58 @@ fn a_settled_replica_is_told_of_a_lost_history_and_keeps_working() {
     let work = live.pump();
     assert!(!work.iter().any(|w| matches!(w, Work::HistoryLost)), "{work:?}");
 }
+
+/// Updates from three peers, delivered to a `LiveDoc` in shuffled order, end where in-order
+/// delivery does. Held updates must land once their dependencies have.
+#[test]
+fn livedoc_shuffled_delivery_equals_in_order_delivery() {
+    fn next(state: &mut u64) -> usize {
+        *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(*state >> 33).unwrap()
+    }
+    fn texts(d: &LiveDoc) -> Vec<(u64, String)> {
+        d.order().iter().map(|id| (*id, d.block(*id).unwrap().text)).collect()
+    }
+    for seed in [1_u64, 2, 5, 8, 17, 42] {
+        let mut rng = seed;
+        let mut peers: Vec<LiveDoc> = (1..=3).map(|space| replica(&sample(), space)).collect();
+        let mut seen = [0usize; 3];
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for step in 0..60_u64 {
+            let p = next(&mut rng) % 3;
+            if next(&mut rng).is_multiple_of(2) {
+                for u in &all[seen[p]..] {
+                    peers[p].apply(u).unwrap();
+                }
+                seen[p] = all.len();
+            }
+            let order = peers[p].order();
+            let id = order[next(&mut rng) % order.len()];
+            let len = peers[p].block(id).unwrap().text.chars().count();
+            let update = if len > 4 && next(&mut rng).is_multiple_of(4) {
+                peers[p].delete_text(id, next(&mut rng) % (len - 1), 1).unwrap()
+            } else {
+                let at = next(&mut rng) % (len + 1);
+                peers[p].insert_text(id, at, &format!("{}", step % 10), &Map::new()).unwrap()
+            };
+            all.push(update);
+        }
+        let mut expect = replica(&sample(), 99);
+        for u in &all {
+            expect.apply(u).unwrap();
+        }
+        for round in 0..20_u64 {
+            let mut order = all.clone();
+            let mut r = seed * 1000 + round;
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(&mut r) % (i + 1));
+            }
+            let mut d = replica(&sample(), 98);
+            for u in &order {
+                d.apply(u).unwrap();
+            }
+            assert_eq!(texts(&d), texts(&expect), "seed {seed} round {round}");
+            assert!(!d.needs_resync());
+        }
+    }
+}
