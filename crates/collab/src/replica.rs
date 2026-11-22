@@ -395,16 +395,19 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
 /// update never reaches a browser replica, where a yrs panic aborts the page.
 ///
 /// Refused: bytes that do not decode, a clock, block end or id past 2^31 (anything below that
-/// cannot wrap a `u32`), a client's blocks adding up past it, a client with two sections, and
-/// anything the byte reader does not understand (see the `walk` module). A client whose only
-/// blocks have length 0 passes. Runs under `catch_unwind`, so a panic while decoding is a refusal. This is a check of
-/// the update on its own; whether it fits a document's history is only known to a replica.
+/// cannot wrap a `u32`), a client's blocks adding up past it, a client with two sections, forms
+/// the byte reader and yrs would read differently (JSON content, the XmlHook type), anything the
+/// byte reader does not understand, and any update where yrs's parse differs from the reader's
+/// (see the `walk` module). Runs under `catch_unwind`, so a panic while decoding is a refusal.
+/// This is a check of the update on its own; whether it fits a document's history is only known
+/// to a replica.
 #[must_use]
 pub fn update_is_sound(bytes: &[u8]) -> bool {
     std::panic::catch_unwind(|| {
         // The walk reads the bytes itself, because nothing yrs exposes can see a clock that
-        // wrapped; yrs's decode then has to agree that the update is well formed.
-        crate::walk::blocks_in_range(bytes).is_some() && Update::decode_v1(bytes).is_ok()
+        // wrapped; yrs's decode then has to accept the update and agree with the walk on it.
+        let Some(shape) = crate::walk::read(bytes) else { return false };
+        Update::decode_v1(bytes).is_ok_and(|update| crate::walk::agrees(&shape, &update))
     })
     .unwrap_or(false)
 }
@@ -1018,13 +1021,14 @@ mod tests {
         }
         updates.push(doc.transact().encode_state_as_update_v1(&StateVector::default()));
         for (i, u) in updates.iter().enumerate() {
-            let spans = crate::walk::blocks_in_range(u).unwrap_or_else(|| panic!("update {i} refused"));
+            let shape = crate::walk::read(u).unwrap_or_else(|| panic!("update {i} refused"));
             let yrs_update = Update::decode_v1(u).unwrap();
             let inserted = yrs_update.insertions(true);
             for (client, ranges) in inserted.iter() {
                 let total: u64 = ranges.iter().map(|r| u64::from(r.end - r.start)).sum();
-                assert_eq!(spans.get(&client.get()), Some(&total), "update {i} client {client:?}");
+                assert_eq!(shape.totals().get(&client.get()), Some(&total), "update {i} client {client:?}");
             }
+            assert!(crate::walk::agrees(&shape, &yrs_update), "update {i}");
             assert!(update_is_sound(u), "update {i}");
         }
     }
@@ -1065,6 +1069,358 @@ mod tests {
         fine.extend(item);
         fine.push(0);
         assert!(update_is_sound(&fine));
+    }
+
+    /// The two byte patterns from re-review 3 (I7): bytes yrs takes, where the round 3 walk read
+    /// one thing and yrs another, hiding a garbage-collected block whose clock wraps.
+    fn desync_patterns() -> [(&'static str, Vec<u8>); 2] {
+        // JSON content with a count of 0: yrs reads one string (the walk's next section header),
+        // then a section whose second GC block, inside the walk's binary payload, is 0xFFFFFFF8
+        // long at clock 21.
+        let mut json = vec![2, 1, 5, 0, 0x02, 1, 1, b't', 0, 1, 0x50, 2, 0x03, 1, 0, 20];
+        let mut payload = vec![0x00, 0xf8, 0xff, 0xff, 0xff, 0x0f, 0x00];
+        payload.resize(20, 0);
+        json.extend(payload);
+        json.push(0);
+        // An XmlHook type: the walk read a hook name that yrs reads as a section of two blocks,
+        // a deleted item 0xF7EFC7F4 long and a GC block 0xF0000870 long after it. The name bytes
+        // are valid UTF-8 (U+10FFFF, U+10000).
+        let mut hook = vec![2, 1, 5, 0, 0x07, 1, 1, b't', 5, 2, 0x09, 0x00];
+        hook.extend([1, 1, 3, 0x04, 1, 11, 0xf4, 0x8f, 0xbf, 0xbf, 0x0f, 0x00, 0xf0, 0x90, 0x80, 0x80, 0x0f, 0]);
+        hook.push(0);
+        [("json", json), ("xml hook", hook)]
+    }
+
+    /// I7: JSON content and the XmlHook type are refused, and yrs really does take those bytes
+    /// with a wrapping clock in them.
+    #[test]
+    fn json_and_xml_hook_desyncs_are_refused() {
+        for (name, bytes) in desync_patterns() {
+            let update = Update::decode_v1(&bytes).unwrap_or_else(|e| panic!("{name}: yrs refused it: {e}"));
+            // yrs's parse has a different shape from anything the walk could report: client 3
+            // (json) or 9 (hook) only exists in yrs's reading.
+            assert!(update.state_vector_lower().iter().any(|(c, _)| c.get() == 3 || c.get() == 9), "{name}: {update:?}");
+            assert!(crate::walk::read(&bytes).is_none(), "{name}: the walk took it");
+            assert!(!update_is_sound(&bytes), "{name} passed");
+        }
+    }
+
+    /// The agreement check on its own: had the walk been fooled the way round 3's was, the
+    /// difference with yrs's parse refuses the update.
+    #[test]
+    fn a_parse_that_differs_from_yrs_is_refused() {
+        let [(_, json), (_, hook)] = desync_patterns();
+        // What round 3's walk saw: client 5 an empty JSON item, client 0x50 one binary item at 2.
+        let json_view = crate::walk::Shape { blocks: [(0x50, vec![(2, 3)])].into(), ..Default::default() };
+        assert!(!crate::walk::agrees(&json_view, &Update::decode_v1(&json).unwrap()));
+        // Client 5 one type at 0, client 1 an empty string item at 3.
+        let hook_view = crate::walk::Shape { blocks: [(5, vec![(0, 1)])].into(), upper: [(5, 1)].into(), ..Default::default() };
+        assert!(!crate::walk::agrees(&hook_view, &Update::decode_v1(&hook).unwrap()));
+        // And a correct view of an honest update agrees.
+        let mut fine = vec![1, 2, 1, 0, 0x00, 5];
+        fine.extend([0x04, 1, 1, b't', 1, b'a']);
+        fine.push(0);
+        let shape = crate::walk::read(&fine).unwrap();
+        assert_eq!(shape.blocks, [(1, vec![(0, 6)])].into());
+        assert!(crate::walk::agrees(&shape, &Update::decode_v1(&fine).unwrap()));
+    }
+
+    /// Integers yrs reads at a narrower width than they are written: a long form, or a value past
+    /// `u32`, reads differently (yrs wraps its shifts), so only the shortest form is taken.
+    #[test]
+    fn long_or_wide_varints_are_refused() {
+        let item = [0x04, 1, 1, b't', 1, b'a'];
+        let with = |head: &[u8]| {
+            let mut u = head.to_vec();
+            u.extend(item);
+            u.push(0);
+            u
+        };
+        assert!(update_is_sound(&with(&[1, 1, 1, 0])));
+        // The clock 0 written in two bytes.
+        assert!(!update_is_sound(&with(&[1, 1, 1, 0x80, 0x00])));
+        // A block count of 2^32 + 1, which yrs reads as 1.
+        assert!(!update_is_sound(&with(&[1, 0x81, 0x80, 0x80, 0x80, 0x10, 1, 0])));
+        // Parent info 2^32 + 1, which yrs reads as 1 (named) where a wider reader reads an id.
+        assert!(!update_is_sound(&[1, 1, 1, 0, 0x04, 0x81, 0x80, 0x80, 0x80, 0x10, 1, b't', 1, b'a', 0]));
+    }
+
+    /// Edits of every kind the Craft apps make, on three peers that sync now and then.
+    #[derive(Debug, Clone)]
+    enum Edit {
+        Text { at: u16, s: u8, bold: bool },
+        Embed { at: u16 },
+        Cut { at: u16, n: u8 },
+        Format { at: u16, n: u8 },
+        MapSet { key: u8, v: u8 },
+        MapNested { key: u8, kind: u8 },
+        MapCut { key: u8 },
+        ArrayPut { at: u16, v: u8 },
+        ArrayCut { at: u16, n: u8 },
+        Inner { at: u16, s: u8 },
+        Sync { from: u8 },
+    }
+
+    fn edit() -> impl proptest::strategy::Strategy<Value = (u8, Edit)> {
+        use proptest::prelude::*;
+        let e = prop_oneof![
+            (any::<u16>(), any::<u8>(), any::<bool>()).prop_map(|(at, s, bold)| Edit::Text { at, s, bold }),
+            any::<u16>().prop_map(|at| Edit::Embed { at }),
+            (any::<u16>(), any::<u8>()).prop_map(|(at, n)| Edit::Cut { at, n }),
+            (any::<u16>(), any::<u8>()).prop_map(|(at, n)| Edit::Format { at, n }),
+            (any::<u8>(), any::<u8>()).prop_map(|(key, v)| Edit::MapSet { key, v }),
+            (any::<u8>(), any::<u8>()).prop_map(|(key, kind)| Edit::MapNested { key, kind }),
+            any::<u8>().prop_map(|key| Edit::MapCut { key }),
+            (any::<u16>(), any::<u8>()).prop_map(|(at, v)| Edit::ArrayPut { at, v }),
+            (any::<u16>(), any::<u8>()).prop_map(|(at, n)| Edit::ArrayCut { at, n }),
+            (any::<u16>(), any::<u8>()).prop_map(|(at, s)| Edit::Inner { at, s }),
+            any::<u8>().prop_map(|from| Edit::Sync { from }),
+        ];
+        (0_u8..3, e)
+    }
+
+    fn value(v: u8) -> Any {
+        let s = ["x", "h\u{e9}", "\u{1f600}", ""][usize::from(v % 4)];
+        match v % 7 {
+            0 => Any::Number(Number::Int(i64::from(v) * -1_000_003)),
+            1 => Any::Number(Number::Float(f64::from(v) / 3.0)),
+            2 => Any::from(s),
+            3 => Any::Array(Arc::from(vec![Any::Null, Any::Undefined, Any::Bool(v.is_multiple_of(2)), Any::from(vec![v, 0])])),
+            4 => Any::Map(Arc::new(std::collections::HashMap::from([
+                ("k".to_owned(), Any::from(s)),
+                ("n".to_owned(), Any::Map(Arc::new(std::collections::HashMap::new()))),
+            ]))),
+            5 => Any::Number(Number::Int(i64::MAX - i64::from(v))),
+            _ => Any::Null,
+        }
+    }
+
+    /// The pieces of `text`, each a character or an embed: its byte offsets and whether it is a
+    /// character. Under byte offsets yrs counts an embed in `len` but cannot remove it by range,
+    /// so cuts and formats only span characters.
+    fn pieces(text: &yrs::TextRef, t: &TransactionMut) -> Vec<(u32, u32, bool)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for d in text.diff(t, yrs::types::text::YChange::identity) {
+            if let yrs::Out::Any(Any::String(s)) = d.insert {
+                for c in s.chars() {
+                    let w = u32::try_from(c.len_utf8()).unwrap();
+                    out.push((at, at + w, true));
+                    at += w;
+                }
+            } else {
+                out.push((at, at + 1, false));
+                at += 1;
+            }
+        }
+        out
+    }
+
+    /// Where to insert into `pieces`: before any piece or at the end.
+    fn insert_at(pieces: &[(u32, u32, bool)], at: u16) -> u32 {
+        let i = usize::from(at) % (pieces.len() + 1);
+        pieces.get(i).map_or_else(|| pieces.last().map_or(0, |p| p.1), |p| p.0)
+    }
+
+    /// A run of up to `n % 4 + 1` characters in `pieces`, as (offset, length).
+    fn char_run(pieces: &[(u32, u32, bool)], at: u16, n: u8) -> Option<(u32, u32)> {
+        let chars: Vec<usize> = (0..pieces.len()).filter(|i| pieces[*i].2).collect();
+        let k = *chars.get(usize::from(at) % chars.len().max(1))?;
+        let mut j = k;
+        while j + 1 < pieces.len() && pieces[j + 1].2 && j - k < usize::from(n % 4) {
+            j += 1;
+        }
+        Some((pieces[k].0, pieces[j].1 - pieces[k].0))
+    }
+
+    /// Runs `edits` on three peers and returns every update they made: each edit's diff, the
+    /// diffs a sync carries, full states, diffs against old states, and merges (which hold skips).
+    fn honest_updates(edits: &[(u8, Edit)]) -> Vec<Vec<u8>> {
+        use yrs::types::Attrs;
+        use yrs::{Array, Map, Out};
+        let docs: Vec<Doc> = (1..=3).map(build_doc).collect();
+        let mut out = Vec::new();
+        let mut old = Vec::new();
+        for (p, e) in edits {
+            let doc = &docs[usize::from(*p)];
+            let (text, map, arr) = (doc.get_or_insert_text("t"), doc.get_or_insert_map("m"), doc.get_or_insert_array("a"));
+            let from = doc.transact().state_vector();
+            old.push(from.clone());
+            if let Edit::Sync { from: q } = e {
+                let src = &docs[usize::from(*q % 3)];
+                let diff = src.transact().encode_diff_v1(&from);
+                doc.transact_mut().apply_update(Update::decode_v1(&diff).unwrap()).unwrap();
+                out.push(diff);
+                continue;
+            }
+            {
+                let mut t = doc.transact_mut();
+                let p = pieces(&text, &t);
+                match e {
+                    Edit::Text { at: i, s, bold } => {
+                        let s = ["a", "na\u{ef}ve ", "\u{1f600}x", "\u{4e2d}\u{6587}"][usize::from(s % 4)];
+                        let attrs: Attrs = if *bold { [("b".into(), Any::Bool(true))].into_iter().collect() } else { Attrs::new() };
+                        text.insert_with_attributes(&mut t, insert_at(&p, *i), s, attrs);
+                    }
+                    Edit::Embed { at: i } => {
+                        // A map, so a diff tells it from text.
+                        let img = Any::Map(Arc::new(std::collections::HashMap::from([("src".to_owned(), Any::from("img"))])));
+                        text.insert_embed(&mut t, insert_at(&p, *i), img);
+                    }
+                    Edit::Cut { at: i, n } => {
+                        if let Some((from, len)) = char_run(&p, *i, *n) {
+                            text.remove_range(&mut t, from, len);
+                        }
+                    }
+                    Edit::Format { at: i, n } => {
+                        if let Some((from, len)) = char_run(&p, *i, *n) {
+                            text.format(&mut t, from, len, [("i".into(), Any::Bool(n.is_multiple_of(2)))].into_iter().collect());
+                        }
+                    }
+                    Edit::MapSet { key, v } => {
+                        map.insert(&mut t, format!("k{}", key % 5), value(*v));
+                    }
+                    Edit::MapNested { key, kind } => {
+                        let key = format!("k{}", key % 5);
+                        match kind % 3 {
+                            0 => {
+                                let _ = map.insert(&mut t, key, yrs::MapPrelim::from([("x", value(*kind))]));
+                            }
+                            1 => {
+                                let _ = map.insert(&mut t, key, yrs::ArrayPrelim::from([value(*kind), value(kind / 2)]));
+                            }
+                            _ => {
+                                let _ = map.insert(&mut t, key, yrs::TextPrelim::new("in map"));
+                            }
+                        }
+                    }
+                    Edit::MapCut { key } => {
+                        map.remove(&mut t, &format!("k{}", key % 5));
+                    }
+                    Edit::ArrayPut { at: i, v } => {
+                        let i = u32::from(*i) % (arr.len(&t) + 1);
+                        match v % 3 {
+                            0 => {
+                                let _ = arr.insert(&mut t, i, value(*v));
+                            }
+                            1 => {
+                                let _ = arr.insert(&mut t, i, yrs::TextPrelim::new("in array"));
+                            }
+                            _ => {
+                                let _ = arr.insert(&mut t, i, yrs::ArrayPrelim::from([value(*v)]));
+                            }
+                        }
+                    }
+                    Edit::ArrayCut { at: i, n } if arr.len(&t) > 0 => {
+                        let n_all = arr.len(&t);
+                        let i = u32::from(*i) % n_all;
+                        arr.remove_range(&mut t, i, (u32::from(*n) % 3 + 1).min(n_all - i));
+                    }
+                    Edit::Inner { at: i, s } => {
+                        // Edit a nested type made earlier, in the array or the map.
+                        let nested = (0..arr.len(&t))
+                            .filter_map(|j| arr.get(&t, j))
+                            .chain((0..5).filter_map(|k| map.get(&t, &format!("k{k}"))))
+                            .nth(usize::from(*s % 4));
+                        match nested {
+                            Some(Out::YText(inner)) => {
+                                let at = insert_at(&pieces(&inner, &t), *i);
+                                inner.insert(&mut t, at, "\u{e9}y");
+                            }
+                            Some(Out::YMap(inner)) => {
+                                let _ = inner.insert(&mut t, format!("i{}", s % 3), value(*s));
+                            }
+                            Some(Out::YArray(inner)) => {
+                                let n = inner.len(&t);
+                                inner.insert(&mut t, u32::from(*i) % (n + 1), value(*s));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(doc.transact().encode_diff_v1(&from));
+        }
+        for (i, doc) in docs.iter().enumerate() {
+            out.push(doc.transact().encode_state_as_update_v1(&StateVector::default()));
+            if let Some(sv) = old.get(old.len() * i / 3) {
+                out.push(doc.transact().encode_state_as_update_v1(sv));
+            }
+        }
+        // Merges of every other update leave gaps that yrs fills with skips.
+        let every_other: Vec<&[u8]> = out.iter().step_by(2).map(Vec::as_slice).collect();
+        out.push(yrs::merge_updates_v1(every_other).unwrap());
+        let tail: Vec<&[u8]> = out.iter().skip(out.len() / 2).map(Vec::as_slice).collect();
+        out.push(yrs::merge_updates_v1(tail).unwrap());
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config { cases: 128, rng_seed: proptest::test_runner::RngSeed::Fixed(0x00c6_0004), failure_persistence: None, ..Default::default() })]
+
+        /// For honest updates from random edit sequences the walk and yrs agree, and the gate
+        /// takes every one.
+        #[test]
+        fn the_walk_and_yrs_agree_on_honest_updates(edits in proptest::collection::vec(edit(), 1..40)) {
+            for (i, u) in honest_updates(&edits).iter().enumerate() {
+                let shape = crate::walk::read(u);
+                proptest::prop_assert!(shape.is_some(), "update {} refused by the walk: {:?}", i, u);
+                let update = Update::decode_v1(u).unwrap();
+                proptest::prop_assert!(crate::walk::agrees(shape.as_ref().unwrap(), &update), "update {} disagrees: {:?}", i, u);
+                proptest::prop_assert!(update_is_sound(u), "update {} refused", i);
+            }
+        }
+    }
+
+    /// Damaged honest updates: whenever both the walk and yrs take the bytes, they agree. A
+    /// failure here is a byte form the two read differently.
+    #[test]
+    fn mutated_updates_the_walk_takes_agree_with_yrs() {
+        let edits: Vec<(u8, Edit)> = (0..60_u8)
+            .map(|i| {
+                let e = match i % 10 {
+                    0 => Edit::Text { at: u16::from(i), s: i, bold: i.is_multiple_of(3) },
+                    1 => Edit::Embed { at: u16::from(i) },
+                    2 => Edit::MapSet { key: i, v: i },
+                    3 => Edit::MapNested { key: i, kind: i },
+                    4 => Edit::ArrayPut { at: u16::from(i), v: i },
+                    5 => Edit::Inner { at: u16::from(i), s: i },
+                    6 => Edit::Format { at: u16::from(i), n: i },
+                    7 => Edit::Cut { at: u16::from(i), n: i },
+                    8 => Edit::ArrayCut { at: u16::from(i), n: i },
+                    _ => Edit::Sync { from: i },
+                };
+                (i % 3, e)
+            })
+            .collect();
+        let mut honest = honest_updates(&edits);
+        honest.extend(desync_patterns().into_iter().map(|(_, b)| b));
+        let mut rng = Lcg(0xc6);
+        let (mut both, mut tried) = (0_u32, 0_u32);
+        for _ in 0..60_000 {
+            let mut m = honest[rng.below(honest.len())].clone();
+            for _ in 0..=rng.below(3) {
+                let at = rng.below(m.len().max(1));
+                let b = u8::try_from(rng.below(256)).unwrap();
+                match rng.below(4) {
+                    0 if !m.is_empty() => m[at] = b,
+                    1 if !m.is_empty() => m[at] ^= 1 << rng.below(8),
+                    2 => m.insert(at.min(m.len()), b),
+                    _ if !m.is_empty() => {
+                        m.remove(at);
+                    }
+                    _ => {}
+                }
+            }
+            tried += 1;
+            let Some(shape) = crate::walk::read(&m) else { continue };
+            let Ok(Ok(update)) = std::panic::catch_unwind(|| Update::decode_v1(&m)) else { continue };
+            both += 1;
+            assert!(crate::walk::agrees(&shape, &update), "the walk and yrs disagree on {m:?}");
+        }
+        println!("MUTATED {tried} tried, {both} taken by both");
+        assert!(both > 1000, "too few mutations parse: {both}");
     }
 
     /// Bytes that do not decode are refused without damage; nothing changes.

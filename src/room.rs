@@ -1031,6 +1031,18 @@ mod tests {
         for bytes in [gc, skip, twice] {
             assert!(!ok("crdt.text", serde_json::json!([wire(&bytes)])));
         }
+        // I7: JSON content and an XmlHook type, which yrs reads differently from the byte walk
+        // of round 3 and where yrs then finds a GC block whose clock wraps.
+        let mut json = vec![2, 1, 5, 0, 0x02, 1, 1, b't', 0, 1, 0x50, 2, 0x03, 1, 0, 20, 0x00, 0xf8, 0xff, 0xff, 0xff, 0x0f, 0x00];
+        json.resize(json.len() + 13, 0);
+        json.push(0);
+        let hook = [
+            2, 1, 5, 0, 0x07, 1, 1, b't', 5, 2, 0x09, 0x00, 1, 1, 3, 0x04, 1, 11, 0xf4, 0x8f, 0xbf, 0xbf, 0x0f, 0x00, 0xf0, 0x90, 0x80, 0x80, 0x0f,
+            0, 0,
+        ];
+        for bytes in [&json[..], &hook[..]] {
+            assert!(!ok("crdt.text", serde_json::json!([good, wire(bytes)])));
+        }
     }
 
     fn crdt_sub(peer: &str, scope: &str) -> Submission {
