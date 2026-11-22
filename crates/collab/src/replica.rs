@@ -154,6 +154,11 @@ impl YReplica {
         Ok(doc)
     }
 
+    /// How many runs the replica's placement index holds (see the `fits` module).
+    pub(crate) fn index_runs(&self) -> usize {
+        self.seen.len()
+    }
+
     /// The document, for the schema's reads.
     #[must_use]
     pub fn doc(&self) -> &Doc {
@@ -291,11 +296,8 @@ impl YReplica {
     /// Hand one ready update to yrs.
     fn apply_now(&mut self, update: &[u8]) -> Result<(), LiveError> {
         let before = self.doc.transact().state_vector();
-        let first = integrate_checked(&self.doc, update, true);
-        if first.is_err() {
-            // yrs may have taken part of it: start the cache again rather than guess.
-            self.seen = crate::fits::Seen::default();
-        } else {
+        let first = integrate_checked(&self.doc, update, true, &mut self.seen);
+        if first.is_ok() {
             self.seen.commit(&self.doc.transact());
         }
         if first == Err(Integrate::Panicked) {
@@ -340,6 +342,28 @@ impl YReplica {
     pub fn rebuilt_from_state(&self, state: &[u8]) -> Result<Doc, LiveError> {
         let own = self.doc.client_id();
         let doc = build_doc(own.get());
+        // The roots typed as this replica types them, so the fit check judges the state
+        // against what it will be read as.
+        let roots: Vec<(String, u8)> = self
+            .doc
+            .transact()
+            .root_refs()
+            .filter_map(|(name, out)| match out {
+                yrs::Out::YArray(_) => Some((name.to_owned(), 0)),
+                yrs::Out::YMap(_) => Some((name.to_owned(), 1)),
+                yrs::Out::YText(_) => Some((name.to_owned(), 2)),
+                yrs::Out::YXmlFragment(_) => Some((name.to_owned(), 3)),
+                _ => None,
+            })
+            .collect();
+        for (name, kind) in roots {
+            match kind {
+                0 => drop(doc.get_or_insert_array(name.as_str())),
+                1 => drop(doc.get_or_insert_map(name.as_str())),
+                2 => drop(doc.get_or_insert_text(name.as_str())),
+                _ => drop(doc.get_or_insert_xml_fragment(name.as_str())),
+            }
+        }
         integrate(&doc, state).map_err(LiveError::from)?;
         if doc.transact().has_missing_updates() {
             return Err(LiveError::Decode);
@@ -373,7 +397,7 @@ impl YReplica {
                 break;
             }
             before = now;
-            match integrate_held(&self.doc) {
+            match integrate_held(&self.doc, &mut self.seen) {
                 Ok(()) => {}
                 Err(Integrate::Panicked) => return Err(Integrate::Panicked),
                 Err(Integrate::Refused) => {
@@ -424,7 +448,9 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        let update = self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Some(update)
     }
 
     /// Redo the last undone local edit and return the update to send. `None` on a damaged
@@ -434,7 +460,9 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        let update = self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Some(update)
     }
 
     /// Whether local edits are being kept out of the undo history now.
@@ -464,9 +492,14 @@ impl YReplica {
         if self.client.is_none() {
             return Err(LiveError::NoClient);
         }
-        let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
-        edit(&mut txn)?;
-        Ok(txn.encode_update_v1())
+        let before = self.doc.transact().state_vector();
+        let update = {
+            let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
+            edit(&mut txn)?;
+            txn.encode_update_v1()
+        };
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Ok(update)
     }
 }
 
@@ -498,13 +531,13 @@ impl From<Integrate> for LiveError {
 /// what yrs already holds for missing dependencies, that held part is dropped (yrs would apply it
 /// along with this update) and this update is applied.
 pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
-    integrate_checked(doc, update, false).map(|_| ())
+    integrate_checked(doc, update, false, &mut crate::fits::Seen::default()).map(|_| ())
 }
 
 /// [`integrate`]; `Ok(true)` when held updates were dropped because they did not fit.
 /// `checked`: the update alone was already checked against this document ([`readiness`]), so
 /// it is only checked again together with what yrs holds, if anything.
-fn integrate_checked(doc: &Doc, update: &[u8], checked: bool) -> Result<bool, Integrate> {
+fn integrate_checked(doc: &Doc, update: &[u8], checked: bool, seen: &mut crate::fits::Seen) -> Result<bool, Integrate> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The walk first: it refuses counts the bytes cannot back (an allocation bomb, which
         // aborts rather than unwinds) before yrs's decoder sizes anything by them.
@@ -512,7 +545,6 @@ fn integrate_checked(doc: &Doc, update: &[u8], checked: bool) -> Result<bool, In
         let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
         let mut txn = doc.transact_mut_with(REMOTE);
         let mut dropped = false;
-        let seen = &mut crate::fits::Seen::default();
         let held = txn.store().pending_update().is_some();
         let verdict = if checked && !held { crate::fits::Verdict::Fits } else { crate::fits::check(&txn, &with_held(&txn, &incoming), seen) };
         match verdict {
@@ -527,7 +559,16 @@ fn integrate_checked(doc: &Doc, update: &[u8], checked: bool) -> Result<bool, In
             }
             _ => {}
         }
-        txn.apply_update(decoded).map_err(|_| Integrate::Refused)?;
+        let before = txn.state_vector();
+        let applied = txn.apply_update(decoded);
+        // What landed goes into the index: all of it when the check staged it, and whatever yrs
+        // took of a refused update otherwise (so the next check does not miss it).
+        if applied.is_ok() && (!checked || held) {
+            seen.commit(&txn);
+        } else if applied.is_err() {
+            crate::fits::learn(&txn, update, &before, seen);
+        }
+        applied.map_err(|_| Integrate::Refused)?;
         Ok(dropped)
     }));
     match outcome {
@@ -626,7 +667,7 @@ pub fn update_is_sound(bytes: &[u8]) -> bool {
 
 /// Take what yrs holds for missing dependencies out and apply it again, under `catch_unwind`
 /// for the same reason as [`integrate`]. What still lacks a dependency goes back to being held.
-fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
+fn integrate_held(doc: &Doc, seen: &mut crate::fits::Seen) -> Result<(), Integrate> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut txn = doc.transact_mut_with(REMOTE);
         match txn.prune_pending() {
@@ -638,8 +679,10 @@ fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
                     held.encode_v1()
                 };
                 match crate::walk::items(&bytes) {
-                    Some((_, items)) if crate::fits::check(&txn, &items, &mut crate::fits::Seen::default()) != crate::fits::Verdict::Refused => {
-                        txn.apply_update(held).map_err(|_| Integrate::Refused)
+                    Some((_, items)) if crate::fits::check(&txn, &items, seen) != crate::fits::Verdict::Refused => {
+                        let applied = txn.apply_update(held).map_err(|_| Integrate::Refused);
+                        seen.commit(&txn);
+                        applied
                     }
                     _ => {
                         log::warn!("collab: held updates put content where its parent cannot hold it");
@@ -1422,6 +1465,81 @@ mod tests {
             assert!(integrate(&doc, bytes).is_err(), "{name} was integrated");
         }
         assert!(t.elapsed() < std::time::Duration::from_millis(500), "the refusals took {:?}", t.elapsed());
+    }
+
+    fn varint(out: &mut Vec<u8>, mut n: u64) {
+        while n >= 0x80 {
+            out.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    }
+
+    /// The fit check costs about the same per item however far into a long array an op lands:
+    /// it reads each neighbour's place from an index, not by walking the array to it (which
+    /// was O(position) per neighbour, so an op of many items placed deep in a large array
+    /// cost seconds).
+    #[test]
+    fn the_fit_check_does_not_walk_the_document_per_item() {
+        use yrs::{Array, ReadTxn};
+        const LONG: u64 = 40_000;
+        const OP: u64 = 10_000;
+        let raw = yrs::Doc::with_client_id(5);
+        let a = raw.get_or_insert_array("a");
+        {
+            let mut txn = raw.transact_mut();
+            // Each at the front, so none merge: item k sits right of item k + 1.
+            for _ in 0..LONG {
+                a.insert(&mut txn, 0, true);
+            }
+        }
+        let doc = YReplica::seed_doc();
+        doc.get_or_insert_array("a");
+        let mut y = YReplica::assemble(doc, None, |_, _| {});
+        y.apply(&raw.transact().encode_state_as_update_v1(&yrs::StateVector::default())).unwrap();
+        // One op of OP items from client 9, each between item k + 1 and item k, deep in.
+        let mut op = vec![1];
+        varint(&mut op, OP);
+        op.extend([9, 0]);
+        for k in 0..OP {
+            op.push(0xc8);
+            for (client, clock) in [(5, k + 1), (5, k)] {
+                varint(&mut op, client);
+                varint(&mut op, clock);
+            }
+            op.extend([1, 0x7e]);
+        }
+        op.push(0);
+        let t = std::time::Instant::now();
+        y.apply(&op).unwrap();
+        let took = t.elapsed();
+        assert_eq!(y.doc().get_or_insert_array("a").len(&y.doc().transact()), (LONG + OP) as u32);
+        assert!(took < std::time::Duration::from_secs(1), "the op took {took:?}");
+    }
+
+    /// A full state whose origin chains run far past the nesting cap is judged, not left
+    /// waiting: the cap is on how deep types nest, not on how long a chain is. A document
+    /// edited in turn by many sessions (each a new client id) makes one: each letter typed at
+    /// the front names the previous session's as its right origin, so the chain crosses from
+    /// one client's run of the update into the next, in whichever order yrs writes them.
+    #[test]
+    fn long_origin_chains_in_one_update_are_judged() {
+        use yrs::updates::decoder::Decode;
+        for ids in [(100..180).collect::<Vec<u64>>(), (100..180).rev().collect()] {
+            let mut state = Vec::new();
+            for id in ids {
+                let peer = yrs::Doc::with_client_id(id);
+                if !state.is_empty() {
+                    peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+                }
+                peer.get_or_insert_text("t").insert(&mut peer.transact_mut(), 0, "x");
+                state = peer.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+            }
+            let (mut y, t) = replica(None);
+            y.apply(&state).unwrap();
+            assert!(!y.is_waiting(), "the state waits");
+            assert_eq!(t.get_string(&y.doc().transact()).len(), 80);
+        }
     }
 
     /// Edits of every kind the Craft apps make, on three peers that sync now and then.

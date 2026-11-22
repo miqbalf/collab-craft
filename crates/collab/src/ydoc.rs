@@ -205,6 +205,9 @@ impl LiveDoc {
     /// would be different items from the ones the snapshot holds.
     pub fn from_state(state: &[u8]) -> Result<LiveDoc, LiveError> {
         let doc = YReplica::seed_doc();
+        // Typed first, so the fit check judges the state against the roots it will be read as.
+        doc.get_or_insert_array(BODY);
+        doc.get_or_insert_map(BLOCKS);
         integrate(&doc, state)?;
         Ok(assemble(doc, None))
     }
@@ -805,6 +808,47 @@ mod tests {
         let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "hello".to_owned(), ..SeedBlock::default() }]).unwrap();
         d.set_client(1).unwrap();
         d
+    }
+
+    /// A state is checked against the typed roots it is read with: a string straight in the
+    /// body (an array of block ids) is refused on restore, as it is on apply.
+    #[test]
+    fn a_restore_checks_the_state_against_the_typed_roots() {
+        let string_in_body = [1, 1, 50, 0, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
+        assert!(LiveDoc::from_state(&string_in_body).is_err(), "from_state");
+        let mut d = doc();
+        assert!(d.apply(&string_in_body).is_err(), "apply");
+        assert!(d.y.rebuilt_from_state(&string_in_body).is_err(), "rebuilt_from_state");
+    }
+
+    /// An item that names no parent takes its origin's map key along with its parent (yrs
+    /// copies `parent_sub` from the left neighbour). So a keyed entry crafted into a block's
+    /// text, then a string placed right of it, is a keyed string in the text, which panics at
+    /// the next local cut (yrs text.rs:845). The fit check follows the key down the origin
+    /// chain and refuses the string.
+    #[test]
+    fn a_string_that_inherits_a_key_in_a_text_is_refused() {
+        use yrs::branch::BranchID;
+        let mut d = doc();
+        let text_id = {
+            let txn = d.y.doc().transact();
+            let blocks = txn.get_map(BLOCKS).unwrap();
+            let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+            let text = text_of(&txn, &block).unwrap();
+            let BranchID::Nested(id) = AsRef::<yrs::branch::Branch>::as_ref(&text).id() else { panic!("a root text") };
+            id
+        };
+        let mut keyed = vec![1, 1, 77, 0, 0x28, 0];
+        for n in [text_id.client.get(), u64::from(text_id.clock)] {
+            assert!(n < 0x80, "{n}");
+            keyed.push(n as u8);
+        }
+        keyed.extend([1, b'x', 1, 0x7d, 1, 0]);
+        d.apply(&keyed).unwrap();
+        // A string, origin the keyed entry, no parent named.
+        assert!(d.apply(&[1, 1, 77, 1, 0x84, 77, 0, 1, b'a', 0]).is_err(), "a keyed string got into the text");
+        d.delete_text(1, 0, 5).unwrap();
+        assert_eq!(d.block(1).unwrap().text, "");
     }
 
     /// An embed another peer put in a block's text (WordCraft never writes one; a crafted update

@@ -100,8 +100,11 @@ pub(crate) struct Placed {
     pub(crate) kind: u8,
     pub(crate) type_ref: Option<u8>,
     pub(crate) under: Under,
-    /// It names a key in its parent (a map entry), rather than taking its origin's.
-    pub(crate) sub: bool,
+    /// The key it names in its parent (a map entry). Only an item with no origin and no right
+    /// origin names one; yrs gives the others their neighbour's key (see the `fits` module).
+    /// A garbage-collected range is listed too, as kind 0 with no parent, so the `fits` index
+    /// knows those clocks hold nothing.
+    pub(crate) sub: Option<String>,
     /// An embed whose value is a JSON string.
     pub(crate) string_embed: bool,
 }
@@ -225,15 +228,14 @@ impl Reader<'_> {
         let (origin, right, sub) = (info & 0x80 != 0, info & 0x40 != 0, info & 0x20 != 0);
         let origin = if origin { Some(self.id()?) } else { None };
         let right = if right { Some(self.id()?) } else { None };
-        let mut keyed = false;
+        let mut keyed = None;
         let under = match (origin, right) {
             (None, None) => {
                 // Parent: a root name (1) or the id of an item.
                 let under = if self.u32()? == 1 { Under::Root(self.name()?) } else { Under::Parent(self.id()?) };
                 // Only named here: an item with an origin takes its key from it.
                 if sub {
-                    self.string()?;
-                    keyed = true;
+                    keyed = Some(self.name()?);
                 }
                 under
             }
@@ -334,7 +336,21 @@ fn read_into(mut r: Reader<'_>) -> Option<(Shape, Option<Vec<Placed>>)> {
         for _ in 0..blocks {
             // yrs: exactly 0 is garbage-collected and 10 is a skip; any other byte is an item.
             let (len, skip) = match r.byte()? {
-                0 => (r.u32()?, false),
+                0 => {
+                    let len = r.u32()?;
+                    if let Some(items) = &mut r.items {
+                        items.push(Placed {
+                            id: (client, clock),
+                            len,
+                            kind: 0,
+                            type_ref: None,
+                            under: Under::Beside(None, None),
+                            sub: None,
+                            string_embed: false,
+                        });
+                    }
+                    (len, false)
+                }
                 10 => (r.u32()?, true),
                 info => (r.item(info, (client, clock))?, false),
             };

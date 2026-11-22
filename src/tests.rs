@@ -2014,17 +2014,84 @@ mod relay_proto {
         }
     }
 
-    /// The shadow copy refuses a submit whose second update does not fit, and keeps none of it:
-    /// the first is taken out again, so a resend of the first alone lands.
+    const ARRAY: [u8; 13] = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+    const STRING_IN_ARRAY: [u8; 12] = [1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
+
+    /// The shadow copy refuses a submit whose second update does not fit, and keeps none of it,
+    /// without a rebuild (the submit is merged and judged before anything is applied), so a
+    /// resend of the first alone lands.
     #[tokio::test]
     async fn the_shadow_keeps_a_submit_whole_or_not_at_all() {
+        use crate::ShadowStop;
+        use craft_collab::shadow::{Shadow, ShadowRefusal};
+        let gates = crate::Gates::default();
         let mut gate = crate::Gate::default();
-        let array = vec![1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
-        let string_in_array = vec![1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
-        let refused = crate::admit_on_shadow(&mut gate, "doc", None, vec![array.clone(), string_in_array]).await;
-        assert_eq!(refused, Err(craft_collab::shadow::ShadowRefusal::Invalid));
-        assert_eq!(gate.shadows["doc"].state(), craft_collab::shadow::Shadow::new(None).state(), "the first update was kept");
-        assert_eq!(crate::admit_on_shadow(&mut gate, "doc", None, vec![array]).await, Ok(()));
+        let refused = crate::admit_on_shadow(&gates, &mut gate, None, vec![ARRAY.to_vec(), STRING_IN_ARRAY.to_vec()]).await;
+        assert_eq!(refused, Err(ShadowStop::Refused(ShadowRefusal::Invalid)));
+        let shadow = gate.shadow.as_ref().expect("a copy");
+        assert_eq!(shadow.state(), Shadow::new(None).state(), "the first update was kept");
+        assert_eq!(shadow.rebuilds(), 0, "refusing the submit cost a rebuild");
+        assert!(crate::admit_on_shadow(&gates, &mut gate, None, vec![ARRAY.to_vec()]).await.is_ok());
+    }
+
+    /// Only the document scope is copied: replicas ignore other scopes, so a peer that invents
+    /// scope names cannot crowd the real copy out (each used to get a copy, up to a cap that
+    /// then turned the shadow off for the room).
+    #[test]
+    fn only_the_document_scope_is_shadowed() {
+        let op = craft_collab::update_to_wire(&ARRAY);
+        let params = |scope: &str| json!({ "scope": scope, "ops": [op] });
+        assert!(crate::crdt_updates("crdt.update", &params("doc")).is_some());
+        for junk in ["junk-1", "doc2", ""] {
+            assert!(crate::crdt_updates("crdt.update", &params(junk)).is_none(), "{junk:?}");
+        }
+    }
+
+    /// Rebuilds are rate-limited: a peer that makes the copy rebuild over and over (a panic, a
+    /// rollback) pauses the room's ops for a while instead of costing a replay every time.
+    #[tokio::test]
+    async fn a_copy_rebuilt_too_often_pauses_the_room() {
+        use crate::{MAX_REBUILDS, ShadowStop};
+        let gates = crate::Gates::default();
+        let mut gate = crate::Gate::default();
+        for _ in 0..MAX_REBUILDS {
+            let mark = crate::admit_on_shadow(&gates, &mut gate, None, vec![ARRAY.to_vec()]).await.expect("lands");
+            crate::unadmit(&mut gate, mark);
+        }
+        assert_eq!(gate.shadow.as_ref().map(craft_collab::shadow::Shadow::rebuilds), Some(MAX_REBUILDS as u64));
+        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, None, vec![ARRAY.to_vec()]).await, Err(ShadowStop::Paused));
+        gate.paused_until = Some(std::time::Instant::now());
+        assert!(crate::admit_on_shadow(&gates, &mut gate, None, vec![ARRAY.to_vec()]).await.is_ok(), "the pause ends");
+    }
+
+    /// A copy past its byte cap, or all copies past theirs, refuses the room's ops rather than
+    /// letting them through unjudged; the relay-wide total follows each copy.
+    #[tokio::test]
+    async fn the_shadow_byte_caps_refuse_new_work() {
+        use crate::ShadowStop;
+        let gates = crate::Gates::new(true, 64, 1 << 20);
+        let mut gate = crate::Gate::default();
+        let big = craft_collab::YReplica::seed_doc();
+        {
+            use craft_collab::yrs::{Array, Transact};
+            let body = big.get_or_insert_array("body");
+            let mut txn = big.transact_mut();
+            body.insert(&mut txn, 0, "x".repeat(100));
+        }
+        let state = {
+            use craft_collab::yrs::{ReadTxn, Transact};
+            big.transact().encode_state_as_update_v1(&craft_collab::yrs::StateVector::default())
+        };
+        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, None, vec![state.clone()]).await, Err(ShadowStop::Full), "the room cap");
+        let gates = crate::Gates::new(true, 1 << 20, 64);
+        assert_eq!(crate::admit_on_shadow(&gates, &mut gate, None, vec![state.clone()]).await, Err(ShadowStop::Full), "the global cap");
+        let (gates, mut gate) = (crate::Gates::default(), crate::Gate::default());
+        assert!(crate::admit_on_shadow(&gates, &mut gate, None, vec![state]).await.is_ok());
+        let held = gates.shadow_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(held > 0 && held == gate.bytes, "{held} vs {}", gate.bytes);
+        crate::lose_copy(&gates, &mut gate, "test");
+        assert_eq!(gates.shadow_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(crate::SHADOW_LOST.load(std::sync::atomic::Ordering::Relaxed) >= 1, "a lost copy is counted");
     }
 
     #[test]

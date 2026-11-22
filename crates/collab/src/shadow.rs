@@ -41,6 +41,14 @@ pub struct Shadow {
     base: Vec<u8>,
     log: Vec<Vec<u8>>,
     log_bytes: usize,
+    rebuilds: u64,
+}
+
+/// Where a [`Shadow`] stood, for [`Shadow::rollback`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    log: usize,
+    log_bytes: usize,
 }
 
 /// The roots a replica schema types, as (name, is a map). A root the schema does not name stays
@@ -71,7 +79,7 @@ impl Shadow {
     /// replicas cannot read it back is refused; with no schema, or an unknown one, they are not.
     #[must_use]
     pub fn new(schema: Option<&str>) -> Shadow {
-        Shadow { y: fresh(schema), schema: schema.map(str::to_owned), base: Vec::new(), log: Vec::new(), log_bytes: 0 }
+        Shadow { y: fresh(schema), schema: schema.map(str::to_owned), base: Vec::new(), log: Vec::new(), log_bytes: 0, rebuilds: 0 }
     }
 
     /// The schema the copy was made for.
@@ -86,24 +94,78 @@ impl Shadow {
         self.admit_all(std::slice::from_ref(&update))
     }
 
-    /// Try one submit's updates, in order, and keep them all or none: when one is refused, the
-    /// ones before it are taken out again, because the relay refuses the whole submit.
+    /// Try one submit's updates and keep them all or none, because the relay refuses the whole
+    /// submit. Several are merged into one update first, so a refusal is found before anything
+    /// is applied and leaves nothing to take out again; only a panic costs a rebuild.
     pub fn admit_all<U: AsRef<[u8]>>(&mut self, updates: &[U]) -> Result<(), ShadowRefusal> {
-        let mark = (self.log.len(), self.log_bytes);
-        for update in updates {
-            if let Err(refusal) = self.admit_one(update.as_ref()) {
-                if self.log.len() > mark.0 {
-                    self.log.truncate(mark.0);
-                    self.log_bytes = mark.1;
-                    self.rebuild();
+        match updates {
+            [] => Ok(()),
+            [one] => self.admit_one(one.as_ref()),
+            many => {
+                // Each read by the gate's walk first: yrs's merge decodes them.
+                if many.iter().any(|u| crate::walk::read(u.as_ref()).is_none()) {
+                    return Err(ShadowRefusal::Invalid);
                 }
-                return Err(refusal);
+                let merged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| yrs::merge_updates_v1(many.iter().map(AsRef::as_ref))))
+                    .ok()
+                    .and_then(Result::ok)
+                    .ok_or(ShadowRefusal::Invalid)?;
+                self.admit_one(&merged)
             }
         }
+    }
+
+    /// Where the copy stands now, to [`rollback`](Self::rollback) to when the relay refuses an
+    /// op after the copy took it (it is never ordered, so no peer sees it).
+    #[must_use]
+    pub fn mark(&self) -> Mark {
+        Mark { log: self.log.len(), log_bytes: self.log_bytes }
+    }
+
+    /// Take out what was admitted since `mark`. A rebuild, so only for the rare refusal after
+    /// the copy (the relay could not number the op); call [`settle`](Self::settle) only once
+    /// the op is ordered.
+    pub fn rollback(&mut self, mark: Mark) {
+        if self.log.len() > mark.log {
+            self.log.truncate(mark.log);
+            self.log_bytes = mark.log_bytes;
+            self.rebuild();
+        }
+    }
+
+    /// Fold the log into one state once it is past [`COMPACT_BYTES`]. For after an op is
+    /// ordered: a [`Mark`] from before does not survive it.
+    pub fn settle(&mut self) {
         if self.log_bytes > COMPACT_BYTES {
             self.compact();
         }
-        Ok(())
+    }
+
+    /// Fold the log into one state now, to shrink a copy past its byte cap (see
+    /// [`bytes`](Self::bytes)). A [`Mark`] from before does not survive it.
+    pub fn compact_now(&mut self) {
+        self.compact();
+    }
+
+    /// About how many bytes the copy holds: its document (at most its base and log again), its
+    /// base, its log and its index.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        2 * (self.base.len() + self.log_bytes) + self.y.index_runs() * 96
+    }
+
+    /// How many times the copy was rebuilt (after a panic, or a rollback).
+    #[must_use]
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
+    /// Type the roots by `schema` from now on, if the copy was made without one.
+    pub fn set_schema(&mut self, schema: Option<&str>) {
+        if self.schema.is_none() && schema.is_some() {
+            self.schema = schema.map(str::to_owned);
+            self.rebuild();
+        }
     }
 
     fn admit_one(&mut self, update: &[u8]) -> Result<(), ShadowRefusal> {
@@ -146,13 +208,10 @@ impl Shadow {
         self.y.is_waiting()
     }
 
-    /// Fold the log into one state. While ops wait the log is kept, so a rebuild still has
-    /// them, up to four times the usual size; past that it is folded anyway and a rebuild would
-    /// lose what waits (the copy then judges the ops that need it less, never wrongly).
+    /// Fold the log into one state. Ops that wait are not in the state, so a later rebuild
+    /// loses them (they were accepted unjudged; the copy then judges what needs them less,
+    /// never wrongly). Folding anyway keeps the log bounded by [`COMPACT_BYTES`].
     fn compact(&mut self) {
-        if self.y.is_waiting() && self.log_bytes <= 4 * COMPACT_BYTES {
-            return;
-        }
         if let Ok(state) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.y.state())) {
             self.base = state;
             self.log.clear();
@@ -162,6 +221,7 @@ impl Shadow {
 
     /// Start again from the last compacted state and the ops accepted since.
     fn rebuild(&mut self) {
+        self.rebuilds += 1;
         let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut y = fresh(self.schema.as_deref());
             if !self.base.is_empty() {
@@ -289,6 +349,25 @@ mod tests {
 
     /// The shadow refuses an op its replica refuses, keeps going, and stays level with a replica
     /// that took the same accepted ops.
+    /// An honest checkpoint of a block split, more than the nesting cap times, by as many
+    /// sessions in turn, is judged in full by a fresh copy (it used to wait for ever: the cap
+    /// was on origin-chain length, and the body's chain crosses between the sessions' runs).
+    #[test]
+    fn a_checkpoint_of_a_block_split_many_times_is_judged() {
+        let mut state = LiveDoc::seeded(&[SeedBlock { id: 1, text: "x".repeat(100), ..SeedBlock::default() }]).unwrap().state();
+        for n in 0..70_u64 {
+            let mut peer = LiveDoc::from_state(&state).unwrap();
+            peer.set_client(100 + n as u32).unwrap();
+            peer.split(1 + n, 1, 2 + n).unwrap();
+            state = peer.state();
+        }
+        let mut shadow = Shadow::new(Some("wordcraft/1"));
+        shadow.admit(&state).unwrap();
+        assert!(!shadow.is_waiting(), "the checkpoint waits");
+        let back = LiveDoc::from_state(&shadow.state()).unwrap();
+        assert_eq!(back.block(71).unwrap().text, "x".repeat(30));
+    }
+
     #[test]
     fn the_shadow_refuses_what_does_not_fit_and_keeps_going() {
         let (state, ops) = big_doc(16 * 1024);

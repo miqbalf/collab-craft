@@ -700,16 +700,21 @@ impl Room {
     /// region lock would only serialize what the CRDT is meant to combine. A
     /// scope on those commands is stripped so a buggy client cannot lock a
     /// paragraph by accident.
-    pub fn submit(&mut self, seq: u64, s: Submission) -> Result<Op, Refusal> {
-        if !s.may_edit {
+    /// Whether [`Room::submit`] would take a CRDT op of `bytes` of params from this peer. The
+    /// relay asks before it tries the op on its shadow copy, so the copy never keeps an op the
+    /// room then refuses (a CRDT op is refused for nothing else: scope locks do not apply).
+    pub fn precheck(&self, may_edit: bool, command: &str, bytes: usize) -> Result<(), Refusal> {
+        if !may_edit {
             return Err(Refusal::ReadOnly);
         }
-        let bytes = value_bytes(&s.params);
         // A CRDT op may be a checkpoint snapshot, which the rooms retain up to the text cap.
-        let limit = if is_crdt_command(&s.command) { HISTORY_BYTES.max(self.scope_cap()) } else { HISTORY_BYTES };
-        if bytes > limit {
-            return Err(Refusal::TooLarge { bytes });
-        }
+        let limit = if is_crdt_command(command) { HISTORY_BYTES.max(self.scope_cap()) } else { HISTORY_BYTES };
+        if bytes > limit { Err(Refusal::TooLarge { bytes }) } else { Ok(()) }
+    }
+
+    pub fn submit(&mut self, seq: u64, s: Submission) -> Result<Op, Refusal> {
+        let bytes = value_bytes(&s.params);
+        self.precheck(s.may_edit, &s.command, bytes)?;
         let scope = if is_crdt_command(&s.command) { None } else { s.scope };
         if let Some(scope) = &scope
             && let Some(holder) = self.locks.get(scope)

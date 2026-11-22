@@ -85,7 +85,7 @@ use socketioxide::extract::{Data, SocketRef, State};
 use tokio::sync::Mutex;
 
 use bus::{Bus, LockOutcome, ReleaseOutcome};
-use craft_collab::shadow::{Shadow, ShadowRefusal};
+use craft_collab::shadow::{Mark, Shadow, ShadowRefusal};
 use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, is_crdt_command};
 
 /// Bytes one opaque frame may carry, base64 included.
@@ -351,29 +351,70 @@ fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
 /// The rooms' broadcast gates. See [`Relay::gate`].
 struct Gates {
     map: std::sync::Mutex<HashMap<String, Arc<Mutex<Gate>>>>,
-    /// Whether each `crdt.*` op is tried on a shadow copy of its scope's document before it is
+    /// Whether each `crdt.*` op is tried on a shadow copy of its room's document before it is
     /// ordered (`COLLABCRAFT_SHADOW`, on unless set to `0`). See [`admit_on_shadow`].
     shadow: bool,
+    /// What all rooms' shadow copies hold, about ([`Shadow::bytes`]), and the caps on it.
+    shadow_bytes: std::sync::atomic::AtomicUsize,
+    room_cap: usize,
+    global_cap: usize,
 }
 
 impl Default for Gates {
     fn default() -> Self {
-        Gates::new(true)
+        Gates::new(true, DEFAULT_SHADOW_ROOM_BYTES, DEFAULT_SHADOW_BYTES)
     }
 }
 
 impl Gates {
-    fn new(shadow: bool) -> Gates {
-        Gates { map: std::sync::Mutex::new(HashMap::new()), shadow }
+    fn new(shadow: bool, room_cap: usize, global_cap: usize) -> Gates {
+        Gates { map: std::sync::Mutex::new(HashMap::new()), shadow, shadow_bytes: std::sync::atomic::AtomicUsize::new(0), room_cap, global_cap }
     }
 }
 
-/// What a room's gate guards besides the order of its broadcasts: the shadow copy of each
-/// scope's document, which only a holder of the gate touches, so the copy takes ops in the
-/// order they are numbered.
+/// Default cap on one room's shadow copy (`COLLABCRAFT_SHADOW_ROOM_BYTES`): its document, base,
+/// log and index, about.
+const DEFAULT_SHADOW_ROOM_BYTES: usize = 256 * 1024 * 1024;
+/// Default cap on all rooms' shadow copies together (`COLLABCRAFT_SHADOW_BYTES`).
+const DEFAULT_SHADOW_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Rebuilds (after a panic, or a rollback) one room's copy may make in [`REBUILD_WINDOW`]
+/// before the room's ops are refused for [`REBUILD_PAUSE`]: each costs a replay of the copy.
+const MAX_REBUILDS: usize = 4;
+const REBUILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const REBUILD_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a room's gate guards besides the order of its broadcasts: the shadow copy of the
+/// room's document (the [`craft_collab::DOC_SCOPE`] scope, the only one replicas read), which
+/// only a holder of the gate touches, so the copy takes ops in the order they are numbered.
 #[derive(Default)]
 struct Gate {
-    shadows: HashMap<String, Shadow>,
+    shadow: Option<Shadow>,
+    /// What the copy held at its last count, as added to [`Gates::shadow_bytes`].
+    bytes: usize,
+    /// When the copy was last rebuilt, and until when the room's ops are refused for it.
+    rebuilt: std::collections::VecDeque<std::time::Instant>,
+    rebuilds_seen: u64,
+    paused_until: Option<std::time::Instant>,
+}
+
+/// Why the relay refused an op at the shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowStop {
+    /// The copy refused it, or yrs panicked on it.
+    Refused(ShadowRefusal),
+    /// The room's copy, or all copies together, are past their byte cap.
+    Full,
+    /// The copy was rebuilt too often lately; the room's ops wait for a while.
+    Paused,
+}
+
+/// Times the blocking task of a shadow copy failed (the copy is lost and started again).
+static SHADOW_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A byte count from the environment, or `default` when unset or unreadable.
+fn parse_bytes_or(raw: &str, default: usize) -> usize {
+    raw.trim().parse().ok().filter(|&n: &usize| n > 0).unwrap_or(default)
 }
 
 /// Parse `COLLABCRAFT_SHADOW`: on unless it is `0`, `false` or `off`.
@@ -385,52 +426,119 @@ fn parse_shadow(raw: &str) -> bool {
 /// takes about 15 ms on a 1 MiB checkpoint (release), long enough to stall other rooms.
 const BLOCKING_CHECK_BYTES: usize = 64 * 1024;
 
-/// The yrs updates of a `crdt.*` submit, decoded. `None` when it carries none (or the
-/// gate, which ran first, would have refused it).
+/// The yrs updates of a `crdt.*` submit to the document scope, decoded. `None` when it carries
+/// none, or is for another scope: replicas read only [`craft_collab::DOC_SCOPE`] and ignore the
+/// rest, so ops there cannot reach a replica's yrs and need no copy (one per invented scope
+/// name would let a peer crowd the real one out).
 fn crdt_updates(command: &str, params: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
-    if !is_crdt_command(command) {
+    if !is_crdt_command(command) || params.get("scope").and_then(serde_json::Value::as_str) != Some(craft_collab::DOC_SCOPE) {
         return None;
     }
     let ops = params.get("ops")?.as_array()?;
     ops.iter().map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok())).collect()
 }
 
-/// Try a submit's updates on the shadow copy of `scope` in the room whose gate is `gate`
-/// (held by the caller). Refused when the copy's replica refuses one (it does not fit the
-/// document) or yrs panics applying or encoding it; the copy then stays as it was. Run off
-/// the async runtime, because a checkpoint costs tens of milliseconds on a large document.
+/// Try a submit's updates on the room's shadow copy (`gate` is held by the caller). Refused when
+/// the copy's replica refuses them (they do not fit the document) or yrs panics applying or
+/// encoding them; the copy then stays as it was. Returns where the copy stood before, for the
+/// caller to roll back to if the room then refuses the op. Run off the async runtime, because a
+/// checkpoint costs tens of milliseconds on a large document.
 ///
-/// A room with more scopes than [`room::MAX_SCOPES`] judges the extra ones on an empty copy,
-/// which still catches what breaks yrs without a document.
-async fn admit_on_shadow(gate: &mut Gate, scope: &str, schema: Option<&str>, updates: Vec<Vec<u8>>) -> Result<(), ShadowRefusal> {
-    let kept = gate.shadows.contains_key(scope) || gate.shadows.len() < room::MAX_SCOPES;
-    let shadow = gate.shadows.remove(scope).unwrap_or_else(|| Shadow::new(schema));
+/// Bounded: a copy past its byte cap is compacted, and if still past it (or all copies together
+/// are past theirs), the op is refused rather than let through unjudged; a copy rebuilt
+/// [`MAX_REBUILDS`] times in [`REBUILD_WINDOW`] pauses the room's ops for [`REBUILD_PAUSE`].
+async fn admit_on_shadow(gates: &Gates, gate: &mut Gate, schema: Option<String>, updates: Vec<Vec<u8>>) -> Result<Option<Mark>, ShadowStop> {
+    let now = std::time::Instant::now();
+    if gate.paused_until.is_some_and(|until| now < until) {
+        return Err(ShadowStop::Paused);
+    }
+    let incoming: usize = updates.iter().map(Vec::len).sum();
+    let mut shadow = gate.shadow.take().unwrap_or_else(|| Shadow::new(schema.as_deref()));
+    let (room_cap, global_cap) = (gates.room_cap, gates.global_cap);
+    let total = gates.shadow_bytes.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(gate.bytes);
     let judged = tokio::task::spawn_blocking(move || {
-        let mut shadow = shadow;
-        let verdict = shadow.admit_all(&updates);
-        let waiting = shadow.is_waiting();
-        (shadow, verdict, waiting)
+        // The op before this one was ordered (or rolled back), so its mark is spent.
+        shadow.settle();
+        shadow.set_schema(schema.as_deref());
+        let fits = |s: &Shadow| s.bytes() + 2 * incoming <= room_cap && total + s.bytes() + 2 * incoming <= global_cap;
+        if !fits(&shadow) {
+            shadow.compact_now();
+        }
+        if !fits(&shadow) {
+            return (shadow, Err(ShadowStop::Full), None);
+        }
+        let mark = shadow.mark();
+        let verdict = shadow.admit_all(&updates).map_err(ShadowStop::Refused);
+        (shadow, verdict, Some(mark))
     })
     .await;
     match judged {
-        Ok((shadow, verdict, waiting)) => {
-            if waiting {
+        Ok((shadow, verdict, mark)) => {
+            if shadow.is_waiting() {
                 // Expected until the room's first checkpoint (the copy lacks the seed), after a
                 // relay restart, and when two submits race for the gate. Logged, not refused:
                 // honest clients send such ops.
-                tracing::debug!(scope, "an op waits at the shadow copy for something it lacks");
+                tracing::debug!("an op waits at the shadow copy for something it lacks");
             }
-            if kept {
-                gate.shadows.insert(scope.to_owned(), shadow);
-            }
-            verdict
+            let rebuilds = shadow.rebuilds();
+            account(gates, gate, &shadow);
+            gate.shadow = Some(shadow);
+            note_rebuilds(gate, rebuilds, now);
+            verdict.map(|()| mark)
         }
-        // The copy is caught under `catch_unwind` inside, so this is a cancelled task; the
-        // scope starts a fresh copy and the op is let through, as with the shadow off.
+        // The copy is caught under `catch_unwind` inside, so this is a cancelled task; the room
+        // starts a fresh copy and the op is let through, as with the shadow off.
         Err(e) => {
-            tracing::warn!(error = %e, scope, "the shadow copy was lost; starting a new one");
-            Ok(())
+            lose_copy(gates, gate, &e.to_string());
+            Ok(None)
         }
+    }
+}
+
+/// The room's copy is gone (its blocking task failed): count it, log it, and free its bytes, so
+/// the next op starts a fresh copy. The op at hand is let through unjudged, as with the shadow
+/// off; [`SHADOW_LOST`] says how often that happened.
+fn lose_copy(gates: &Gates, gate: &mut Gate, error: &str) {
+    let lost = SHADOW_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::warn!(error, lost, "the shadow copy was lost; starting a new one");
+    gate.shadow = None;
+    gates.shadow_bytes.fetch_sub(std::mem::take(&mut gate.bytes), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count the copy's bytes into the relay-wide total.
+fn account(gates: &Gates, gate: &mut Gate, shadow: &Shadow) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = shadow.bytes();
+    gates.shadow_bytes.fetch_add(bytes, Relaxed);
+    gates.shadow_bytes.fetch_sub(gate.bytes, Relaxed);
+    gate.bytes = bytes;
+}
+
+/// Take an op back out of the room's copy when it is not ordered after all (the bus could not
+/// number it). A rebuild, so it counts toward the room's pause like any other.
+fn unadmit(gate: &mut Gate, mark: Option<Mark>) {
+    if let (Some(mark), Some(shadow)) = (mark, gate.shadow.as_mut()) {
+        shadow.rollback(mark);
+        let rebuilds = shadow.rebuilds();
+        note_rebuilds(gate, rebuilds, std::time::Instant::now());
+    }
+}
+
+/// Record the copy's rebuilds since the last count (`rebuilds` is its running total) and pause
+/// the room when there were [`MAX_REBUILDS`] within [`REBUILD_WINDOW`].
+fn note_rebuilds(gate: &mut Gate, rebuilds: u64, now: std::time::Instant) {
+    while gate.rebuilt.front().is_some_and(|t| now.duration_since(*t) > REBUILD_WINDOW) {
+        gate.rebuilt.pop_front();
+    }
+    let fresh = rebuilds.saturating_sub(gate.rebuilds_seen);
+    gate.rebuilds_seen = rebuilds;
+    for _ in 0..fresh.min(MAX_REBUILDS as u64) {
+        gate.rebuilt.push_back(now);
+    }
+    if gate.rebuilt.len() >= MAX_REBUILDS {
+        gate.paused_until = Some(now + REBUILD_PAUSE);
+        gate.rebuilt.clear();
+        tracing::warn!("a room's shadow copy was rebuilt {MAX_REBUILDS} times within a minute; its ops are refused for a while");
     }
 }
 
@@ -450,8 +558,11 @@ impl Relay {
     /// Drop a room's gate once nobody holds or waits on it.
     fn forget_gate(&self, key: &str) {
         let mut gates = self.gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1) {
-            gates.remove(key);
+        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1)
+            && let Some(gate) = gates.remove(key)
+            && let Ok(gate) = gate.try_lock()
+        {
+            self.gates.shadow_bytes.fetch_sub(gate.bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -660,7 +771,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret: secret_bytes.clone(),
         bus: Mutex::new(bus),
         rooms: Mutex::new(HashMap::new()),
-        gates: Gates::new(shadow),
+        gates: Gates::new(
+            shadow,
+            parse_bytes_or(&std::env::var("COLLABCRAFT_SHADOW_ROOM_BYTES").unwrap_or_default(), DEFAULT_SHADOW_ROOM_BYTES),
+            parse_bytes_or(&std::env::var("COLLABCRAFT_SHADOW_BYTES").unwrap_or_default(), DEFAULT_SHADOW_BYTES),
+        ),
         room_grace: ROOM_GRACE,
     });
     // For the health route, which outlives the move into the socket layer.
@@ -1285,29 +1400,6 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     let gate = relay.gate(&claims.rm);
     let mut ordered = gate.lock().await;
 
-    // Tried on the scope's shadow copy under the gate, so the copy takes ops in the order they
-    // are numbered, and before the sequence, so a refusal burns nothing. The gate above reads an
-    // op alone; this is what catches an op that decodes but breaks yrs in the document it lands
-    // in. See [`craft_collab::shadow`].
-    if relay.gates.shadow
-        && let Some(updates) = crdt_updates(&msg.command, &msg.params)
-    {
-        let scope_key = msg.params.get("scope").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-        let schema = {
-            let rooms = relay.rooms.lock().await;
-            rooms.get(&claims.rm).and_then(Room::schema).map(str::to_owned)
-        };
-        if let Err(refusal) = admit_on_shadow(&mut ordered, &scope_key, schema.as_deref(), updates).await {
-            drop(ordered);
-            tracing::warn!(room = %claims.rm, peer = %claims.pid, reason = %refusal, "refused an op the shadow copy could not take");
-            let _ = socket.emit(
-                "error",
-                &ErrorMsg { doc: room_name, detail: "that change is not a valid document update".to_owned(), local, code: Some(CODE_INVALID) },
-            );
-            return;
-        }
-    }
-
     // A fenced submit (an ordered edit) is ordered only while its sender holds the scope under
     // the grant's token. Checked on the bus, inside the gate and before the sequence: a holder
     // that was paused or cut off past its lease, and whose scope was granted again since, is
@@ -1337,6 +1429,48 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         }
     }
 
+    // Tried on the room's shadow copy under the gate, so the copy takes ops in the order they
+    // are numbered, and before the sequence, so a refusal burns nothing. The gate above reads an
+    // op alone; this is what catches an op that decodes but breaks yrs in the document it lands
+    // in. See [`craft_collab::shadow`]. Only an op the room will record is tried (the room is
+    // asked first), and the copy is rolled back if the op is not ordered after all, so the copy
+    // holds exactly what peers are sent.
+    let mut mark = None;
+    if relay.gates.shadow
+        && let Some(updates) = crdt_updates(&msg.command, &msg.params)
+    {
+        let (schema, room_says) = {
+            let rooms = relay.rooms.lock().await;
+            let room = rooms.get(&claims.rm);
+            let says = room.map_or(Ok(()), |r| r.precheck(claims.may_edit(), &msg.command, room::value_bytes(&msg.params)));
+            (room.and_then(Room::schema).map(str::to_owned), says)
+        };
+        // Refused by the room below, with its own message; the copy is not asked.
+        if room_says.is_ok() {
+            match admit_on_shadow(&relay.gates, &mut ordered, schema, updates).await {
+                Ok(m) => mark = m,
+                Err(stop) => {
+                    drop(ordered);
+                    let (detail, code) = match stop {
+                        ShadowStop::Refused(refusal) => {
+                            tracing::warn!(room = %claims.rm, peer = %claims.pid, reason = %refusal, "refused an op the shadow copy could not take");
+                            ("that change is not a valid document update", CODE_INVALID)
+                        }
+                        ShadowStop::Full => {
+                            tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op: the room's shadow copy is past its byte cap");
+                            ("that document is too large for this relay to check", CODE_INVALID)
+                        }
+                        ShadowStop::Paused => {
+                            tracing::info!(room = %claims.rm, peer = %claims.pid, "refused an op while the room's shadow copy is paused");
+                            ("relay is busy checking this document; try again shortly", CODE_RETRY)
+                        }
+                    };
+                    let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail: detail.to_owned(), local, code: Some(code) });
+                    return;
+                }
+            }
+        }
+    }
     // The sequence comes from Valkey, so two relay instances cannot hand out
     // the same number.
     let floor = {
@@ -1348,6 +1482,8 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         match bus.next_seq(&claims.rm, floor).await {
             Ok(s) => s,
             Err(e) => {
+                unadmit(&mut ordered, mark);
+                drop(ordered);
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
                 let _ = socket
                     .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
@@ -1371,6 +1507,9 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             },
         )
     };
+    if outcome.is_err() {
+        unadmit(&mut ordered, mark);
+    }
     drop(ordered);
 
     match outcome {

@@ -854,7 +854,32 @@ fn items_mut(u: &mut Upd) -> Vec<&mut Item> {
 fn mutate(u: &mut Upd, pool: &Pool, donors: &[Upd], r: &mut Rng) {
     let n_items = items_mut(u).len();
     let pick_item = |_: &mut Upd, r: &mut Rng| -> Option<usize> { if n_items == 0 { None } else { Some(r.below(n_items)) } };
-    match r.below(22) {
+    match r.below(23) {
+        21 => {
+            // An item beside a keyed entry this update makes, naming no parent: yrs gives it the
+            // entry's parent and its key (the review's C1, a keyed string in a text).
+            let mut keyed = Vec::new();
+            for sec in &u.secs {
+                let mut clock = sec.clock;
+                for b in &sec.blocks {
+                    if let Blk::Item(it) = b
+                        && it.sub.is_some()
+                        && it.origin.is_none()
+                        && it.right.is_none()
+                    {
+                        keyed.push((sec.client, clock + b.len() - 1));
+                    }
+                    clock += b.len();
+                }
+            }
+            if let (Some(&id), Some(i)) = (r.pick(&keyed), pick_item(u, r)) {
+                let it = item_at(u, i);
+                it.origin = Some(id);
+                it.right = None;
+                it.parent = Parent::Inherit;
+                it.sub = None;
+            }
+        }
         0 | 1 => {
             if let Some(i) = pick_item(u, r) {
                 let id = pool.id(r);
