@@ -299,8 +299,18 @@ struct Fenced {
     lease_ms: u64,
     /// When the lease was last granted or refreshed, on the clock [`Live::refresh_lease`] is given.
     refreshed_at: Option<f64>,
-    /// A newer grant of this scope, `(token, lease_ms)`, that starts its fence once this one ends.
-    next: Option<(u64, u64)>,
+    /// A newer grant of this scope that starts its fence once this one ends.
+    next: Option<Parked>,
+}
+
+/// A newer grant of the fenced scope, waiting for the old fence to settle. The app hears of it
+/// ([`LockEvent::Granted`]) only once its fence starts, so no edit meant for it can land in the
+/// old, dead fence and be taken back. Its lease is refreshed meanwhile.
+struct Parked {
+    token: u64,
+    lease_ms: u64,
+    seq: Option<u64>,
+    refreshed_at: Option<f64>,
 }
 
 /// The fenced submit in flight.
@@ -831,13 +841,20 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// relay also extends it on each fenced edit. When the lease is gone the relay answers and
     /// [`pump`](Live::pump) reports [`LockEvent::Lost`].
     pub fn refresh_lease(&mut self, now_ms: f64) {
-        let Some(f) = self.fence.as_mut().filter(|f| !f.dead && !f.unlocked) else { return };
-        let at = *f.refreshed_at.get_or_insert(now_ms);
-        if now_ms - at < f.lease_ms as f64 / 2.0 {
+        let Some(f) = self.fence.as_mut() else { return };
+        let scope = f.scope.clone();
+        // The live grant, or a newer one parked behind a dead fence.
+        let (token, lease_ms, refreshed_at) = match f.next.as_mut() {
+            Some(next) => (next.token, next.lease_ms, &mut next.refreshed_at),
+            None if !f.dead && !f.unlocked => (f.token, f.lease_ms, &mut f.refreshed_at),
+            None => return,
+        };
+        let at = *refreshed_at.get_or_insert(now_ms);
+        if now_ms - at < lease_ms as f64 / 2.0 {
             return;
         }
-        f.refreshed_at = Some(now_ms);
-        let msg = self.wire.refresh_lock(f.scope.clone(), f.token);
+        *refreshed_at = Some(now_ms);
+        let msg = self.wire.refresh_lock(scope, token);
         if let Err(e) = self.hub.send(msg) {
             log::debug!("collab: a lease refresh was not sent: {e}");
         }
@@ -1067,12 +1084,19 @@ impl<H: Hub, R: Replica> Live<H, R> {
             f.queue = chunks.collect();
         }
         let local = self.send_with(&first, Some(fence));
-        // Kept unless it never left for good (too large: the replica broke). One the hub could
-        // not send goes again on the rejoin.
-        if let (Ok(Some(_)) | Err(Error::Hub(_)), Some(f)) = (&local, self.fence.as_mut()) {
+        // Kept unless it never left for good (too large: the replica broke, and the fence went
+        // with it). One the hub could not send goes again after the backoff, or on the rejoin.
+        if let Some(f) = self.fence.as_mut() {
             let locals: Vec<u64> = local.as_ref().ok().copied().flatten().into_iter().collect();
             f.sent.extend(locals.iter().copied());
             f.inflight = Some(InFlight { update: first, locals });
+            if local.is_err() {
+                f.retry = true;
+                if self.retry_at.is_none() {
+                    self.retry_at = now_ms().map(|now| now + self.retry_wait.as_secs_f64() * 1000.0);
+                    self.retry_wait = (self.retry_wait * 2).min(RETRY_MOST);
+                }
+            }
         }
         local.map(|_| ())
     }
@@ -1094,7 +1118,16 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 }
             }
             Ok(None) => {}
-            Err(e) => log::warn!("collab: an edit made under the lock could not be sent again: {e}"),
+            Err(e) => {
+                log::warn!("collab: an edit made under the lock could not be sent again: {e}");
+                if let Some(f) = self.fence.as_mut().filter(|f| f.inflight.is_some()) {
+                    f.retry = true;
+                    if self.retry_at.is_none() {
+                        self.retry_at = now_ms().map(|now| now + self.retry_wait.as_secs_f64() * 1000.0);
+                        self.retry_wait = (self.retry_wait * 2).min(RETRY_MOST);
+                    }
+                }
+            }
         }
     }
 
@@ -1433,22 +1466,36 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// scope already fenced (the app asked again) makes the old fence dead: its edits stay
     /// under the old token, so the relay refuses them, and the new fence starts once the old
     /// one has settled. An edit made under a grant is never sent under another.
-    fn fenced_grant(&mut self, scope: &str, token: u64, lease_ms: Option<u64>, work: &mut Vec<Work<R::Change>>) {
+    ///
+    /// Announces the grant ([`LockEvent::Granted`]) when its fence starts: at once, or for a
+    /// parked one once the old fence has settled.
+    fn fenced_grant(&mut self, scope: &str, seq: Option<u64>, token: u64, lease_ms: Option<u64>, work: &mut Vec<Work<R::Change>>) {
         self.grants.insert(scope.to_owned(), token);
         let lease_ms = lease_ms.unwrap_or(DEFAULT_LEASE_MS);
-        match self.fence.as_mut() {
+        let announce = match self.fence.as_mut() {
             Some(f) if f.scope == scope && f.token == token => {
                 // The same grant again (a refresh of the same holder): the lease is fresh.
                 f.refreshed_at = None;
                 f.lease_ms = lease_ms;
+                true
             }
             Some(f) if f.scope == scope => {
-                f.next = Some((token, lease_ms));
+                f.next = Some(Parked { token, lease_ms, seq, refreshed_at: None });
                 let old = f.token;
                 self.kill_fence(old, work);
+                false
             }
-            Some(f) => log::warn!("collab: {scope} was granted while a run under {} is still fenced; its edits go out under that one", f.scope),
-            None => self.start_fence(scope, token, lease_ms),
+            Some(f) => {
+                log::warn!("collab: {scope} was granted while a run under {} is still fenced; its edits go out under that one", f.scope);
+                true
+            }
+            None => {
+                self.start_fence(scope, token, lease_ms);
+                true
+            }
+        };
+        if announce {
+            work.push(Work::Lock(LockEvent::Granted { scope: scope.to_owned(), seq, token: Some(token) }));
         }
         self.settle_fence(work);
     }
@@ -1540,8 +1587,12 @@ impl<H: Hub, R: Replica> Live<H, R> {
             if f.unlocked {
                 self.end_fence(&f);
             }
-            if let Some((token, lease_ms)) = f.next {
-                self.start_fence(&f.scope, token, lease_ms);
+            if let Some(next) = f.next {
+                self.start_fence(&f.scope, next.token, next.lease_ms);
+                if let Some(started) = self.fence.as_mut() {
+                    started.refreshed_at = next.refreshed_at;
+                }
+                work.push(Work::Lock(LockEvent::Granted { scope: f.scope.clone(), seq: next.seq, token: Some(next.token) }));
                 if f.unlocked {
                     return;
                 }
@@ -1702,7 +1753,11 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 if let Some(f) = self.fence.take() {
                     self.abandoned += f.outstanding();
                     if !f.told {
-                        work.push(Work::Lock(LockEvent::Lost { scope: f.scope, token: f.token }));
+                        work.push(Work::Lock(LockEvent::Lost { scope: f.scope.clone(), token: f.token }));
+                    }
+                    if let Some(next) = f.next {
+                        // Held: the app hears of it, so it can give it back.
+                        work.push(Work::Lock(LockEvent::Granted { scope: f.scope, seq: next.seq, token: Some(next.token) }));
                     }
                 }
                 if document.is_null() {
@@ -1716,12 +1771,10 @@ impl<H: Hub, R: Replica> Live<H, R> {
                     self.notices.push("the other editors sent a document this window cannot install; reopen the file".to_owned());
                 }
             }
-            Effect::LockHeld { scope, seq, token, lease_ms } => {
-                if let Some(token) = token {
-                    self.fenced_grant(&scope, token, lease_ms, work);
-                }
-                work.push(Work::Lock(LockEvent::Granted { scope, seq, token }));
-            }
+            Effect::LockHeld { scope, seq, token, lease_ms } => match token {
+                Some(token) => self.fenced_grant(&scope, seq, token, lease_ms, work),
+                None => work.push(Work::Lock(LockEvent::Granted { scope, seq, token })),
+            },
             Effect::LockLost { scope, token } => self.lose_fence(&scope, token, work),
             Effect::LockDropped { scope } => work.push(Work::Lock(LockEvent::Released { scope })),
             Effect::RemoteLocks { .. } => {}
@@ -1969,6 +2022,66 @@ mod tests {
         assert!(live.redo().is_err());
         assert!(live.checkpoint().is_err());
         assert_eq!(hub.0.borrow().0.len(), 1, "only the edit before the damage went out");
+    }
+
+    fn lock_events<R: Replica>(work: Vec<Work<R::Change>>) -> Vec<LockEvent> {
+        work.into_iter()
+            .filter_map(|w| match w {
+                Work::Lock(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The re-review's N1 and N2: a newer grant of a scope whose old fence still has an edit in
+    /// flight is parked. The app hears of it only once the old fence has settled (so nothing
+    /// meant for it lands in the dead fence and is taken back), and its lease is refreshed
+    /// meanwhile.
+    #[test]
+    fn a_newer_grant_waits_for_the_old_fence_and_keeps_its_lease() {
+        let hub = Hub0::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&[block()]).unwrap();
+        hub.0.borrow_mut().1.push(joined_msg());
+        live.pump();
+        let d = || "d".to_owned();
+        let scope = || "grid/struct".to_owned();
+        let grant = |token: u64| ServerMsg::LockGranted { doc: d(), scope: scope(), seq: Some(0), token: Some(token), lease_ms: Some(1000) };
+        hub.0.borrow_mut().1.push(grant(1));
+        assert_eq!(lock_events::<LiveDoc>(live.pump()), vec![LockEvent::Granted { scope: scope(), seq: Some(0), token: Some(1) }]);
+        live.edit(|doc| doc.insert_text(1, 0, "x", &Map::new())).unwrap();
+        let local = hub
+            .0
+            .borrow()
+            .0
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ClientMsg::Submit { local, fence: Some(_), .. } => Some(*local),
+                _ => None,
+            })
+            .expect("a fenced submit");
+        // Asked again: token 2, while the edit under token 1 is unanswered.
+        hub.0.borrow_mut().1.push(grant(2));
+        let events = lock_events::<LiveDoc>(live.pump());
+        assert_eq!(events, vec![LockEvent::Lost { scope: scope(), token: 1 }], "the parked grant was announced early");
+        assert_eq!(live.fence(), None);
+        // Its lease is refreshed while it waits.
+        hub.0.borrow_mut().0.clear();
+        live.refresh_lease(0.0);
+        live.refresh_lease(600.0);
+        assert!(
+            hub.0.borrow().0.iter().any(|m| matches!(m, ClientMsg::Refresh { token: 2, .. })),
+            "the parked grant's lease was not refreshed: {:?}",
+            hub.0.borrow().0
+        );
+        // The old edit is refused: taken back, and the new grant starts and is announced.
+        hub.0.borrow_mut().1.push(ServerMsg::Error { doc: d(), detail: "fenced".to_owned(), local: Some(local), code: Some(FENCED.to_owned()) });
+        let work = live.pump();
+        assert!(work.iter().any(|w| matches!(w, Work::Reset)));
+        assert_eq!(lock_events::<LiveDoc>(work), vec![LockEvent::Granted { scope: scope(), seq: Some(0), token: Some(2) }]);
+        assert_eq!(live.fence().map(|f| f.token), Some(2));
+        assert_eq!(live.doc().unwrap().block(1).unwrap().text, "hello");
     }
 
     /// A replica that dropped held updates (`needs_resync`) never becomes the room's checkpoint.

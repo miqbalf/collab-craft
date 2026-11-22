@@ -1117,6 +1117,13 @@ fn a_lost_grant_asks_again_or_loses_the_run() {
     assert_eq!(q.poll(6, 8.0), Polled::LockLost { scope: SCOPE.into() });
     assert_eq!(q.poll(6, 9.0), Polled::Nothing, "told twice");
     assert_eq!(q.finish(true), vec![Action::SendUnlock], "a lost fenced run must still end its fence");
+    // A rejoin before the run gives a fenced grant back before asking again.
+    q.request("z", 9.5).unwrap();
+    q.on_lock(&fenced(6, 9), 9.6);
+    assert_eq!(q.rejoined(9.7), vec![Action::SendUnlock, Action::SendLock]);
+    q.on_lock(&LockEvent::Denied { scope: SCOPE.into(), holder: "bob".into() }, 9.8);
+    assert!(q.on_lock(&lost(9), 9.9).is_empty(), "the grant was already given back");
+    assert!(matches!(q.poll(6, 9.9 + GIVE_UP_MS + 1.0), Polled::GaveUp { .. }));
     // A fenced run that was not lost gives its lock back as before.
     q.request("y", 10.0).unwrap();
     q.on_lock(&fenced(7, 5), 11.0);
@@ -1222,8 +1229,14 @@ fn only_one_fenced_submit_is_in_flight() {
     b.le.lock(SCOPE).unwrap();
     b.pump();
     take_grant(&mut b);
-    // The backoff runs out: the retry goes under the old grant and is refused.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The backoff runs out (however slow the runner): the retry goes under the old grant and
+    // is refused.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while a.line(1) != "one" {
+        assert!(std::time::Instant::now() < deadline, "the retry never came back refused");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        settle(&mut [&mut a, &mut b]);
+    }
     settle(&mut [&mut a, &mut b]);
     assert_eq!(relay.seq(), seq, "an edit of the lost run was ordered");
     assert_eq!((a.line(1), a.line(2)), ("one", "two"));
@@ -1272,4 +1285,83 @@ fn a_replaced_document_loses_the_fence() {
     a.pump();
     assert!(a.le.take_lock_events().contains(&lost(token)));
     assert!(a.le.live().fence().is_none());
+}
+
+/// Send what `Ordered` asked for.
+fn act(w: &mut Window, actions: Vec<Action>) {
+    for action in actions {
+        match action {
+            Action::SendLock => w.le.lock(SCOPE).unwrap(),
+            Action::SendUnlock => w.le.unlock(SCOPE).unwrap(),
+        }
+    }
+}
+
+/// The re-review's I4: a rejoin while the item still waits under a fenced grant gives that
+/// grant back before asking again. Otherwise the client's fence for it outlives the request
+/// (denied, then given up): once it died, every later edit would be taken back.
+#[test]
+fn a_rejoin_before_the_run_gives_the_fenced_grant_back() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    act(&mut a, q.request("x", 0.0).unwrap());
+    a.pump();
+    for e in a.le.take_lock_events() {
+        act(&mut a, q.on_lock(&e, 1.0));
+    }
+    assert!(a.le.live().fence().is_some(), "not granted");
+    // The link drops before the item runs; B takes the scope meanwhile.
+    relay.drop_link(a.le.hub());
+    b.pump();
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    take_grant(&mut b);
+    relay.restore_link(a.le.hub());
+    a.pump();
+    let actions = q.rejoined(2.0);
+    assert_eq!(actions, vec![Action::SendUnlock, Action::SendLock]);
+    act(&mut a, actions);
+    settle(&mut [&mut a, &mut b]);
+    for e in a.le.take_lock_events() {
+        act(&mut a, q.on_lock(&e, 3.0));
+    }
+    assert_eq!(q.waiting_for(), Some(peer_of(&relay, &b).as_str()), "A was not denied");
+    assert!(a.le.live().fence().is_none(), "the old grant still fences A");
+    // B keeps it past the wait: A gives up. A's typing is free and reaches B.
+    assert!(matches!(q.poll(a.le.newest_seq(), 3.0 + GIVE_UP_MS + 1.0), Polled::GaveUp { .. }));
+    a.set(1, "typed after giving up");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "typed after giving up");
+    assert_eq!(a.line(1), "typed after giving up");
+    assert_eq!(relay.holder(SCOPE).map(|(p, _)| p), Some(peer_of(&relay, &b)), "A's unlock released B's grant");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The re-review's N4: a fenced edit whose send failed is sent again (after the backoff), not
+/// left in flight with no counter for the relay to answer.
+#[test]
+fn a_fenced_edit_whose_send_failed_goes_again() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    relay.fail_sends(a.le.hub(), true);
+    a.set(1, "sent at last");
+    relay.fail_sends(a.le.hub(), false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while b.line(1) != "sent at last" {
+        assert!(std::time::Instant::now() < deadline, "the failed send never went again");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        settle(&mut [&mut a, &mut b]);
+    }
+    a.le.unlock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), None);
+    assert_eq!(replica_lines(&a), replica_lines(&b));
 }

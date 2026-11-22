@@ -236,7 +236,8 @@ impl<P> Ordered<P> {
         }
     }
 
-    /// The link rejoined: drop the grant (the relay released it), keep the item, ask again.
+    /// The link rejoined: drop the grant (the relay released it), keep the item, ask again. A
+    /// fenced grant is given back first ([`Action::SendUnlock`], then [`Action::SendLock`]).
     /// The wait for the lock starts over. Feed the lock events taken before the rejoin to
     /// [`on_lock`](Self::on_lock) first (`LiveEditing` already drops the old link's events, so
     /// the order cannot revive a stale grant).
@@ -251,6 +252,16 @@ impl<P> Ordered<P> {
             State::Running { told, token: None, .. } => {
                 self.state = State::Running { held: false, lost: true, told, token: None };
                 Vec::new()
+            }
+            // A fenced grant the item has not run under yet: give it back before asking again.
+            // The relay may still hold it (then this releases it), or it went with the old link
+            // (then this releases nothing); either way the unlock ends the client's fence for
+            // it, which otherwise would die later with nobody left to end it.
+            State::Granted { token: Some(_), .. } => {
+                self.state = State::Asking;
+                self.since = now_ms;
+                self.released_early = false;
+                vec![Action::SendUnlock, Action::SendLock]
             }
             State::Asking | State::Denied { .. } | State::Granted { .. } => {
                 self.state = State::Asking;
