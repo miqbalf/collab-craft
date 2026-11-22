@@ -33,6 +33,14 @@ impl LiveKind for Lines {
 #[derive(Default)]
 struct Engine {
     doc: Doc,
+    /// The unmerged states handed over, and the resets, in the order they came.
+    seen: Vec<Noted>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Noted {
+    Unmerged(Vec<u8>, usize),
+    Reset,
 }
 
 impl LiveApp<Lines> for Engine {
@@ -68,7 +76,12 @@ impl LiveApp<Lines> for Engine {
         self.doc = replica.order().into_iter().map(|id| (id, replica.block(id).map(|b| b.text).unwrap_or_default())).collect();
         Ok(())
     }
-    fn reset(&mut self, _: u32) {}
+    fn reset(&mut self, _: u32) {
+        self.seen.push(Noted::Reset);
+    }
+    fn unmerged(&mut self, state: &[u8], edits: usize) {
+        self.seen.push(Noted::Unmerged(state.to_vec(), edits));
+    }
     fn set_space(&mut self, _: u32) {}
     fn caret(&self, payload: &Value) -> Option<(u64, usize)> {
         let id = payload.get("id")?.as_u64()?;
@@ -100,7 +113,7 @@ impl Window {
     fn join(relay: &MemRelay, uid: &str, access: Access) -> Window {
         let hub = relay.connect(uid, uid, access == Access::Edit);
         let le = LiveEditing::start(hub, ROOM, seed().as_slice(), access).unwrap();
-        let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() };
+        let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
         Window { engine, le }
     }
 
@@ -289,7 +302,7 @@ fn a_late_catch_up_is_told_then_given_up() {
     let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
     let read = now.clone();
     late.set_clock(Box::new(move || *read.lock().unwrap()));
-    let mut engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() };
+    let mut engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
     relay.cut_replay(&hub);
     late.pump(&mut engine);
     assert_eq!(late.status(), &LiveStatus::Connecting);
@@ -630,7 +643,7 @@ fn an_edit_refused_for_good_is_not_saved() {
     let relay = MemRelay::new();
     let hub = relay.connect("alice", "alice", false);
     let le = LiveEditing::start(hub, ROOM, seed().as_slice(), Access::Edit).unwrap();
-    let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() };
+    let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), seen: Vec::new() };
     let mut a = Window { engine, le };
     settle(&mut [&mut a]);
     a.set(1, "uno");
@@ -1364,4 +1377,283 @@ fn a_fenced_edit_whose_send_failed_goes_again() {
     settle(&mut [&mut a, &mut b]);
     assert_eq!(relay.holder(SCOPE), None);
     assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+// C9: editing goes on while the link is down.
+
+/// Free edits made while reconnecting stay in the window and reach every peer on the rejoin, as
+/// one merged submit; every replica ends equal.
+#[test]
+fn edits_made_while_reconnecting_reach_every_peer_after_the_rejoin() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    let mut c = Window::join(&relay, "carol", Access::Edit);
+    settle(&mut [&mut a, &mut b, &mut c]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    assert!(a.le.editable(), "a free edit was refused while reconnecting");
+    assert!(!a.le.ordered_editable(), "an ordered edit was offered while reconnecting");
+    a.set(1, "typed offline");
+    a.pump();
+    a.set(2, "and more");
+    assert_eq!((a.line(1), a.line(2)), ("typed offline", "and more"), "an offline edit was put back");
+    assert_eq!(b.line(1), "one");
+    let seq = relay.seq();
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b, &mut c]);
+    assert_eq!(relay.seq(), seq + 1, "the offline edits did not go out as one bundle");
+    for w in [&b, &c] {
+        assert_eq!((w.line(1), w.line(2)), ("typed offline", "and more"));
+        assert_eq!(replica_lines(w), replica_lines(&a));
+    }
+    assert!(a.le.local_settled() && a.le.editable());
+}
+
+/// Both sides edit while one is offline (the same line too): after the rejoin the replicas and
+/// the engines agree.
+#[test]
+fn two_peers_editing_while_one_is_offline_converge() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    a.set(1, "alice offline");
+    assert_eq!(a.line(1), "alice offline", "the offline edit was put back");
+    b.set(1, "bob online");
+    b.set(2, "bob two");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(a.line(2), "two", "the offline window saw the room");
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+    assert_eq!(a.engine.doc, b.engine.doc);
+    assert_eq!(a.line(2), "bob two");
+    // Both replaced the same text at once: yrs keeps both insertions, in one order everywhere.
+    assert!(a.line(1).contains("alice offline") && a.line(1).contains("bob online"), "{:?}", a.line(1));
+}
+
+/// An ordered edit needs the link: asked for while offline it is refused here, nothing is sent,
+/// and an edit made under a grant the link dropped is put back, the document unchanged.
+#[test]
+fn an_ordered_edit_while_offline_is_refused_locally() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert!(!a.le.ordered_editable());
+    assert!(a.le.lock(SCOPE).is_err(), "a lock was asked for while offline");
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.holder(SCOPE), None, "the offline request reached the relay");
+    assert!(a.le.ordered_editable());
+
+    // Under a grant, the link drops before the run's edit: it is refused, nothing changes.
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    let before = replica_lines(&a);
+    a.set(1, "ordered offline");
+    assert_eq!(a.line(1), "one", "the ordered edit stayed in the engine");
+    assert_eq!(replica_lines(&a), before, "the ordered edit reached the replica");
+    assert!(a.le.take_notices().iter().any(|n| n == crate::ORDERED_OFFLINE));
+    a.le.unlock(SCOPE).unwrap();
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "one");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// Past the offline bound new edits are refused with a notice; the buffered ones survive and
+/// arrive, and editing resumes once they are sent.
+#[test]
+fn edits_past_the_buffer_cap_are_refused_and_the_buffered_ones_arrive() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    let half = craft_collab::OFFLINE_MAX_BYTES / 2 + 1;
+    let (one, two) = ("a".repeat(half), "b".repeat(half));
+    a.set(1, &one);
+    a.set(2, &two);
+    assert!(!a.le.editable(), "the bound did not hold");
+    a.set(1, "refused");
+    assert_eq!(a.line(1), one, "the refused edit stayed, or a buffered one was dropped");
+    assert!(a.le.take_notices().iter().any(|n| n == crate::BUFFER_FULL));
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), (one.as_str(), two.as_str()), "a buffered edit was lost");
+    assert!(a.le.editable(), "editing did not resume once the buffer was sent");
+    a.set(1, "after");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "after");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// The rejoin's resend of an edit whose order was lost with the link reuses the edit's own clock
+/// ranges: the room orders it twice, and the second delivery changes nothing anywhere.
+#[test]
+fn a_duplicate_delivery_of_a_resent_update_is_a_no_op() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.set(1, "once");
+    let seq = relay.seq();
+    b.pump();
+    assert_eq!(b.line(1), "once");
+    let state_b = b.le.live().doc().expect("seeded").state();
+    let state_a = a.le.live().doc().expect("seeded").state();
+    // A never hears its edit was ordered: the link drops first, and the rejoin resends it.
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(relay.seq(), seq + 1, "the resend was not delivered again, as one merged update");
+    assert_eq!(b.le.live().doc().expect("seeded").state(), state_b, "the duplicate changed B");
+    assert_eq!(a.le.live().doc().expect("seeded").state(), state_a, "the resend minted new clocks");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// Before a lost ordered run is taken back, the app gets the replica's state with the run's
+/// edit in it, and only then the reset.
+#[test]
+fn the_unmerged_state_comes_before_the_take_back() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    take_grant(&mut a);
+    relay.lapse(SCOPE);
+    b.le.lock(SCOPE).unwrap();
+    b.pump();
+    a.engine.seen.clear();
+    a.set(1, "refused run");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(a.line(1), "one", "the run was not taken back");
+    let seen = std::mem::take(&mut a.engine.seen);
+    let unmerged = seen.iter().position(|n| matches!(n, Noted::Unmerged(..)));
+    let reset = seen.iter().position(|n| *n == Noted::Reset);
+    assert!(unmerged.is_some() && unmerged < reset, "{seen:?}");
+    let Some(Noted::Unmerged(state, edits)) = seen.into_iter().find(|n| matches!(n, Noted::Unmerged(..))) else { panic!("no state") };
+    assert!(edits >= 1);
+    let copy = LiveDoc::from_state(&state).unwrap();
+    assert_eq!(copy.block(1).unwrap().text, "refused run", "the copy lacks the refused edit");
+}
+
+/// One command made while offline stays one undo step across the rejoin: a single undo takes
+/// the whole command back, for every peer.
+#[test]
+fn an_offline_command_is_one_undo_step_after_the_rejoin() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    // One command changing both lines.
+    let before = a.engine.doc.clone();
+    a.engine.doc = vec![(1, "uno".to_owned()), (2, "dos".to_owned())];
+    a.le.queue().push((before, a.engine.doc.clone()));
+    a.le.flush(&mut a.engine);
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((b.line(1), b.line(2)), ("uno", "dos"));
+    let mut undo = a.le.queue().history_hook();
+    assert!(undo(false), "the rejoin lost the undo history");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!((a.line(1), a.line(2)), ("one", "two"), "one undo did not take the whole command back");
+    assert_eq!((b.line(1), b.line(2)), ("one", "two"));
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+// The C8 re-review's N1 and N5.
+
+/// N1: a newer grant parked behind a fence whose edit is still unanswered reaches the app only
+/// after the old grant's loss, never before (the app would run under a fence not yet started).
+#[test]
+fn a_parked_grant_reaches_the_app_after_the_old_fence_settles() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    let old = take_grant(&mut a);
+    // The relay's answer to a re-grant overtakes the answer to the edit under the old grant.
+    relay.inject(
+        a.le.hub(),
+        ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(relay.seq()), token: Some(old + 1), lease_ms: Some(LEASE_MS) },
+    );
+    a.set(1, "under the old grant");
+    a.pump();
+    let events = a.le.take_lock_events();
+    let granted = events.iter().position(|e| matches!(e, LockEvent::Granted { token: Some(t), .. } if *t == old + 1));
+    let lost_at = events.iter().position(|e| *e == lost(old));
+    assert!(lost_at.is_some(), "{events:?}");
+    assert!(granted.is_none_or(|g| lost_at < Some(g)), "the parked grant was announced before the old one ended: {events:?}");
+    assert_eq!(events.iter().filter(|e| matches!(e, LockEvent::Granted { .. })).count(), usize::from(granted.is_some()), "{events:?}");
+}
+
+/// N5: a grant and a rejoin read in one poll. The app never hears of the grant, so its fence is
+/// given back here; the window's edits after the rejoin are free and reach the room.
+#[test]
+fn a_grant_and_a_rejoin_in_one_poll_leave_no_fence_behind() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    let mut q = Ordered::<&str>::new(SCOPE);
+    q.request("x", 0.0).unwrap();
+    a.le.lock(SCOPE).unwrap();
+    let (_, token) = relay.holder(SCOPE).expect("granted");
+    // The old link's grant, then the drop and the rejoin, all unread: one poll gets them.
+    relay.drop_link(a.le.hub());
+    relay.inject(
+        a.le.hub(),
+        ServerMsg::LockGranted { doc: ROOM.into(), scope: SCOPE.into(), seq: Some(relay.seq()), token: Some(token), lease_ms: Some(LEASE_MS) },
+    );
+    relay.restore_link(a.le.hub());
+    a.pump();
+    for e in a.le.take_lock_events() {
+        assert!(q.on_lock(&e, 1.0).is_empty(), "{e:?}");
+    }
+    assert_eq!(q.rejoined(1.0), vec![Action::SendLock]);
+    assert_eq!(a.le.live().open_fence(), None, "the stale grant's fence was left open");
+    // B takes the scope; A gives up and types on.
+    b.le.lock(SCOPE).unwrap();
+    settle(&mut [&mut a, &mut b]);
+    a.set(1, "free again");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "free again", "an edit after the rejoin went under the stale fence");
+    assert_eq!(replica_lines(&a), replica_lines(&b));
+}
+
+/// N5 across pumps: a fenced grant the app had not taken yet when the link rejoined is dropped
+/// with the old link's answers, and its fence is given back too.
+#[test]
+fn an_untaken_grant_dropped_by_a_rejoin_leaves_no_fence_behind() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.le.lock(SCOPE).unwrap();
+    a.pump();
+    relay.drop_link(a.le.hub());
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert!(a.le.take_lock_events().is_empty(), "a stale grant survived the rejoin");
+    assert_eq!(a.le.live().open_fence(), None, "the stale grant's fence was left open");
+    a.set(1, "free again");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "free again");
 }

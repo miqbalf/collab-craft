@@ -69,7 +69,10 @@ mod tests;
 
 pub use error::{Error, Result};
 pub use hub::{EVENTS, Endpoint, Hub, SLOW_LINK_BYTES_PER_SEC, decode, emit, encode, receive, transfer_time};
-pub use live::{CHECKPOINT_TIMEOUT, DOC_SCOPE, Live, LockEvent, TextPayload, Work, refusal_is_permanent, update_from_wire, update_to_wire};
+pub use live::{
+    CHECKPOINT_TIMEOUT, DOC_SCOPE, Live, LockEvent, MAX_UNCONFIRMED_BYTES, MAX_UNCONFIRMED_EDITS, OFFLINE_MAX_BYTES, TextPayload, Work,
+    refusal_is_permanent, update_from_wire, update_to_wire,
+};
 pub use proto::{
     CRDT_POS, CRDT_TEXT, ClientMsg, DocId, FENCED, Fence, LockState, PROTO, PeerId, Presence, REFUSED_AUTH, REFUSED_FULL, REFUSED_PROTO,
     REFUSED_SCHEMA, RETRY, Scope, ServerMsg, is_crdt_command,

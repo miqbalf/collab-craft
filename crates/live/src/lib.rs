@@ -22,11 +22,15 @@
 //!    before the next command. Edits that reach the pump in a batch (several commands between
 //!    pumps) are shared as one edit, and an edit made after an Undo in the same batch is dropped
 //!    with a notice.
-//! 4. Take no edit while [`LiveEditing::editable`] is false. An edit that arrives anyway is put
-//!    back and the user is told why: the pump is the backstop, not the gate.
+//! 4. Take no edit while [`LiveEditing::editable`] is false, and start no ordered edit while
+//!    [`LiveEditing::ordered_editable`] is false. An edit that arrives anyway is put back and the
+//!    user is told why: the pump is the backstop, not the gate.
 //! 5. Send the caret with [`LiveEditing::send_presence`] whenever it moves; the pump holds it to
 //!    at most five a second ([`CURSOR_INTERVAL_MS`]). In a browser, give it the page's clock
 //!    with [`LiveEditing::set_clock`]; without a clock it counts frames instead.
+//! 6. Implement [`LiveApp::unmerged`]: before the replica drops local edits the room does not
+//!    have (an ordered run taken back, a replica given up), it hands over the replica's state
+//!    with them, to save as an "unmerged copy" of the file.
 //!
 //! # The status
 //!
@@ -40,7 +44,15 @@
 //!   marker from the service uid [`SERVICE_UID`], `{seq, etag}`, `seq` never going back). It
 //!   is kept across reconnects and peers leaving.
 //! - [`LiveStatus::Reconnecting`] when the link drops after it had been live, until the hub's
-//!   rejoin is answered and its catch-up has arrived. No edits.
+//!   rejoin is answered and its catch-up has arrived. Free edits go on: they land in the replica
+//!   and go out, merged into as few submits as fit, on the rejoin, where they merge with what
+//!   the room did meanwhile (yrs merges them; a resend reuses the edits' own clock ranges, so an
+//!   update the room already has is a no-op). The replica keeps its client id space across the
+//!   rejoin, so its undo history, one step per command, carries on. Ordered (structure-locked)
+//!   edits need the link: [`LiveEditing::ordered_editable`] is false (grey them out) and
+//!   [`LiveEditing::lock`] refuses. Edits stop with [`BUFFER_FULL`] once
+//!   `craft_collab::OFFLINE_MAX_BYTES` or `craft_collab::MAX_UNCONFIRMED_EDITS` wait; nothing
+//!   waiting is dropped.
 //! - [`LiveStatus::ReadOnly`] for a read-only ticket, from the start and for good (it follows
 //!   the other editors and shows its caret, and never sends an edit).
 //! - [`LiveStatus::Refused`] when the relay grants no client space, so nothing can be shared.
@@ -123,6 +135,12 @@ const NO_SPACE: &str = "The live editing server cannot share edits right now. Re
 /// No edit is taken until the link is live.
 pub const CONNECTING: &str = "Still connecting to the other editors. You can edit in a moment.";
 const RECONNECTING: &str = "Reconnecting to the other editors. Editing is paused until then.";
+/// An ordered (structure-locked) change was refused because the link is down: it needs the lock,
+/// which only the connected room can grant. Nothing changed.
+pub const ORDERED_OFFLINE: &str = "This change needs the connection to the other editors. Try again once you are reconnected.";
+/// Too many edits wait for the link (`craft_collab::OFFLINE_MAX_BYTES`, `MAX_UNCONFIRMED_EDITS`):
+/// new ones are refused until those are sent. Nothing waiting is dropped.
+pub const BUFFER_FULL: &str = "Too many changes are waiting to be sent to the other editors. Editing resumes once they are sent.";
 const READ_ONLY: &str = "This file is read-only for you.";
 /// Part of a local edit was not shared and the document was rebuilt from the replica.
 pub const PARTIAL: &str = "Part of your last edit could not be shared and was taken back.";
@@ -263,6 +281,14 @@ pub trait LiveApp<K: LiveKind> {
     fn caret(&self, payload: &Value) -> Option<K::Caret>;
     /// Keep each caret on the same content after an edit; drop those whose content is gone.
     fn follow(&self, carets: &mut HashMap<String, K::Caret>);
+    /// The replica is about to drop local edits the room does not have (an ordered run taken
+    /// back, or the replica given up: needs a resync, damaged, replaced, refused). `state` is the
+    /// replica's full state with them (yrs update v1, `Replica::from_state`), taken before the
+    /// drop; `edits` how many local updates the room lacks. Called before the reset or the break
+    /// that drops them: save it as an "unmerged copy" of the file. Nothing by default.
+    fn unmerged(&mut self, state: &[u8], edits: usize) {
+        let _ = (state, edits);
+    }
 }
 
 /// What the hub's join messages said, read as they pass.
@@ -289,8 +315,13 @@ struct Seen {
     resending: bool,
     /// What the relay said about lock scopes since the app last took it, oldest first. Read
     /// here, in the order the messages arrive, so a join empties exactly what came before it
-    /// (the old link's answers), however the poll batches them.
+    /// (the old link's answers), however the poll batches them. A fenced grant and a lost grant
+    /// are `Live`'s own word (it announces a grant when its fence starts) and join this list as
+    /// `Live` reports them.
     lock_events: Vec<LockEvent>,
+    /// Fenced grants a join dropped from [`Seen::lock_events`] before the app took them: their
+    /// fences are given back, since the app, never told, would not.
+    dropped_grants: Vec<(String, u64)>,
 }
 
 impl Seen {
@@ -337,8 +368,10 @@ impl Seen {
             self.confirmed = self.confirmed.max(Some(*seq));
         }
         match m {
-            ServerMsg::LockGranted { scope, seq, token, .. } => {
-                self.lock_events.push(LockEvent::Granted { scope: scope.clone(), seq: *seq, token: *token });
+            // A fenced grant is announced by `Live` once its fence starts (a newer grant waits
+            // for the old fence to settle), so the app never runs under a fence not yet started.
+            ServerMsg::LockGranted { scope, seq, token: None, .. } => {
+                self.lock_events.push(LockEvent::Granted { scope: scope.clone(), seq: *seq, token: None });
             }
             ServerMsg::LockDenied { scope, holder, .. } => self.lock_events.push(LockEvent::Denied { scope: scope.clone(), holder: holder.clone() }),
             ServerMsg::LockReleased { scope, .. } => self.lock_events.push(LockEvent::Released { scope: scope.clone() }),
@@ -348,8 +381,18 @@ impl Seen {
             }
             ServerMsg::Joined { peer, seq, space, replay_until, fallback, .. } => {
                 // The relay released this peer's locks with the old link and told nobody here:
-                // every lock answer heard before this join is stale.
-                self.lock_events.clear();
+                // every lock answer heard before this join is stale. A lost grant is not an
+                // answer of the link (the run it ended was taken back), so it stays. A fenced
+                // grant never taken leaves a fence nobody would end: noted, to give it back.
+                let dropped = &mut self.dropped_grants;
+                self.lock_events.retain(|e| match e {
+                    LockEvent::Lost { .. } => true,
+                    LockEvent::Granted { scope, token: Some(token), .. } => {
+                        dropped.push((scope.clone(), *token));
+                        false
+                    }
+                    _ => false,
+                });
                 // What was sent before is never ordered under these counters now: `Live` sends
                 // it again, merged, as it handles the join.
                 if !self.pending.is_empty() {
@@ -573,6 +616,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     pub fn pump(&mut self, app: &mut impl LiveApp<K>) -> Vec<Peer<K::Pos>> {
         self.flush(app);
         let works = self.live.pump();
+        self.give_back_dropped_grants();
         if let Some(now) = self.clock.as_mut().map(|c| c()) {
             self.live.refresh_lease(now);
         }
@@ -645,7 +689,13 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// taken back: the replica returns to the room's state, the app is reset and resynced from
     /// it ([`LiveApp::reset`]), and `LockEvent::Lost` follows. The lease is refreshed at half its
     /// length while held, on the host's clock ([`set_clock`](Self::set_clock)).
+    ///
+    /// Refused while the link is down ([`ordered_editable`](Self::ordered_editable) is false):
+    /// nothing is sent and nothing changes; the user is told [`ORDERED_OFFLINE`].
     pub fn lock(&mut self, scope: &str) -> craft_collab::Result<()> {
+        if !self.live.connected() {
+            return Err(craft_collab::Error::Hub(ORDERED_OFFLINE.to_owned()));
+        }
         self.live.lock(scope)
     }
 
@@ -659,7 +709,11 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
 
     /// What the relay said about locks since the last call, oldest first. A rejoin drops every
     /// answer that came before it, taken or not yet taken, even within one poll: the relay
-    /// released this peer's locks with the old link, so a grant from it is never handed out.
+    /// released this peer's locks with the old link, so a grant from it is never handed out (a
+    /// fenced one's fence is given back here, since nobody else would). `LockEvent::Lost` is
+    /// kept across a rejoin. A fenced grant (`token` set) is handed out when its fence starts:
+    /// a re-grant of a scope whose old fence still has an edit unanswered comes after that
+    /// fence's `Lost`, once its edit is answered.
     /// What came after the join is kept. Feed these to `Ordered::on_lock`, then call
     /// `Ordered::rejoined` if the link rejoined; the order does not matter for correctness.
     pub fn take_lock_events(&mut self) -> Vec<LockEvent> {
@@ -673,14 +727,58 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         lock(&self.shared).queue.is_empty() && self.live.unconfirmed_edits() == 0 && !lock(&self.seen).stale
     }
 
-    /// Whether the host may take edits now: live, connected, with an edit ticket.
+    /// Whether the host may take free (unordered) edits now, with an edit ticket: while live, and
+    /// also while [`LiveStatus::Reconnecting`] once the link had been live. Edits made while the
+    /// link is down land in the replica and go out, merged, on the rejoin, where they merge with
+    /// what the room did meanwhile. Not while the link is down and an ordered run is still open
+    /// (its edits need the lock), and not while too much is waiting to be sent
+    /// ([`BUFFER_FULL`]). Ordered edits have their own gate,
+    /// [`ordered_editable`](Self::ordered_editable).
     pub fn editable(&self) -> bool {
-        matches!(self.status, LiveStatus::Live { .. }) && self.access == Access::Edit && self.live.connected() && self.live.ready_to_type()
+        self.refusal().is_none()
     }
 
-    /// Why no edit is taken now, for the user: connecting, reconnecting, read-only, or the
-    /// reason the link was refused or broke.
+    /// Whether the host may start an ordered (structure-locked) edit now: live and connected,
+    /// with room in the buffer. False while reconnecting: grey those commands out, and refuse
+    /// one tried anyway with [`ORDERED_OFFLINE`] ([`lock`](Self::lock) refuses it too).
+    pub fn ordered_editable(&self) -> bool {
+        matches!(self.status, LiveStatus::Live { .. })
+            && self.access == Access::Edit
+            && self.live.connected()
+            && self.live.ready_to_type()
+            && !self.live.buffer_full()
+    }
+
+    /// Why a local edit is refused now, for the user; `None` when it is taken.
+    fn refusal(&self) -> Option<String> {
+        let line = match &self.status {
+            LiveStatus::Live { .. } | LiveStatus::Reconnecting if self.access == Access::Edit => {
+                let online = matches!(self.status, LiveStatus::Live { .. }) && self.live.connected();
+                if !self.live.ready_to_type() || !self.been_live {
+                    RECONNECTING
+                } else if !online && self.live.open_fence().is_some() {
+                    // Under the lock every edit is part of the ordered run, which needs the link.
+                    ORDERED_OFFLINE
+                } else if self.live.buffer_full() {
+                    BUFFER_FULL
+                } else {
+                    return None;
+                }
+            }
+            LiveStatus::Live { .. } | LiveStatus::Reconnecting | LiveStatus::ReadOnly => READ_ONLY,
+            LiveStatus::Connecting => CONNECTING,
+            LiveStatus::Refused(m) | LiveStatus::Broken(m) => return Some(m.clone()),
+        };
+        Some(line.to_owned())
+    }
+
+    /// Why no edit is taken now, for the user: connecting, reconnecting, read-only, too much
+    /// waiting to be sent, an ordered run that needs the link, or the reason the link was
+    /// refused or broke.
     pub fn not_editable(&self) -> String {
+        if let Some(why) = self.refusal() {
+            return why;
+        }
         match &self.status {
             LiveStatus::Connecting => CONNECTING.to_owned(),
             LiveStatus::Live { .. } | LiveStatus::Reconnecting => RECONNECTING.to_owned(),
@@ -786,6 +884,21 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         &mut self.live.hub_mut().hub
     }
 
+    /// A join dropped fenced grants the app never took ([`Seen::dropped_grants`]): they went with
+    /// the old link, and no `Ordered` will unlock them, so their fences end here. Otherwise every
+    /// later edit would go out under a grant the relay no longer holds and be taken back.
+    fn give_back_dropped_grants(&mut self) {
+        let dropped = std::mem::take(&mut lock(&self.seen).dropped_grants);
+        for (scope, token) in dropped {
+            if self.live.open_fence().is_some_and(|f| f.scope == scope && f.token == token) {
+                log::info!("live: a grant from the old link was never taken; giving it back");
+                if let Err(e) = self.live.unlock(&scope) {
+                    log::debug!("live: an unlock was not sent: {e}");
+                }
+            }
+        }
+    }
+
     fn note_join(&mut self, app: &mut impl LiveApp<K>) {
         let (joins, space) = {
             let s = lock(&self.seen);
@@ -797,8 +910,11 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         self.joins = joins;
         self.need_join = false;
         match space {
-            Some(space) if space > 0 => {
+            Some(granted) if granted > 0 => {
                 self.refused = None;
+                // The replica keeps its first space across rejoins (`Live::space`): a new one
+                // only when the room lost its history.
+                let space = self.live.space().filter(|s| *s > 0).unwrap_or(granted);
                 if space != self.space {
                     self.space = space;
                     app.set_space(space);
@@ -825,10 +941,17 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
             // A lost grant is `Live`'s own word (a fenced edit refused, a refresh answered), not
-            // a lock answer on the wire, so it joins the events here.
-            Work::Lock(event @ LockEvent::Lost { .. }) => lock(&self.seen).lock_events.push(event),
-            // Lock answers are read off the wire in `Seen`, in order with the joins.
+            // a lock answer on the wire, so it joins the events here. So does a fenced grant:
+            // `Live` announces it when its fence starts, after an older fence of the scope has
+            // settled, and leaves out one that a rejoin in the same poll made stale.
+            Work::Lock(event @ (LockEvent::Lost { .. } | LockEvent::Granted { token: Some(_), .. })) => lock(&self.seen).lock_events.push(event),
+            // Other lock answers are read off the wire in `Seen`, in order with the joins.
             Work::Lock(_) => {}
+            // Local edits only this replica holds are about to be dropped: the app saves them.
+            Work::Unmerged { state, edits } => {
+                log::warn!("live: {edits} local edits the room does not have are about to be dropped; handing them to the app");
+                app.unmerged(&state, edits);
+            }
             // The relay lost the room's history. A replica that held a settled state goes on
             // (the saver checkpoints it at once, see `take_history_lost`); one that held nothing
             // waits for the snapshot (`Live::awaiting_snapshot`), see `update_status`.

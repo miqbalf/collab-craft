@@ -288,7 +288,10 @@ as a boolean or a render, still take a lock.
 Two rules keep the character identities honest. Every scope allocates from its
 own counters, so the ids a paragraph receives cannot move when another paragraph
 is loaded first. The relay grants each connection its own id space in the join
-payload, and a client mints nothing before that arrives.
+payload, and a client mints nothing before that arrives. A replica keeps the first space it was
+granted across reconnects (nobody else is ever granted it), so its own items, its undo history and
+the edits it made while the link was down carry on unchanged; it takes a new one only when the
+room lost its history.
 
 A peer joining a live session cannot reach the room's text by reading the file,
 because the file is behind every edit made since it was written. The relay
@@ -405,7 +408,8 @@ Phase 1 of live co-editing ships with these. Each is a decision, not an oversigh
   would be stronger and is left for later.
 - **The id space counter has no floor.** It lives in Valkey with a 30-day TTL refreshed on every
   connection. If it is lost (a flush, a different database) while the sequence survives, spaces
-  start again at 1 and a new connection can share a space with a replica still open from before.
+  start again at 1 and a new connection can share a space with a replica still open from before
+  (a replica keeps its space across reconnects, unless the join says the room lost its history).
   Reopening every window after a Valkey flush avoids it.
 - **A crafted yrs update can abort a wasm build.** Native builds catch a yrs panic and mark the
   replica damaged. A browser build targets `wasm32`, where a panic aborts and cannot be

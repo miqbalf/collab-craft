@@ -175,6 +175,16 @@ pub enum Work<C = BlockChange> {
     /// [`crate::REFUSED_FULL`]. The hub stops reconnecting; give it a new ticket with
     /// [`Hub::set_token`] (through [`Live::hub_mut`]) and it connects again.
     ConnectionRefused { code: String, reason: String },
+    /// The replica holds local edits the room does not have, and they are about to be dropped:
+    /// taken back after a lost ordered run ([`Work::Reset`] follows), or given up with the replica
+    /// ([`Work::TextIncomplete`] follows, or the replica broke on a local edit). Raised before the
+    /// work that drops them, at the front of the pump's work (or of the next pump's, when the
+    /// replica broke inside [`Live::edit`]).
+    ///
+    /// `state` is this replica's full state (yrs update v1) with those edits in it, taken just
+    /// before the drop: restore it ([`Replica::from_state`]) and save it as an "unmerged copy"
+    /// so the user loses nothing. `edits` is how many local updates the room lacks.
+    Unmerged { state: Vec<u8>, edits: usize },
     /// The relay joined this link to a room that lost its history (`Joined.history_lost`): it
     /// restarted, or the room was dropped after its grace period, and nobody has checkpointed
     /// since. Raised once per such join.
@@ -211,8 +221,23 @@ const INVALID_UPDATE: &str = "not a valid document update";
 /// [`ServerMsg::Error`]'s `code` for it.
 const INVALID: &str = "invalid";
 
-/// The most local edit bytes a replica holds unconfirmed before it gives up on the link.
-const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
+/// The most local edit bytes a replica holds unconfirmed while the link is up. Past it, new local
+/// edits are refused ([`Live::buffer_full`]) until the relay has ordered some; nothing held is
+/// dropped. Also the most an ordered run's take-back log holds.
+pub const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
+
+/// The most local edit bytes a replica buffers while the link is down. Past it, new local edits
+/// are refused until the link is back and the buffer has gone out; nothing buffered is dropped.
+///
+/// The relay's default retention per scope (`TEXT_BYTES`, 2 MiB): the reconnect bundle alone
+/// never pushes the room's retained text for joiners past what it keeps, and it uploads in about
+/// 32 s on a slow link ([`crate::SLOW_LINK_BYTES_PER_SEC`]).
+pub const OFFLINE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most local edits (separate updates) a replica holds unconfirmed, online or offline. About
+/// half an hour of typing at one edit per keystroke; it bounds the per-edit bookkeeping and the
+/// merge on the reconnect.
+pub const MAX_UNCONFIRMED_EDITS: usize = 10_000;
 
 /// How long a checkpoint may wait for its ordering and the save acknowledgement.
 pub const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -503,6 +528,11 @@ pub struct Live<H, R: Replica = LiveDoc> {
     fence: Option<Fenced>,
     /// The newest fencing token granted per scope, for [`Live::unlock`].
     grants: std::collections::HashMap<Scope, u64>,
+    /// Unmerged local states taken before a drop, for [`Work::Unmerged`] at the next pump's front.
+    unmerged: Vec<(Vec<u8>, usize)>,
+    /// The join being handled lost the room's history: take the space it grants, even though
+    /// this replica already has one.
+    adopt_space: bool,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
     /// Who else is in the document. The identifier comes with the name because a badge's
@@ -556,6 +586,8 @@ impl<H: Hub, R: Replica> Live<H, R> {
             told_lost: false,
             fence: None,
             grants: std::collections::HashMap::new(),
+            unmerged: Vec::new(),
+            adopt_space: false,
             notices: Vec::new(),
             roster: Vec::new(),
             was_connected: true,
@@ -648,6 +680,32 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.fence.as_ref().filter(|f| !f.dead && !f.unlocked).map(Fenced::fence)
     }
 
+    /// The fence of the ordered run this replica has not given back yet, in any state: live,
+    /// lost (dead until [`Live::unlock`]) or draining towards its unlock. `None` once unlocked,
+    /// or with no fenced grant. While it is `Some`, a local edit is part of the ordered run, not
+    /// a free edit.
+    pub fn open_fence(&self) -> Option<Fence> {
+        self.fence.as_ref().filter(|f| !f.unlocked).map(Fenced::fence)
+    }
+
+    /// The client id space this replica mints in: the first the relay granted, kept across
+    /// rejoins so the replica's own items, its undo history and an app's minted ids carry on
+    /// (a new connection's space is taken only when the room lost its history). An app that
+    /// mints its own ids takes the space from here, not from each join.
+    pub fn space(&self) -> Option<u32> {
+        self.space
+    }
+
+    /// Whether a new local command must be refused because too much is waiting for the relay:
+    /// [`MAX_UNCONFIRMED_EDITS`] edits or more, or [`OFFLINE_MAX_BYTES`] or more while the link is
+    /// down ([`MAX_UNCONFIRMED_BYTES`] while it is up). Nothing waiting is dropped; it clears as
+    /// the relay orders what waits. `craft-live` refuses commands on it; an app on [`Live`]
+    /// directly checks it before each command.
+    pub fn buffer_full(&self) -> bool {
+        let bytes = if self.hub.connected() { MAX_UNCONFIRMED_BYTES } else { OFFLINE_MAX_BYTES };
+        self.unconfirmed.len() >= MAX_UNCONFIRMED_EDITS || self.unconfirmed_bytes >= bytes
+    }
+
     /// The highest relay sequence applied to the replica in order. An op that arrived ahead of
     /// a gap is held, not counted, until the ops before it have been applied.
     pub fn applied(&self) -> u64 {
@@ -694,6 +752,11 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// An edit whose update is past the relay's advertised cap (`Joined.text_cap`) is refused
     /// with [`Error::Refused`], permanently: the replica is broken and the file has to be
     /// reopened. Split very large pastes so each stays under it.
+    ///
+    /// Works while the link is down: the edit lands in the replica and goes out, merged with the
+    /// others made meanwhile, when the link rejoins. Check [`buffer_full`](Live::buffer_full)
+    /// before each user command and refuse the command while it holds: the bound is per command,
+    /// so a command made of several updates is never cut in half.
     pub fn edit<F>(&mut self, edit: F) -> Result<()>
     where
         F: FnOnce(&mut R) -> std::result::Result<Vec<u8>, LiveError>,
@@ -915,7 +978,24 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.time_out_checkpoint(&mut work);
         self.send_retries();
         self.settle_fence(&mut work);
+        // Unmerged states go first: each was taken before the work that drops its edits.
+        let unmerged = std::mem::take(&mut self.unmerged).into_iter().map(|(state, edits)| Work::Unmerged { state, edits });
+        work.splice(0..0, unmerged);
         work
+    }
+
+    /// Keep the replica's state for [`Work::Unmerged`] when it holds local edits the room does
+    /// not (`extra` more than the ones tracked), before they are dropped. Taken once per drop: a
+    /// state already waiting for the next pump covers it.
+    fn keep_unmerged(&mut self, extra: usize) {
+        let edits = self.unconfirmed.len() + self.fence.as_ref().map_or(0, Fenced::outstanding) + extra;
+        if edits == 0 || !self.unmerged.is_empty() {
+            return;
+        }
+        if let Some(doc) = self.doc.as_ref() {
+            log::info!("collab: keeping this replica's {edits} unmerged edits for the app before they are dropped");
+            self.unmerged.push((doc.state(), edits));
+        }
     }
 
     /// The document, when it may take a local edit.
@@ -936,6 +1016,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// Give up on this replica for good, and say so.
     fn break_replica(&mut self, why: &str) {
         log::warn!("collab: {why}");
+        self.keep_unmerged(0);
         self.broken = true;
         self.snapshot = None;
         self.abandoned += self.unconfirmed.len();
@@ -971,12 +1052,22 @@ impl<H: Hub, R: Replica> Live<H, R> {
         } else {
             self.told_lost = false;
         }
+        // Only a room that lost its history may hand this replica a new client id space: then
+        // the counter behind the spaces may have started over, and the old one could be granted
+        // to somebody else. Otherwise the replica keeps minting in its own (see `Live::space`).
+        self.adopt_space = history_lost;
         if !self.joined_once || !self.settled {
             let catchup = Catchup { joined: seq, until: replay_until };
             self.catchup = catchup.replays_anything().then_some(catchup);
             // A relay that marks the replay also says whether text ops follow. An older one
             // does not, and its text ops have always been the catch-up.
             self.text_catchup = fallback || replay_until.is_none();
+            if self.catchup.is_none() && !self.text_catchup && !self.awaiting_snapshot && self.doc.is_some() {
+                // A marked join with nothing to replay: there is no snapshot to restart from, so
+                // the loaded replica is the room's. Settled now, a later join (a reconnect after
+                // edits made offline) never restarts it onto a snapshot and drops those edits.
+                self.settled = true;
+            }
         } else {
             self.catchup = None;
             self.text_catchup = false;
@@ -988,6 +1079,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.text_more = false;
         self.told_incomplete = false;
         if self.joined_once {
+            self.drop_old_grants(work);
             self.resend_unconfirmed();
             // The fenced edit in flight goes again under its own fence. If the relay ordered it
             // just before the drop, the catch-up above carries that order and it counts; if
@@ -998,6 +1090,42 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.retry_at = None;
         self.joined_once = true;
         self.lose_checkpoint(work, "the link rejoined");
+    }
+
+    /// A rejoin: grants the old link was given and the app has not heard of yet are gone with
+    /// that link (the relay released them on the disconnect), and nobody would ever unlock their
+    /// fences. A grant announced earlier in this same pump is taken out of `work` again (a join
+    /// drops every lock answer before it), and its fence, which nothing was made under yet, is
+    /// given back. A newer grant parked behind the fence is dropped the same way. The app asks
+    /// again on the rejoin.
+    fn drop_old_grants(&mut self, work: &mut Vec<Work<R::Change>>) {
+        let mut untold = Vec::new();
+        work.retain(|w| match w {
+            Work::Lock(LockEvent::Granted { scope, token: Some(token), .. }) => {
+                untold.push((scope.clone(), *token));
+                false
+            }
+            _ => true,
+        });
+        if let Some(f) = self.fence.as_mut()
+            && let Some(next) = f.next.take()
+        {
+            log::info!("collab: a grant parked behind an ordered run went with the old link");
+            if self.grants.get(&f.scope) == Some(&next.token) {
+                self.grants.remove(&f.scope);
+            }
+            let msg = self.wire.release_grant(&f.scope, Some(next.token));
+            if let Err(e) = self.hub.send(msg) {
+                log::debug!("collab: an unlock was not sent: {e}");
+            }
+        }
+        for (scope, token) in untold {
+            let empty = self.fence.as_ref().is_some_and(|f| f.scope == scope && f.token == token && f.outstanding() == 0 && !f.owed_back);
+            if empty && let Some(f) = self.fence.take() {
+                log::info!("collab: a grant the app never heard of went with the old link; giving it back");
+                self.end_fence(&f);
+            }
+        }
     }
 
     /// Drop a checkpoint whose submit may never be ordered, reported as raced so it is retried.
@@ -1136,6 +1264,8 @@ impl<H: Hub, R: Replica> Live<H, R> {
     fn send_with(&mut self, update: &[u8], fence: Option<Fence>) -> Result<Option<u64>> {
         let params = serde_json::to_value(TextPayload::new(update)).map_err(|e| Error::malformed("client", e.to_string()))?;
         if let Some(bytes) = self.over_cap(&params) {
+            // The edit itself is in the replica and tracked nowhere: count it.
+            self.keep_unmerged(1);
             self.break_replica(&format!("a local edit of {bytes} bytes is past what the relay carries"));
             self.notices.push("that change is too large to share with the other editors; reopen the file".to_owned());
             return Err(Error::Refused(format!("that change is {bytes} bytes, more than this relay will carry")));
@@ -1150,12 +1280,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
             self.unconfirmed.insert(local, update.to_vec());
             self.unconfirmed_bytes += update.len();
         }
+        // Past the buffer's bounds, the next local edit is refused (`Live::buffer_full`); what
+        // is held here is never dropped for it.
         self.hub.send(msg)?;
-        if self.unconfirmed_bytes > MAX_UNCONFIRMED_BYTES {
-            // The relay has not confirmed this much for so long that the link is as good as
-            // gone; holding more would grow without bound.
-            self.break_replica("too many edits are waiting for the relay");
-        }
         Ok(local)
     }
 
@@ -1218,39 +1345,48 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
     }
 
-    /// Merge `updates` in order into as few updates as fit the relay's cap, each measured as
-    /// [`Live::over_cap`] measures a submit. An update that does not fit merged with anything
-    /// goes as it was: it was sent once, so it fits alone.
+    /// Merge `updates` in order into as few updates as surely fit the relay's cap. An update that
+    /// does not fit with anything goes as it was: it was sent once, so it fits alone.
+    ///
+    /// Merging only joins the updates' own items: no clock is minted, so an update the room
+    /// already holds merges and lands as a no-op. Each group is merged once, so a reconnect
+    /// bundle of thousands of small edits costs about its own size, not a pass per edit.
     fn chunked(&self, updates: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
         // The params a submit of `bytes` of update would serialize to, about: base64, the
-        // quotes, and the scope around it. Merged updates are no larger than the parts summed.
+        // quotes, and the scope around it. Merged updates are no larger than the parts summed,
+        // so a group within 90% of the cap by this estimate surely fits.
         let estimate = |bytes: usize| bytes.div_ceil(3) * 4 + 32;
-        let fits = |update: &[u8]| serde_json::to_value(TextPayload::new(update)).map(|params| self.over_cap(&params).is_none()).unwrap_or(false);
-        let cap = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX));
-        // Each chunk, with the summed size of the updates in it.
-        let mut chunks: Vec<(Vec<u8>, usize)> = Vec::new();
+        let budget = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX) / 10 * 9);
+        let fits = |summed: usize| budget.is_none_or(|budget| estimate(summed) <= budget);
+        // Each group, with the summed size of the updates in it.
+        let mut groups: Vec<(Vec<Vec<u8>>, usize)> = Vec::new();
         for update in updates {
-            let grown = chunks.last().and_then(|(last, summed)| {
-                let summed = summed + update.len();
-                // Only near the cap is the exact measure worth its serialization.
-                let (sure, maybe) = match cap {
-                    None => (true, true),
-                    Some(cap) => (estimate(summed) <= cap / 10 * 9, estimate(summed) <= cap / 10 * 11),
-                };
-                if !maybe {
-                    return None;
+            match groups.last_mut() {
+                Some((group, summed)) if fits(*summed + update.len()) => {
+                    *summed += update.len();
+                    group.push(update);
                 }
-                yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok().filter(|merged| sure || fits(merged)).map(|merged| (merged, summed))
-            });
-            match (grown, chunks.last_mut()) {
-                (Some(merged), Some(last)) => *last = merged,
                 _ => {
                     let size = update.len();
-                    chunks.push((update, size));
+                    groups.push((vec![update], size));
                 }
             }
         }
-        chunks.into_iter().map(|(chunk, _)| chunk).collect()
+        let mut chunks = Vec::new();
+        for (group, _) in groups {
+            if group.len() == 1 {
+                chunks.extend(group);
+                continue;
+            }
+            match yrs::merge_updates_v1(&group) {
+                Ok(merged) => chunks.push(merged),
+                Err(e) => {
+                    log::warn!("collab: {} edits did not merge ({e}); they go one by one", group.len());
+                    chunks.extend(group);
+                }
+            }
+        }
+        chunks
     }
 
     /// Merge a batch of wire updates, or hold them until the document is loaded.
@@ -1335,7 +1471,12 @@ impl<H: Hub, R: Replica> Live<H, R> {
         if !changes.is_empty() {
             work.push(Work::Doc { changes });
         }
-        if doc.needs_resync() && !std::mem::replace(&mut self.told_incomplete, true) {
+        let resync = doc.needs_resync();
+        if (resync && !self.told_incomplete) || damaged {
+            // The app gives this replica up next (reopen): keep what only it holds.
+            self.keep_unmerged(0);
+        }
+        if resync && !std::mem::replace(&mut self.told_incomplete, true) {
             // Updates this replica was holding for missing dependencies were dropped to stay
             // within bounds, so it is behind with no way to catch up from the ops alone.
             log::warn!("collab: too many updates waited for dependencies that did not come in {scope}");
@@ -1571,6 +1712,11 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 return;
             }
             if f.owed_back || !f.queue.is_empty() || (f.unlocked && !f.held_back.is_empty()) {
+                // What is taken back is in the replica now and nowhere else. A refused edit is
+                // no longer in flight or queued, so `owed_back` counts it.
+                let owed = usize::from(f.owed_back);
+                self.keep_unmerged(owed);
+                let Some(f) = self.fence.as_mut() else { return };
                 f.owed_back = false;
                 f.queue.clear();
                 f.held_back.clear();
@@ -1657,6 +1803,15 @@ impl<H: Hub, R: Replica> Live<H, R> {
     fn act(&mut self, effect: Effect, work: &mut Vec<Work<R::Change>>) {
         match effect {
             Effect::Space { space } => {
+                if self.space.is_some_and(|own| own != space) && !std::mem::take(&mut self.adopt_space) {
+                    // A rejoin's new space. This replica keeps its own: nobody else is granted it,
+                    // and a new client id would rebuild the replica and start its undo history
+                    // again, so a command made before (or while the link was down) could no
+                    // longer be undone as one step.
+                    log::debug!("collab: keeping id space {own:?} across the rejoin", own = self.space);
+                    return;
+                }
+                self.adopt_space = false;
                 self.space = Some(space);
                 if let Some(doc) = self.doc.as_mut()
                     && let Err(e) = doc.set_client(space)
@@ -1743,6 +1898,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 self.settle_fence(work);
             }
             Effect::Replace { document, seq } => {
+                self.keep_unmerged(0);
                 self.lose_checkpoint(work, "the relay replaced the document");
                 // Edits made against what is being replaced cannot be reconciled with it, and
                 // the room never ordered them: they stay counted, so they never read as saved.
@@ -2082,6 +2238,102 @@ mod tests {
         assert_eq!(lock_events::<LiveDoc>(work), vec![LockEvent::Granted { scope: scope(), seq: Some(0), token: Some(2) }]);
         assert_eq!(live.fence().map(|f| f.token), Some(2));
         assert_eq!(live.doc().unwrap().block(1).unwrap().text, "hello");
+    }
+
+    /// C9: a replica that falls behind (`needs_resync`) with a local edit the room never ordered
+    /// hands that edit's state over (`Work::Unmerged`) before it is given up
+    /// (`Work::TextIncomplete`), so the app can save an unmerged copy.
+    #[test]
+    fn a_replica_given_up_hands_over_its_unmerged_edits_first() {
+        let (ha, hb) = (Hub0::default(), Hub0::default());
+        let mut a = Live::new(ha.clone(), "d");
+        let mut b = Live::new(hb.clone(), "d");
+        a.seed(&[block()]).unwrap();
+        b.seed(&[block()]).unwrap();
+        ha.0.borrow_mut().1.push(joined(1));
+        hb.0.borrow_mut().1.push(joined(2));
+        a.pump();
+        b.pump();
+        // A's own edit, never ordered (the relay never answers it).
+        a.edit(|d| d.insert_text(1, 0, "mine ", &Map::new())).unwrap();
+        // B's edit reaches A while A is behind.
+        b.edit(|d| d.insert_text(1, 5, "!", &Map::new())).unwrap();
+        let Some(ClientMsg::Submit { command, params, local, .. }) = hb.0.borrow_mut().0.pop() else { panic!("B sent nothing") };
+        a.doc.as_mut().unwrap().force_resync(true);
+        ha.0.borrow_mut().1.push(ServerMsg::Op {
+            doc: "d".to_owned(),
+            seq: 1,
+            origin: "p2".to_owned(),
+            local: Some(local),
+            command,
+            params,
+            scope: None,
+        });
+        let work = a.pump();
+        let unmerged = work.iter().position(|w| matches!(w, Work::Unmerged { .. }));
+        let incomplete = work.iter().position(|w| matches!(w, Work::TextIncomplete { .. }));
+        assert!(unmerged.is_some() && incomplete.is_some(), "{work:?}");
+        assert!(unmerged < incomplete, "the unmerged state came after the drop: {work:?}");
+        let Some(Work::Unmerged { state, edits }) = work.into_iter().find(|w| matches!(w, Work::Unmerged { .. })) else {
+            panic!("no unmerged state")
+        };
+        assert!(edits >= 1);
+        let copy = LiveDoc::from_state(&state).unwrap();
+        assert!(copy.block(1).unwrap().text.contains("mine"), "the copy lacks the unmerged edit");
+    }
+
+    /// C9: edits made while the link is down go out on the rejoin as one merged submit, and a
+    /// replica past the offline bound says so (`buffer_full`) without dropping anything.
+    #[test]
+    fn offline_edits_go_out_merged_and_the_bound_drops_nothing() {
+        #[derive(Default)]
+        struct Link {
+            sent: Vec<ClientMsg>,
+            inbox: Vec<ServerMsg>,
+            up: bool,
+        }
+        #[derive(Clone, Default)]
+        struct Flaky(Rc<RefCell<Link>>);
+        impl Hub for Flaky {
+            fn send(&mut self, msg: ClientMsg) -> Result<()> {
+                let mut s = self.0.borrow_mut();
+                // A link that is down drops edits, as the real hubs do.
+                if s.up {
+                    s.sent.push(msg);
+                }
+                Ok(())
+            }
+            fn poll(&mut self) -> Vec<ServerMsg> {
+                std::mem::take(&mut self.0.borrow_mut().inbox)
+            }
+            fn connected(&self) -> bool {
+                self.0.borrow().up
+            }
+        }
+        let hub = Flaky::default();
+        hub.0.borrow_mut().up = true;
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&[block()]).unwrap();
+        hub.0.borrow_mut().inbox.push(joined(1));
+        live.pump();
+        hub.0.borrow_mut().up = false;
+        let big = "x".repeat(OFFLINE_MAX_BYTES / 2 + 1);
+        let mut made = 0;
+        while !live.buffer_full() {
+            live.edit(|d| d.insert_text(1, 0, &big, &Map::new())).unwrap();
+            made += 1;
+            assert!(made < 8, "the bound never held");
+        }
+        assert_eq!(live.unconfirmed_edits(), made, "an edit was dropped at the bound");
+        assert!(hub.0.borrow().sent.is_empty());
+        // Back: the rejoin sends everything, merged, and it keeps its own space.
+        hub.0.borrow_mut().up = true;
+        hub.0.borrow_mut().inbox.push(joined(7));
+        live.pump();
+        assert_eq!(live.space(), Some(1), "the rejoin's space replaced the replica's own");
+        let submits = hub.0.borrow().sent.iter().filter(|m| matches!(m, ClientMsg::Submit { .. })).count();
+        assert_eq!(submits, 1, "the offline edits did not go out as one bundle");
+        assert!(!live.buffer_full(), "online, the larger bound applies");
     }
 
     /// A replica that dropped held updates (`needs_resync`) never becomes the room's checkpoint.
