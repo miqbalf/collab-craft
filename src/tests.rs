@@ -2296,6 +2296,28 @@ mod relay_proto {
         }
     }
 
+    /// C7b fix-1 review: the floor at the default ceiling (half again the cap). With the total
+    /// between the cap and the ceiling, a copy under the floor is still judged: its ops come back
+    /// with a mark, not through the unjudged fail-open.
+    #[tokio::test]
+    async fn a_copy_under_the_floor_is_judged_between_the_cap_and_the_default_ceiling() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let gates = crate::Gates::new(true, 1 << 30, 64 * MIB);
+        assert_eq!(gates.ceiling, 96 * MIB, "the default ceiling");
+        // Three large rooms past the cap, under the ceiling.
+        gates.shadow_bytes.fetch_add(80 * MIB, Relaxed);
+        gates.over_floor.fetch_add(3, Relaxed);
+        let mut ordinary = crate::Gate::default();
+        let who = ("ordinary", "alice");
+        let document = crate::admit_on_shadow(&gates, &mut ordinary, who, None, vec![text_state(MIB)], false).await;
+        assert!(matches!(document, Ok(Some(_))), "the document was not judged: {document:?}");
+        let total = gates.shadow_bytes.load(Relaxed);
+        assert!(ordinary.bytes <= gates.floor && total > gates.global_cap && total < gates.ceiling, "copy {} total {total}", ordinary.bytes);
+        let edit = crate::admit_on_shadow(&gates, &mut ordinary, who, None, vec![ARRAY.to_vec()], false).await;
+        assert!(matches!(edit, Ok(Some(_))), "the edit was not judged: {edit:?}");
+    }
+
     /// C7b review I-1: idle copies past the ceiling (rooms that sent nothing, kept open) go
     /// before an honest small room's. Its op is judged (a mark comes back) and its copy kept,
     /// and so are its later ops; only as many idle copies go as the ceiling needs.
