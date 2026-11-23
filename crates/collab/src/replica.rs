@@ -63,6 +63,12 @@ pub trait Replica: Sized + Send {
     fn from_state(state: &[u8]) -> Result<Self, LiveError>;
     fn set_client(&mut self, space: u32) -> Result<(), LiveError>;
     fn apply(&mut self, update: &[u8]) -> Result<Vec<Self::Change>, LiveError>;
+    /// [`apply`](Self::apply) for a checkpoint snapshot the room ordered, which holds the
+    /// whole document: a schema on [`YReplica`] checks it with [`YReplica::apply_state`]'s
+    /// higher item cap. By default the same as `apply`.
+    fn apply_state(&mut self, update: &[u8]) -> Result<Vec<Self::Change>, LiveError> {
+        self.apply(update)
+    }
     fn state(&self) -> Vec<u8>;
     fn undo(&mut self) -> Option<Vec<u8>>;
     fn redo(&mut self) -> Option<Vec<u8>>;
@@ -93,6 +99,15 @@ pub struct YReplica {
     held: usize,
     /// The encoded size of those updates, from their incoming sizes.
     held_bytes: usize,
+    /// Updates that wait for something this document lacks (an earlier clock of a client, an
+    /// item they name), in arrival order. They are kept here rather than handed to yrs: yrs 0.28
+    /// integrates an update past a gap in a client's clocks with a placeholder and then mixes up
+    /// later updates that overlap it, and merges held updates with different content under the
+    /// same clock (both panic). So yrs only ever sees an update it can integrate whole.
+    /// Each with the id it waits for: it is looked at again once the state vector passes it.
+    waiting: Vec<(Vec<u8>, (u64, u32))>,
+    /// Parents of recently checked items, for the next check (see the `fits` module).
+    seen: crate::fits::Seen,
 }
 
 impl YReplica {
@@ -118,7 +133,18 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false, resync: false, held: 0, held_bytes: 0 }
+        YReplica {
+            undo,
+            doc,
+            client,
+            damaged: false,
+            untracked: false,
+            resync: false,
+            held: 0,
+            held_bytes: 0,
+            waiting: Vec::new(),
+            seen: crate::fits::Seen::default(),
+        }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -132,6 +158,11 @@ impl YReplica {
             return Err(LiveError::from(e));
         }
         Ok(doc)
+    }
+
+    /// How many runs the replica's placement index holds (see the `fits` module).
+    pub(crate) fn index_runs(&self) -> usize {
+        self.seen.len()
     }
 
     /// The document, for the schema's reads.
@@ -159,6 +190,12 @@ impl YReplica {
         self.resync = resync;
     }
 
+    /// Whether updates are waiting for something this document lacks (see [`apply`](Self::apply)).
+    #[must_use]
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty() || self.doc.transact().has_missing_updates()
+    }
+
     /// Whether yrs panicked during an earlier apply.
     #[must_use]
     pub fn damaged(&self) -> bool {
@@ -172,6 +209,7 @@ impl YReplica {
         self.resync = old.resync;
         self.held = old.held;
         self.held_bytes = old.held_bytes;
+        self.waiting.clone_from(&old.waiting);
     }
 
     /// Carry the damaged mark across a rebuild, or set it (a test of a caught panic).
@@ -181,20 +219,116 @@ impl YReplica {
 
     /// Merge an update from another replica. A yrs panic marks this replica damaged.
     ///
-    /// Updates may arrive in any order. One whose dependencies are missing is held by yrs. yrs
-    /// 0.28 does not always apply a held update once its dependencies land (it only looks at the
-    /// client ids of the update that just arrived), so whenever an apply advanced the state
-    /// vector and something is still held, the held part is taken out ([`WriteTxn::prune_pending`])
-    /// and applied again, until nothing more lands. What stays held is bounded by
+    /// Updates may arrive in any order. Each is first read and checked against this document
+    /// (see [`integrate`]): one that puts content where its parent cannot hold it is refused
+    /// with nothing changed. One that needs something this document lacks (an earlier clock of a
+    /// client, an item it names, an item it deletes) waits here and is applied once that has
+    /// landed; yrs only ever sees updates it can integrate whole. What waits is bounded by
     /// [`MAX_PENDING_UPDATES`] and [`MAX_PENDING_BYTES`]; past either it is dropped and
     /// [`needs_resync`](Self::needs_resync) is raised.
+    ///
+    /// Should yrs still hold something back, it is retried the same way: whenever an apply
+    /// advanced the state vector, the held part is taken out ([`WriteTxn::prune_pending`]) and
+    /// applied again, until nothing more lands.
     pub fn apply(&mut self, update: &[u8]) -> Result<(), LiveError> {
+        self.apply_capped(update, crate::fits::MAX_ITEMS)
+    }
+
+    /// [`apply`](Self::apply) for a checkpoint snapshot (a full state the document service
+    /// wrote, which the relay orders only from it): checked under the higher
+    /// [`MAX_STATE_ITEMS`](crate::fits::MAX_STATE_ITEMS), because a checkpoint holds the whole
+    /// document.
+    pub fn apply_state(&mut self, update: &[u8]) -> Result<(), LiveError> {
+        self.apply_capped(update, crate::fits::MAX_STATE_ITEMS)
+    }
+
+    fn apply_capped(&mut self, update: &[u8], cap: usize) -> Result<(), LiveError> {
+        match readiness(&self.doc, update, &mut self.seen, cap) {
+            Ready::Refused => return Err(LiveError::Decode),
+            Ready::TooLarge => return Err(LiveError::TooLarge),
+            Ready::Waiting(need) => {
+                self.wait(update, need);
+                return Ok(());
+            }
+            Ready::Now => {}
+        }
+        let applied = self.apply_now(update);
+        if self.damaged {
+            return applied;
+        }
+        self.release()?;
+        if self.waiting.is_empty() && !self.doc.transact().has_missing_updates() {
+            self.held = 0;
+            self.held_bytes = 0;
+        }
+        applied
+    }
+
+    /// Keep `update` until what it needs has landed.
+    fn wait(&mut self, update: &[u8], need: (u64, u32)) {
+        self.waiting.push((update.to_vec(), need));
+        self.held += 1;
+        self.held_bytes += update.len();
+        if self.held > MAX_PENDING_UPDATES || self.held_bytes > MAX_PENDING_BYTES {
+            log::warn!(
+                "collab: {} updates ({} bytes) are waiting for dependencies that did not come; dropped, resync needed",
+                self.held,
+                self.held_bytes
+            );
+            self.drop_held();
+        }
+    }
+
+    /// Apply what waits and is ready now, until nothing more lands. One that is refused now (its
+    /// parent turned out unable to hold it) is dropped.
+    fn release(&mut self) -> Result<(), LiveError> {
+        let mut seen = StateVector::default();
+        loop {
+            let now = self.doc.transact().state_vector();
+            if self.waiting.is_empty() || now == seen {
+                return Ok(());
+            }
+            let mut keep = Vec::new();
+            for (u, need) in std::mem::take(&mut self.waiting) {
+                // Only what the state vector has passed the need of can have changed.
+                if now.get(&ClientID::new(need.0)) <= need.1 {
+                    keep.push((u, need));
+                    continue;
+                }
+                // Already read under its cap when it arrived.
+                match readiness(&self.doc, &u, &mut self.seen, crate::fits::MAX_STATE_ITEMS) {
+                    Ready::Waiting(need) => keep.push((u, need)),
+                    Ready::Refused | Ready::TooLarge => log::warn!("collab: a waiting update does not fit the document; dropped"),
+                    Ready::Now => {
+                        let applied = self.apply_now(&u);
+                        if self.damaged {
+                            self.waiting = keep;
+                            return applied;
+                        }
+                    }
+                }
+            }
+            seen = now;
+            self.waiting.extend(keep);
+        }
+    }
+
+    /// Hand one ready update to yrs.
+    fn apply_now(&mut self, update: &[u8]) -> Result<(), LiveError> {
         let before = self.doc.transact().state_vector();
-        let first = integrate(&self.doc, update);
+        let first = integrate_checked(&self.doc, update, true, &mut self.seen, crate::fits::MAX_STATE_ITEMS);
+        if first.is_ok() {
+            self.seen.commit(&self.doc.transact());
+        }
         if first == Err(Integrate::Panicked) {
             self.damaged = true;
             return Err(LiveError::Decode);
         }
+        if first == Ok(true) {
+            // Held updates that did not fit were dropped: behind, as after any dropped hold.
+            self.resync = true;
+        }
+        let first = first.map(|_| ());
         // Also after a refusal: yrs may have integrated part of the update first, which can
         // make a held one ready.
         if self.settle(before.clone(), if first.is_ok() { update.len() } else { 0 }, first.is_ok()) == Err(Integrate::Panicked) {
@@ -208,7 +342,7 @@ impl YReplica {
             self.drop_held();
             return Ok(());
         }
-        first.map_err(|_| LiveError::Decode)
+        first.map_err(LiveError::from)
     }
 
     /// A fresh document with this replica's client id holding exactly `state` (a checkpoint, or
@@ -228,6 +362,28 @@ impl YReplica {
     pub fn rebuilt_from_state(&self, state: &[u8]) -> Result<Doc, LiveError> {
         let own = self.doc.client_id();
         let doc = build_doc(own.get());
+        // The roots typed as this replica types them, so the fit check judges the state
+        // against what it will be read as.
+        let roots: Vec<(String, u8)> = self
+            .doc
+            .transact()
+            .root_refs()
+            .filter_map(|(name, out)| match out {
+                yrs::Out::YArray(_) => Some((name.to_owned(), 0)),
+                yrs::Out::YMap(_) => Some((name.to_owned(), 1)),
+                yrs::Out::YText(_) => Some((name.to_owned(), 2)),
+                yrs::Out::YXmlFragment(_) => Some((name.to_owned(), 3)),
+                _ => None,
+            })
+            .collect();
+        for (name, kind) in roots {
+            match kind {
+                0 => drop(doc.get_or_insert_array(name.as_str())),
+                1 => drop(doc.get_or_insert_map(name.as_str())),
+                2 => drop(doc.get_or_insert_text(name.as_str())),
+                _ => drop(doc.get_or_insert_xml_fragment(name.as_str())),
+            }
+        }
         integrate(&doc, state).map_err(LiveError::from)?;
         if doc.transact().has_missing_updates() {
             return Err(LiveError::Decode);
@@ -249,8 +405,10 @@ impl YReplica {
         loop {
             let txn = self.doc.transact();
             if !txn.has_missing_updates() {
-                self.held = 0;
-                self.held_bytes = 0;
+                if self.waiting.is_empty() {
+                    self.held = 0;
+                    self.held_bytes = 0;
+                }
                 return Ok(());
             }
             let now = txn.state_vector();
@@ -259,10 +417,10 @@ impl YReplica {
                 break;
             }
             before = now;
-            match integrate_held(&self.doc) {
+            match integrate_held(&self.doc, &mut self.seen) {
                 Ok(()) => {}
                 Err(Integrate::Panicked) => return Err(Integrate::Panicked),
-                Err(Integrate::Refused) => {
+                Err(Integrate::Refused | Integrate::TooLarge) => {
                     log::warn!("collab: held updates did not apply together; dropped, resync needed");
                     self.drop_held();
                     return Ok(());
@@ -291,6 +449,7 @@ impl YReplica {
     /// Throw away what is held and say the replica is behind.
     fn drop_held(&mut self) {
         drop(self.doc.transact_mut_with(REMOTE).prune_pending());
+        self.waiting.clear();
         self.held = 0;
         self.held_bytes = 0;
         self.resync = true;
@@ -309,7 +468,9 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        let update = self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Some(update)
     }
 
     /// Redo the last undone local edit and return the update to send. `None` on a damaged
@@ -319,7 +480,9 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        let update = self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Some(update)
     }
 
     /// Whether local edits are being kept out of the undo history now.
@@ -349,9 +512,14 @@ impl YReplica {
         if self.client.is_none() {
             return Err(LiveError::NoClient);
         }
-        let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
-        edit(&mut txn)?;
-        Ok(txn.encode_update_v1())
+        let before = self.doc.transact().state_vector();
+        let update = {
+            let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
+            edit(&mut txn)?;
+            txn.encode_update_v1()
+        };
+        crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
+        Ok(update)
     }
 }
 
@@ -360,13 +528,18 @@ impl YReplica {
 pub enum Integrate {
     #[error("the update did not decode or apply")]
     Refused,
+    #[error("the update is too large to check")]
+    TooLarge,
     #[error("yrs panicked while applying the update")]
     Panicked,
 }
 
 impl From<Integrate> for LiveError {
-    fn from(_: Integrate) -> LiveError {
-        LiveError::Decode
+    fn from(i: Integrate) -> LiveError {
+        match i {
+            Integrate::TooLarge => LiveError::TooLarge,
+            _ => LiveError::Decode,
+        }
     }
 }
 
@@ -375,11 +548,60 @@ impl From<Integrate> for LiveError {
 /// yrs can panic on bytes that decode but do not describe a valid document, so the apply runs
 /// under `catch_unwind`: a hostile or damaged update must not take the app down. That only holds
 /// where panics unwind; a wasm build with `panic = "abort"` still aborts.
+///
+/// Before yrs sees it, the update is read by the gate's byte reader and every item is checked
+/// against the document for a parent that can hold its content (see the `fits` module): yrs
+/// takes a string inside an array and then loops for ever reading that array. Refused: an update
+/// the reader does not take, and one with an item that does not fit. When the only misfit is in
+/// what yrs already holds for missing dependencies, that held part is dropped (yrs would apply it
+/// along with this update) and this update is applied.
 pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
+    integrate_checked(doc, update, false, &mut crate::fits::Seen::default(), crate::fits::MAX_STATE_ITEMS).map(|_| ())
+}
+
+/// [`integrate`]; `Ok(true)` when held updates were dropped because they did not fit.
+/// `checked`: the update alone was already checked against this document ([`readiness`]), so
+/// it is only checked again together with what yrs holds, if anything.
+fn integrate_checked(doc: &Doc, update: &[u8], checked: bool, seen: &mut crate::fits::Seen, cap: usize) -> Result<bool, Integrate> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let update = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
+        // The walk first: it refuses counts the bytes cannot back (an allocation bomb, which
+        // aborts rather than unwinds) before yrs's decoder sizes anything by them.
+        let incoming = match crate::walk::items_capped(update, cap) {
+            crate::walk::Walked::Items(_, items) => items,
+            crate::walk::Walked::Unread => return Err(Integrate::Refused),
+            crate::walk::Walked::TooMany => {
+                crate::fits::too_many(cap);
+                return Err(Integrate::TooLarge);
+            }
+        };
+        let decoded = Update::decode_v1(update).map_err(|_| Integrate::Refused)?;
         let mut txn = doc.transact_mut_with(REMOTE);
-        txn.apply_update(update).map_err(|_| Integrate::Refused)
+        let mut dropped = false;
+        let held = txn.store().pending_update().is_some();
+        let verdict = if checked && !held { crate::fits::Verdict::Fits } else { crate::fits::check(&txn, &with_held(&txn, &incoming), seen) };
+        match verdict {
+            crate::fits::Verdict::Refused if crate::fits::check(&txn, &incoming, seen) == crate::fits::Verdict::Refused => {
+                log::warn!("collab: an update puts content where its parent cannot hold it; refused");
+                return Err(Integrate::Refused);
+            }
+            crate::fits::Verdict::Refused => {
+                log::warn!("collab: held updates put content where its parent cannot hold it; dropped");
+                drop(txn.prune_pending());
+                dropped = true;
+            }
+            _ => {}
+        }
+        let before = txn.state_vector();
+        let applied = txn.apply_update(decoded);
+        // What landed goes into the index: all of it when the check staged it, and whatever yrs
+        // took of a refused update otherwise (so the next check does not miss it).
+        if applied.is_ok() && (!checked || held) {
+            seen.commit(&txn);
+        } else if applied.is_err() {
+            crate::fits::learn(&txn, update, &before, seen);
+        }
+        applied.map_err(|_| Integrate::Refused)?;
+        Ok(dropped)
     }));
     match outcome {
         Ok(result) => result,
@@ -388,6 +610,103 @@ pub fn integrate(doc: &Doc, update: &[u8]) -> Result<(), Integrate> {
             Err(Integrate::Panicked)
         }
     }
+}
+
+/// Whether an update can go to yrs now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ready {
+    Now,
+    /// It needs something the document lacks: the state vector to pass this id.
+    Waiting((u64, u32)),
+    /// It does not read, or does not fit the document.
+    Refused,
+    /// It has more items than one check takes.
+    TooLarge,
+}
+
+/// Read `update` and check it against `doc`: [`Ready::Refused`] when the reader does not take it
+/// or an item does not fit its parent (see the `fits` module), [`Ready::Waiting`] when it starts
+/// past a client's clock in `doc`, skips clocks, names an item `doc` lacks, or deletes past what
+/// `doc` and the update hold.
+fn readiness(doc: &Doc, update: &[u8], seen: &mut crate::fits::Seen, cap: usize) -> Ready {
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (shape, items) = match crate::walk::items_capped(update, cap) {
+            crate::walk::Walked::Items(shape, items) => (shape, items),
+            crate::walk::Walked::Unread => return Ready::Refused,
+            crate::walk::Walked::TooMany => {
+                crate::fits::too_many(cap);
+                return Ready::TooLarge;
+            }
+        };
+        let txn = doc.transact();
+        let fits = crate::fits::check(&txn, &items, seen);
+        if fits == crate::fits::Verdict::Refused {
+            log::warn!("collab: an update puts content where its parent cannot hold it; refused");
+            return Ready::Refused;
+        }
+        let sv = txn.state_vector();
+        let mut reach: BTreeMap<u64, u32> = BTreeMap::new();
+        for (client, ranges) in &shape.blocks {
+            let mut have = sv.get(&ClientID::new(*client));
+            for (start, end) in ranges {
+                if *start > have {
+                    return Ready::Waiting((*client, start - 1));
+                }
+                have = have.max(*end);
+            }
+            reach.insert(*client, have);
+        }
+        for (client, ranges) in &shape.deletes {
+            let have = reach.get(client).copied().unwrap_or_else(|| sv.get(&ClientID::new(*client)));
+            if let Some((_, end)) = ranges.iter().find(|(_, end)| *end > have) {
+                return Ready::Waiting((*client, end - 1));
+            }
+        }
+        match fits {
+            crate::fits::Verdict::Waiting(id) => Ready::Waiting(id),
+            _ => Ready::Now,
+        }
+    }));
+    checked.unwrap_or(Ready::Refused)
+}
+
+/// `incoming` and the items yrs holds for missing dependencies (yrs applies those along with
+/// the next update that releases them, so they are checked with it).
+fn with_held<T: ReadTxn>(txn: &T, incoming: &[crate::walk::Placed]) -> Vec<crate::walk::Placed> {
+    let mut all = incoming.to_vec();
+    if let Some(held) = txn.store().pending_update() {
+        use yrs::updates::encoder::Encode;
+        // yrs's own encoding of what it holds: the reader takes it, or nothing is added.
+        if let Some((_, items)) = crate::walk::items(&held.update.encode_v1()) {
+            all.extend(items);
+        }
+    }
+    all
+}
+
+/// The most blocks a peer's update may write: past it, the update is refused as too large to
+/// check (and not as invalid). See the `fits` module for how it was sized.
+pub const MAX_OP_BLOCKS: usize = crate::fits::MAX_ITEMS;
+
+/// The most blocks a checkpoint snapshot from the document service may write.
+pub const MAX_STATE_BLOCKS: usize = crate::fits::MAX_STATE_ITEMS;
+
+/// How many blocks `bytes` write, read without allocating per block, with each client section
+/// and each delete-set client and range counted as one more (they cost a reader a map entry
+/// each, as a block does); `None` when the byte reader does not take them. For a relay to refuse an update past [`MAX_OP_BLOCKS`] as too
+/// large before anything decodes it.
+#[must_use]
+pub fn update_blocks(bytes: &[u8]) -> Option<usize> {
+    std::panic::catch_unwind(|| crate::walk::read(bytes).map(|shape| shape.count)).ok().flatten()
+}
+
+/// Whether `bytes` count more than `cap` entries as [`update_blocks`] counts them, read only
+/// as far as the cap: a relay's check before it decodes anything, which keeps no more than the
+/// cap's worth of the read's own maps however many sections or delete ranges the bytes carry.
+/// `false` when the byte reader does not take them before the cap (the gate refuses those).
+#[must_use]
+pub fn update_exceeds_blocks(bytes: &[u8], cap: usize) -> bool {
+    std::panic::catch_unwind(|| matches!(crate::walk::read_capped(bytes, cap), crate::walk::Counted::Over)).unwrap_or(false)
 }
 
 /// Whether `bytes` are a yrs update (v1) that decodes and whose ids are sane: no block or delete
@@ -414,11 +733,29 @@ pub fn update_is_sound(bytes: &[u8]) -> bool {
 
 /// Take what yrs holds for missing dependencies out and apply it again, under `catch_unwind`
 /// for the same reason as [`integrate`]. What still lacks a dependency goes back to being held.
-fn integrate_held(doc: &Doc) -> Result<(), Integrate> {
+fn integrate_held(doc: &Doc, seen: &mut crate::fits::Seen) -> Result<(), Integrate> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut txn = doc.transact_mut_with(REMOTE);
         match txn.prune_pending() {
-            Some(held) => txn.apply_update(held).map_err(|_| Integrate::Refused),
+            Some(held) => {
+                // The same check as `integrate`: what was held may now resolve to a parent that
+                // cannot hold it.
+                let bytes = {
+                    use yrs::updates::encoder::Encode;
+                    held.encode_v1()
+                };
+                match crate::walk::items(&bytes) {
+                    Some((_, items)) if crate::fits::check(&txn, &items, seen) != crate::fits::Verdict::Refused => {
+                        let applied = txn.apply_update(held).map_err(|_| Integrate::Refused);
+                        seen.commit(&txn);
+                        applied
+                    }
+                    _ => {
+                        log::warn!("collab: held updates put content where its parent cannot hold it");
+                        Err(Integrate::Refused)
+                    }
+                }
+            }
             None => Ok(()),
         }
     }))
@@ -615,7 +952,7 @@ mod tests {
     }
 
     fn pending(y: &YReplica) -> bool {
-        y.doc().transact().has_missing_updates()
+        y.is_waiting()
     }
 
     fn read(y: &YReplica) -> String {
@@ -810,20 +1147,27 @@ mod tests {
         vec![1, 1, client, 0, 0x04, 0, pc, 0, 1, b'a', 0]
     }
 
-    /// Held updates that fail to apply together (one names a string item as its parent) raise
-    /// resync, never an error for the update that did apply, and never panic or damage.
+    /// A waiting update that yrs then refuses (it names a string item as its parent) is dropped
+    /// alone: the honest updates waiting beside it land, nothing is left held, no resync is
+    /// needed (every replica drops it the same way), nothing panics or is damaged.
     #[test]
-    fn a_failing_retry_raises_resync_and_still_counts_as_applied() {
-        let (first, rest, _) = withheld(&[2, 1, 1]);
+    fn a_waiting_update_that_does_not_apply_is_dropped_alone() {
+        let (first, rest, state) = withheld(&[2, 1, 1]);
         let (mut y, _) = peer(99);
         y.apply(&child_of(5, 1)).unwrap();
         y.apply(&rest[0]).unwrap();
         assert!(pending(&y));
         assert!(!y.needs_resync());
         assert!(y.apply(&first).is_ok(), "the dependency did apply");
-        assert!(y.needs_resync());
+        for u in &rest[1..] {
+            y.apply(u).unwrap();
+        }
+        assert!(!y.needs_resync());
         assert!(!y.damaged());
         assert!(!pending(&y), "nothing is left held");
+        let (author, _) = peer(98);
+        integrate(author.doc(), &state).unwrap();
+        assert_eq!(read(&y), read(&author));
     }
 
     /// A rebuild from a state that lacks this replica's own sent edits is refused, because the
@@ -907,8 +1251,8 @@ mod tests {
         assert!(worst.as_millis() < 2000);
     }
 
-    /// Each update applies one block and leaves one waiting on a missing item. Counting only
-    /// updates that advanced nothing would never trip the cap while yrs's pending grew.
+    /// Each update has one block that could apply and one that waits on a missing item. The
+    /// whole update waits (yrs never sees half of one), and the cap still trips.
     #[test]
     fn mixed_updates_that_half_apply_still_hit_the_cap() {
         let (_, _, _) = withheld(&[1, 1]);
@@ -928,8 +1272,8 @@ mod tests {
             y.apply(&u).unwrap();
             worst = worst.max(t.elapsed());
             if n == 3 {
-                assert!(pending(&y), "the orphan half is held");
-                assert!(read(&y).len() >= 4, "the other half applied");
+                assert!(pending(&y), "the updates wait");
+                assert!(read(&y).is_empty(), "nothing of a waiting update lands");
             }
             n += 1;
         }
@@ -1143,6 +1487,254 @@ mod tests {
         assert!(!update_is_sound(&with(&[1, 0x81, 0x80, 0x80, 0x80, 0x10, 1, 0])));
         // Parent info 2^32 + 1, which yrs reads as 1 (named) where a wider reader reads an id.
         assert!(!update_is_sound(&[1, 1, 1, 0, 0x04, 0x81, 0x80, 0x80, 0x80, 0x10, 1, b't', 1, b'a', 0]));
+    }
+
+    /// Seeds for yrs issues known to panic or abort on crafted input (y-crdt #675/#750, #720,
+    /// #733, #743, #749): the gate refuses each before yrs reads it, and fast, since an
+    /// allocation bomb aborts rather than unwinds and no `catch_unwind` would help.
+    #[test]
+    fn known_yrs_crashers_are_refused_before_yrs_reads_them() {
+        let item = |info: u8, content: &[u8]| {
+            let mut u = vec![1, 1, 5, 0, info, 1, 1, b't'];
+            u.extend(content);
+            u.push(0);
+            u
+        };
+        let t = std::time::Instant::now();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            // #675/#750: counts the bytes cannot back (4e9 sections, 4e9 blocks, 4e9 Any values,
+            // a 4 GB string, 4e9 delete-set clients).
+            ("sections", vec![0xff, 0xff, 0xff, 0xff, 0x0f, 1, 5, 0]),
+            ("blocks", vec![1, 0xff, 0xff, 0xff, 0xff, 0x0f, 5, 0, 0x04]),
+            ("any values", item(0x08, &[0xff, 0xff, 0xff, 0xff, 0x0f, 0x7f])),
+            ("string", item(0x04, &[0xff, 0xff, 0xff, 0xff, 0x0f, b'a'])),
+            ("delete set", vec![0, 0xff, 0xff, 0xff, 0xff, 0x0f, 1, 1, 0, 1]),
+            // #720: content ref 18 (info 0x12, JSON once masked), which applies and then panics
+            // at the next encode.
+            ("content ref 18", item(0x12, &[1, 1, b'1'])),
+            // #733: a weak link type (type ref 7), whose splice panics (and is only built with
+            // yrs's `weak` feature, which no crate here turns on).
+            ("weak link", item(0x07, &[7])),
+            // #743: a client id past 2^53.
+            ("client id", vec![1, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10, 0, 0x04, 1, 1, b't', 1, b'a', 0]),
+            // #749's cousin in values: an Any nested 100 deep.
+            ("deep any", {
+                let mut c = vec![1];
+                c.extend(std::iter::repeat_n([0x75, 1], 100).flatten());
+                c.push(0x7f);
+                item(0x08, &c)
+            }),
+        ];
+        for (name, bytes) in &cases {
+            assert!(!update_is_sound(bytes), "{name} passed the gate");
+            let doc = YReplica::seed_doc();
+            assert!(integrate(&doc, bytes).is_err(), "{name} was integrated");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "the refusals took {:?}", t.elapsed());
+    }
+
+    fn varint(out: &mut Vec<u8>, mut n: u64) {
+        while n >= 0x80 {
+            out.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    }
+
+    /// An update of millions of two-byte blocks (16 MiB of GC blocks of one clock each, which
+    /// fit anywhere) is refused as too large to check, fast and without listing a block: the
+    /// walk counts them first. A relay counts them the same way before it decodes anything.
+    #[test]
+    fn a_flood_of_tiny_blocks_is_refused_as_too_large_before_it_is_listed() {
+        const BLOCKS: u64 = 8 << 20;
+        let mut bomb = vec![1];
+        varint(&mut bomb, BLOCKS);
+        bomb.extend([0x7f, 0]);
+        for _ in 0..BLOCKS {
+            bomb.extend([0, 1]);
+        }
+        bomb.push(0);
+        assert!(bomb.len() >= 16 << 20);
+        let doc = YReplica::seed_doc();
+        doc.get_or_insert_array("a");
+        let mut y = YReplica::assemble(doc, None, |_, _| {});
+        crate::walk::LISTED.with(|n| n.set(0));
+        let t = std::time::Instant::now();
+        assert_eq!(y.apply(&bomb), Err(LiveError::TooLarge));
+        let took = t.elapsed();
+        assert_eq!(y.apply_state(&bomb), Err(LiveError::TooLarge), "past the state cap too");
+        assert_eq!(integrate(&YReplica::seed_doc(), &bomb), Err(Integrate::TooLarge));
+        assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0, "blocks were listed");
+        assert_eq!(update_blocks(&bomb), Some(BLOCKS as usize + 1), "the blocks and their one section");
+        // About 1.1 s in debug on a build host at load 25 (88c15ed and after); listing the
+        // 8 M blocks would cost far more, and gigabytes.
+        assert!(took < std::time::Duration::from_secs(2), "the refusals took {took:?}");
+        assert_eq!(LiveError::from(Integrate::TooLarge), LiveError::TooLarge);
+    }
+
+    /// R3-M2: client sections and delete-set entries count toward the cap, as blocks do. An
+    /// update of one GC block in each of 600 k client sections writes 600 k blocks, under the
+    /// cap, but costs a reader 1.2 M entries; a delete set of 1.1 M ranges writes no block at
+    /// all. Both are refused as too large, before anything is listed.
+    #[test]
+    fn client_sections_and_delete_entries_count_toward_the_cap() {
+        const SECTIONS: u64 = 600_000;
+        let mut sections = Vec::new();
+        varint(&mut sections, SECTIONS);
+        for client in 0..SECTIONS {
+            sections.push(1);
+            varint(&mut sections, client + 1);
+            sections.extend([0, 0, 1]);
+        }
+        sections.push(0);
+        const RANGES: u64 = (1 << 20) + 50_000;
+        let mut deletes = vec![0, 1, 7];
+        varint(&mut deletes, RANGES);
+        for i in 0..RANGES {
+            varint(&mut deletes, 2 * i);
+            deletes.push(1);
+        }
+        assert_eq!(update_blocks(&sections), Some(2 * SECTIONS as usize));
+        assert_eq!(update_blocks(&deletes), Some(1 + RANGES as usize));
+        for (name, bytes) in [("sections", &sections), ("deletes", &deletes)] {
+            let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+            crate::walk::LISTED.with(|n| n.set(0));
+            assert_eq!(y.apply(bytes), Err(LiveError::TooLarge), "{name}");
+            assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0, "{name}: blocks were listed");
+        }
+    }
+
+    /// R3-M2: a client section with no blocks (yrs never writes one) is refused: a flood of
+    /// them would cost a map entry each for nothing.
+    #[test]
+    fn a_client_section_with_no_blocks_is_refused() {
+        let empty = [1, 0, 5, 0, 0];
+        assert!(!update_is_sound(&empty));
+        assert_eq!(update_blocks(&empty), None);
+        let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+        assert_eq!(y.apply(&empty), Err(LiveError::Decode));
+        // An empty update (no sections, no deletes) is still taken.
+        assert!(update_is_sound(&[0, 0]));
+    }
+
+    /// C7b review M-2: the counting read stops as soon as the count passes the cap, before it
+    /// keeps anything more per section. 600 k one-block sections pass 2^20 entries about
+    /// halfway; bytes after that point are never read, so a tail the reader would refuse
+    /// does not turn "too large" into "unreadable", and nothing is listed.
+    #[test]
+    fn the_counting_read_stops_at_the_cap() {
+        const SECTIONS: u64 = 600_000;
+        let mut bytes = Vec::new();
+        varint(&mut bytes, SECTIONS);
+        for client in 0..SECTIONS {
+            bytes.push(1);
+            varint(&mut bytes, client + 1);
+            bytes.extend([0, 0, 1]);
+        }
+        // Not a delete set: the reader refuses this tail if it gets there.
+        bytes.extend([0xff, 0xff, 0xff]);
+        crate::walk::LISTED.with(|n| n.set(0));
+        assert!(matches!(crate::walk::items_capped(&bytes, crate::fits::MAX_ITEMS), crate::walk::Walked::TooMany), "the read went past the cap");
+        assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0);
+        let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+        assert_eq!(y.apply(&bytes), Err(LiveError::TooLarge));
+    }
+
+    /// How many blocks the largest honest updates write, against the caps. A 1 MiB offline
+    /// bundle of single letters each typed apart from the last (the densest a client makes:
+    /// none merge), and a 1 MiB seed of short paragraphs (a paste of a whole file).
+    #[test]
+    #[ignore = "measurement (about 90 s in debug); run with --ignored --nocapture"]
+    fn honest_updates_stay_far_below_the_item_caps() {
+        use yrs::{ReadTxn, Text};
+        let typist = yrs::Doc::with_client_id(5);
+        let t = typist.get_or_insert_text("t");
+        {
+            let mut txn = typist.transact_mut();
+            // At the front each time: no two letters merge into one item.
+            for _ in 0..(1 << 20) / 8 {
+                t.insert(&mut txn, 0, "x");
+            }
+        }
+        let bundle = typist.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let paragraphs: Vec<crate::SeedBlock> =
+            (0..(1 << 20) / 24).map(|i| crate::SeedBlock { id: i + 1, text: format!("paragraph {i:>8}"), ..crate::SeedBlock::default() }).collect();
+        let seed = crate::LiveDoc::seeded(&paragraphs).unwrap().state();
+        for (name, update) in [("offline letters", &bundle), ("seeded paragraphs", &seed)] {
+            let blocks = update_blocks(update).unwrap();
+            let per_mib = blocks as f64 / (update.len() as f64 / f64::from(1 << 20));
+            println!("C7 {name}: {} bytes, {blocks} blocks, {per_mib:.0} per MiB", update.len());
+            assert!(update.len() >= 1 << 19, "{name} is only {} bytes", update.len());
+            assert!(per_mib < crate::fits::MAX_ITEMS as f64 / 2.0, "{name}: {per_mib:.0} blocks per MiB");
+            assert!(per_mib * 16.0 < crate::fits::MAX_STATE_ITEMS as f64, "{name}: a 16 MiB checkpoint this dense");
+        }
+    }
+
+    /// The fit check costs about the same per item however far into a long array an op lands:
+    /// it reads each neighbour's place from an index, not by walking the array to it (which
+    /// was O(position) per neighbour, so an op of many items placed deep in a large array
+    /// cost seconds).
+    #[test]
+    fn the_fit_check_does_not_walk_the_document_per_item() {
+        use yrs::{Array, ReadTxn};
+        const LONG: u64 = 40_000;
+        const OP: u64 = 10_000;
+        let raw = yrs::Doc::with_client_id(5);
+        let a = raw.get_or_insert_array("a");
+        {
+            let mut txn = raw.transact_mut();
+            // Each at the front, so none merge: item k sits right of item k + 1.
+            for _ in 0..LONG {
+                a.insert(&mut txn, 0, true);
+            }
+        }
+        let doc = YReplica::seed_doc();
+        doc.get_or_insert_array("a");
+        let mut y = YReplica::assemble(doc, None, |_, _| {});
+        y.apply(&raw.transact().encode_state_as_update_v1(&yrs::StateVector::default())).unwrap();
+        // One op of OP items from client 9, each between item k + 1 and item k, deep in.
+        let mut op = vec![1];
+        varint(&mut op, OP);
+        op.extend([9, 0]);
+        for k in 0..OP {
+            op.push(0xc8);
+            for (client, clock) in [(5, k + 1), (5, k)] {
+                varint(&mut op, client);
+                varint(&mut op, clock);
+            }
+            op.extend([1, 0x7e]);
+        }
+        op.push(0);
+        let t = std::time::Instant::now();
+        y.apply(&op).unwrap();
+        let took = t.elapsed();
+        assert_eq!(y.doc().get_or_insert_array("a").len(&y.doc().transact()), (LONG + OP) as u32);
+        assert!(took < std::time::Duration::from_secs(1), "the op took {took:?}");
+    }
+
+    /// A full state whose origin chains run far past the nesting cap is judged, not left
+    /// waiting: the cap is on how deep types nest, not on how long a chain is. A document
+    /// edited in turn by many sessions (each a new client id) makes one: each letter typed at
+    /// the front names the previous session's as its right origin, so the chain crosses from
+    /// one client's run of the update into the next, in whichever order yrs writes them.
+    #[test]
+    fn long_origin_chains_in_one_update_are_judged() {
+        use yrs::updates::decoder::Decode;
+        for ids in [(100..180).collect::<Vec<u64>>(), (100..180).rev().collect()] {
+            let mut state = Vec::new();
+            for id in ids {
+                let peer = yrs::Doc::with_client_id(id);
+                if !state.is_empty() {
+                    peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+                }
+                peer.get_or_insert_text("t").insert(&mut peer.transact_mut(), 0, "x");
+                state = peer.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+            }
+            let (mut y, t) = replica(None);
+            y.apply(&state).unwrap();
+            assert!(!y.is_waiting(), "the state waits");
+            assert_eq!(t.get_string(&y.doc().transact()).len(), 80);
+        }
     }
 
     /// Edits of every kind the Craft apps make, on three peers that sync now and then.

@@ -87,7 +87,8 @@ use socketioxide::extract::{Data, SocketRef, State};
 use tokio::sync::Mutex;
 
 use bus::{Bus, LockOutcome, ReleaseOutcome};
-use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, is_crdt_command};
+use craft_collab::shadow::{Mark, Shadow, ShadowRefusal};
+use room::{Op, Peer, Refusal, Room, Submission, crdt_ops_sound, crdt_ops_too_large, is_crdt_command};
 
 /// Bytes one opaque frame may carry, base64 included.
 ///
@@ -248,8 +249,9 @@ struct Relay {
     /// cheaper at this scale. Held only for room bookkeeping, never while a payload is
     /// serialized onto a socket.
     rooms: Mutex<HashMap<String, Room>>,
-    /// file id -> that room's broadcast gate. See [`Relay::gate`].
-    gates: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// file id -> that room's broadcast gate, and whether ops are tried on a shadow copy.
+    /// See [`Relay::gate`].
+    gates: Gates,
     /// How long an emptied room is kept. [`ROOM_GRACE`] in the binary.
     room_grace: std::time::Duration,
 }
@@ -360,6 +362,424 @@ fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
     }
 }
 
+/// The rooms' broadcast gates. See [`Relay::gate`].
+struct Gates {
+    map: std::sync::Mutex<HashMap<String, Arc<Mutex<Gate>>>>,
+    /// Whether each `crdt.*` op is tried on a shadow copy of its room's document before it is
+    /// ordered (`COLLABCRAFT_SHADOW`, on unless set to `0`). See [`admit_on_shadow`].
+    shadow: bool,
+    /// What all rooms' shadow copies hold, about ([`Shadow::bytes`]), and how many copies
+    /// hold more than the floor.
+    shadow_bytes: std::sync::atomic::AtomicUsize,
+    over_floor: std::sync::atomic::AtomicUsize,
+    room_cap: usize,
+    global_cap: usize,
+    /// A copy at or under this many bytes is never refused for the relay-wide cap: a room of
+    /// ordinary size goes on whatever other rooms hold (`COLLABCRAFT_SHADOW_FLOOR_BYTES`).
+    floor: usize,
+    /// Past this many bytes in all copies, the relay drops copies instead of growing them, and
+    /// never refuses an op for it (`COLLABCRAFT_SHADOW_CEILING_BYTES`; by default half again
+    /// the relay-wide cap, and never under it, so the floor and share rules act first). It
+    /// bounds what the floor leaves open (N rooms at the floor each). Idle copies go first,
+    /// then the largest over the floor ([`make_room`]); only when neither is left does the
+    /// room at hand lose its copy and its op go through unjudged ([`ceiling_drop`]).
+    ceiling: usize,
+    /// Per (room, user id): ops that cost a copy a rebuild. Kept here, not in the gate or by
+    /// socket, so neither a reconnect nor an emptied room resets them. See [`MAX_STRIKES`].
+    strikes: std::sync::Mutex<HashMap<(String, String), Strikes>>,
+}
+
+impl Default for Gates {
+    fn default() -> Self {
+        Gates::new(true, DEFAULT_SHADOW_ROOM_BYTES, DEFAULT_SHADOW_BYTES)
+    }
+}
+
+impl Gates {
+    fn new(shadow: bool, room_cap: usize, global_cap: usize) -> Gates {
+        Gates {
+            map: std::sync::Mutex::new(HashMap::new()),
+            shadow,
+            shadow_bytes: std::sync::atomic::AtomicUsize::new(0),
+            over_floor: std::sync::atomic::AtomicUsize::new(0),
+            room_cap,
+            global_cap,
+            floor: DEFAULT_SHADOW_FLOOR_BYTES,
+            ceiling: default_ceiling(global_cap),
+            strikes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_floor(self, floor: usize) -> Gates {
+        Gates { floor, ..self }
+    }
+
+    fn with_ceiling(self, ceiling: usize) -> Gates {
+        Gates { ceiling, ..self }
+    }
+
+    /// One copy's share of the relay-wide cap, among the copies over the floor only, so
+    /// opening many small rooms shrinks nobody's share.
+    fn fair_share(&self) -> usize {
+        self.global_cap / self.over_floor.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    }
+
+    fn strikes(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Strikes>> {
+        self.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Default cap on one room's shadow copy (`COLLABCRAFT_SHADOW_ROOM_BYTES`): its document, base,
+/// log and index, about.
+const DEFAULT_SHADOW_ROOM_BYTES: usize = 256 * 1024 * 1024;
+/// Default cap on all rooms' shadow copies together (`COLLABCRAFT_SHADOW_BYTES`).
+const DEFAULT_SHADOW_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Default floor under which a copy is never refused for the relay-wide cap
+/// (`COLLABCRAFT_SHADOW_FLOOR_BYTES`). A 1 MiB document's copy is about 2-3 MiB.
+const DEFAULT_SHADOW_FLOOR_BYTES: usize = 16 * 1024 * 1024;
+/// A copy whose room sent no op for this long is idle: the first to go at the ceiling (see
+/// [`make_room`]). An active room types every few seconds; a room that sent nothing for a
+/// minute loses only its judging of a first op after a while, and its next checkpoint brings
+/// its document back.
+const SHADOW_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The default hard ceiling on all rooms' shadow copies together: half again the relay-wide
+/// cap (3 GiB at the default 2 GiB). See [`Gates::ceiling`].
+fn default_ceiling(global_cap: usize) -> usize {
+    global_cap.saturating_add(global_cap / 2)
+}
+
+/// Parse `COLLABCRAFT_SHADOW_CEILING_BYTES` against the relay-wide cap: unset means the
+/// default; a ceiling under the cap is refused, because then copies would be dropped (and ops
+/// let through unjudged) before the floor and share rules ever act.
+fn parse_ceiling(raw: &str, global_cap: usize) -> Result<usize, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(default_ceiling(global_cap));
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if n >= global_cap => Ok(n),
+        Ok(n) => Err(format!("COLLABCRAFT_SHADOW_CEILING_BYTES ({n}) must be at least COLLABCRAFT_SHADOW_BYTES ({global_cap})")),
+        Err(_) => Err("COLLABCRAFT_SHADOW_CEILING_BYTES must be a number of bytes".to_owned()),
+    }
+}
+
+/// Ops one user may send to one room that cost its copy a rebuild (yrs panicked on them)
+/// within [`STRIKE_WINDOW`], before that user's CRDT ops in that room are refused for
+/// [`STRIKE_PAUSE`]. Only that user: the room's other editors and its checkpoints go on. A
+/// rollback because the bus did not answer, or the room refused the op, counts against
+/// nobody. Honest clients never strike.
+const MAX_STRIKES: usize = 4;
+const STRIKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const STRIKE_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One user's rebuild-costing ops in one room, and until when its ops are refused.
+#[derive(Default)]
+struct Strikes {
+    at: std::collections::VecDeque<std::time::Instant>,
+    paused_until: Option<std::time::Instant>,
+}
+
+/// What a room's gate guards besides the order of its broadcasts: the shadow copy of the
+/// room's document (the [`craft_collab::DOC_SCOPE`] scope, the only one replicas read), which
+/// only a holder of the gate touches, so the copy takes ops in the order they are numbered.
+#[derive(Default)]
+struct Gate {
+    shadow: Option<Shadow>,
+    /// What the copy held at its last count, as added to [`Gates::shadow_bytes`].
+    bytes: usize,
+    /// When the room last sent an op to the copy ([`SHADOW_IDLE`]).
+    last_op: Option<std::time::Instant>,
+}
+
+/// Why the relay refused an op at the shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowStop {
+    /// The copy refused it, or yrs panicked on it, or it carries more than one update.
+    Refused(ShadowRefusal),
+    /// For now: the room's copy is past its byte cap, or among the largest while all copies
+    /// are past theirs, or this user is paused for its rebuilds. Sent as `retry`.
+    Busy,
+    /// The op alone is past the room's copy cap, or has more items than a check takes:
+    /// sending it again cannot help, and it says nothing about its content.
+    TooLarge,
+}
+
+/// Times the blocking task of a shadow copy failed (the copy is lost and started again).
+static SHADOW_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Copies dropped at the relay-wide ceiling ([`Gates::ceiling`]).
+static SHADOW_CEILING_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A byte count from the environment, or `default` when unset or unreadable.
+fn parse_bytes_or(raw: &str, default: usize) -> usize {
+    raw.trim().parse().ok().filter(|&n: &usize| n > 0).unwrap_or(default)
+}
+
+/// Parse `COLLABCRAFT_SHADOW`: on unless it is `0`, `false` or `off`.
+fn parse_shadow(raw: &str) -> bool {
+    !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off")
+}
+
+/// Ops whose payload is past this many bytes are checked off the async runtime: the gate
+/// takes about 15 ms on a 1 MiB checkpoint (release), long enough to stall other rooms.
+const BLOCKING_CHECK_BYTES: usize = 64 * 1024;
+
+/// The yrs updates of a `crdt.*` submit to the document scope, decoded. `None` when it carries
+/// none, or is for another scope: replicas read only [`craft_collab::DOC_SCOPE`] and ignore the
+/// rest, so ops there cannot reach a replica's yrs and need no copy (one per invented scope
+/// name would let a peer crowd the real one out).
+fn crdt_updates(command: &str, params: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    if !is_crdt_command(command) || params.get("scope").and_then(serde_json::Value::as_str) != Some(craft_collab::DOC_SCOPE) {
+        return None;
+    }
+    let ops = params.get("ops")?.as_array()?;
+    ops.iter().map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok())).collect()
+}
+
+/// Try a submit's update on the room's shadow copy (`gate` is held by the caller; `who` is the
+/// room and the sender's user id). Refused when the copy's replica refuses it (it does not fit
+/// the document) or yrs panics applying or encoding it; the copy then stays as it was. Returns
+/// where the copy stood before, for the caller to roll back to if the op is not ordered after
+/// all. Run off the async runtime, because a checkpoint costs tens of milliseconds on a large
+/// document.
+///
+/// One update per document-scope submit: every client sends one (an edit, an offline bundle it
+/// merged itself, or a checkpoint), and refusing the second of two would cost a rebuild to take
+/// the first out again. A refused single update costs none: the replica refuses it before yrs
+/// sees it. `state`: the op is a checkpoint snapshot from the document service, checked under
+/// the higher state item cap.
+///
+/// Bounded, and never by switching judgement off: a copy past the room cap is compacted, and
+/// if still past it, the op is refused for now (`retry`). Past the relay-wide cap, a copy at
+/// or under the floor always goes on; among the copies over it, only one past its fair share
+/// is refused for now, after compacting. A copy is judged on its own bytes against the floor,
+/// not with the op: a room under the floor goes on whatever size its checkpoints are. Past the
+/// hard [ceiling](Gates::ceiling) the relay stops judging instead: the op goes through
+/// unjudged and the room's copy is dropped (logged). A user whose ops cost [`MAX_STRIKES`]
+/// rebuilds in a room in [`STRIKE_WINDOW`] is refused there for [`STRIKE_PAUSE`].
+async fn admit_on_shadow(
+    gates: &Gates,
+    gate: &mut Gate,
+    who: (&str, &str),
+    schema: Option<String>,
+    updates: Vec<Vec<u8>>,
+    state: bool,
+) -> Result<Option<Mark>, ShadowStop> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = std::time::Instant::now();
+    let key = (who.0.to_owned(), who.1.to_owned());
+    if gates.strikes().get(&key).and_then(|s| s.paused_until).is_some_and(|until| now < until) {
+        return Err(ShadowStop::Busy);
+    }
+    let update = match <[Vec<u8>; 1]>::try_from(updates) {
+        Ok([update]) => update,
+        Err(none) if none.is_empty() => return Ok(None),
+        Err(_) => return Err(ShadowStop::Refused(ShadowRefusal::Invalid)),
+    };
+    if update.len() > gates.room_cap {
+        return Err(ShadowStop::TooLarge);
+    }
+    gate.last_op = Some(now);
+    // Past the ceiling, other rooms' idle and larger copies go before this one.
+    make_room(gates, who.0, gate.bytes, gate.bytes + 2 * update.len(), now);
+    let (room_cap, global_cap, share, floor, ceiling) = (gates.room_cap, gates.global_cap, gates.fair_share(), gates.floor, gates.ceiling);
+    let others = gates.shadow_bytes.load(Relaxed).saturating_sub(gate.bytes);
+    if gate.shadow.is_none() && others + 2 * update.len() > ceiling {
+        // Past the ceiling, no new copy is started: the op goes through unjudged.
+        tracing::debug!(room = %who.0, "the shadow copies are past their ceiling; an op goes through unjudged");
+        return Ok(None);
+    }
+    let mut shadow = gate.shadow.take().unwrap_or_else(|| Shadow::new(schema.as_deref()));
+    let empty_before = shadow.empty_rebuilds();
+    let judged = tokio::task::spawn_blocking(move || {
+        // The op before this one was ordered (or rolled back), so its mark is spent.
+        shadow.settle();
+        shadow.set_schema(schema.as_deref());
+        let need = |s: &Shadow| s.bytes() + 2 * update.len();
+        // The floor is on the copy alone (R3-M1): a large op into a copy under the floor goes on.
+        let over = |s: &Shadow| need(s) > room_cap || (others + need(s) > global_cap && s.bytes() > floor && need(s) > share);
+        let past_ceiling = |s: &Shadow| others + need(s) > ceiling;
+        if over(&shadow) || past_ceiling(&shadow) {
+            shadow.compact_now();
+        }
+        if over(&shadow) {
+            return (Some(shadow), Err(ShadowStop::Busy), None, 0);
+        }
+        if past_ceiling(&shadow) {
+            // Stop judging rather than refuse an honest room: the copy goes.
+            return (None, Ok(()), None, 0);
+        }
+        let (mark, before) = (shadow.mark(), shadow.rebuilds());
+        let admitted = if state { shadow.admit_state(&update) } else { shadow.admit(&update) };
+        let verdict = admitted.map_err(|r| if r == ShadowRefusal::TooLarge { ShadowStop::TooLarge } else { ShadowStop::Refused(r) });
+        let cost = shadow.rebuilds() - before;
+        (Some(shadow), verdict, Some(mark), cost)
+    })
+    .await;
+    match judged {
+        Ok((None, ..)) => {
+            ceiling_drop(gates, gate, who.0, others);
+            Ok(None)
+        }
+        Ok((Some(shadow), verdict, mark, cost)) => {
+            warn_empty_rebuild(who.0, &shadow, empty_before);
+            if shadow.is_waiting() {
+                // Expected until the room's first checkpoint (the copy lacks the seed), after a
+                // relay restart, and when two submits race for the gate. Logged, not refused:
+                // honest clients send such ops.
+                tracing::debug!("an op waits at the shadow copy for something it lacks");
+            }
+            account(gates, gate, &shadow);
+            gate.shadow = Some(shadow);
+            if cost > 0 {
+                strike(gates, key, now);
+            }
+            verdict.map(|()| mark)
+        }
+        // The copy is caught under `catch_unwind` inside, so this is a cancelled task; the room
+        // starts a fresh copy and the op is let through, as with the shadow off.
+        Err(e) => {
+            lose_copy(gates, gate, &e.to_string());
+            Ok(None)
+        }
+    }
+}
+
+/// The room's copy is gone (its blocking task failed): count it, log it, and free its bytes, so
+/// the next op starts a fresh copy. The op at hand is let through unjudged, as with the shadow
+/// off; [`SHADOW_LOST`] says how often that happened.
+fn lose_copy(gates: &Gates, gate: &mut Gate, error: &str) {
+    let lost = SHADOW_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::warn!(error, lost, "the shadow copy was lost; starting a new one");
+    gate.shadow = None;
+    forget_bytes(gates, gate);
+}
+
+/// Bring the copies under the [ceiling](Gates::ceiling) for an op of room `room` whose copy
+/// holds `own` bytes and will need about `need`, by dropping other rooms' copies: idle ones
+/// first ([`SHADOW_IDLE`], largest first), then active ones over the floor and larger than
+/// this room's, largest first. A room never loses its copy to the ceiling while a copy that
+/// is idle or larger exists, so an honest small active room keeps being judged. A gate held
+/// right now (its room is mid-op) is passed over, never waited for.
+fn make_room(gates: &Gates, room: &str, own: usize, need: usize, now: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let past = || gates.shadow_bytes.load(Relaxed).saturating_sub(own).saturating_add(need) > gates.ceiling;
+    if !past() {
+        return;
+    }
+    let all: Vec<(String, Arc<Mutex<Gate>>)> = {
+        let map = gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter().filter(|(key, _)| key.as_str() != room).map(|(key, gate)| (key.clone(), Arc::clone(gate))).collect()
+    };
+    // (idle, bytes, room, gate) of every copy that may go before this room's.
+    let mut victims: Vec<(bool, usize, String, Arc<Mutex<Gate>>)> = all
+        .into_iter()
+        .filter_map(|(key, gate)| {
+            let g = gate.try_lock().ok()?;
+            g.shadow.as_ref()?;
+            let idle = g.last_op.is_none_or(|t| now.duration_since(t) >= SHADOW_IDLE);
+            let (bytes, larger) = (g.bytes, g.bytes > gates.floor && g.bytes > own);
+            drop(g);
+            (idle || larger).then_some((idle, bytes, key, gate))
+        })
+        .collect();
+    victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (_, _, key, gate) in victims {
+        if !past() {
+            break;
+        }
+        if let Ok(mut g) = gate.try_lock()
+            && g.shadow.is_some()
+        {
+            let others = gates.shadow_bytes.load(Relaxed).saturating_sub(g.bytes);
+            ceiling_drop(gates, &mut g, &key, others);
+        }
+    }
+}
+
+/// The relay-wide [ceiling](Gates::ceiling) is reached: drop a room's copy (another room's, an
+/// idle or larger one, from [`make_room`]; or, when none is left, the room at hand's, whose op
+/// then goes through unjudged, as with the shadow off). Logged and counted
+/// ([`SHADOW_CEILING_DROPS`]); the room's next op starts a new copy once the total is back
+/// under the ceiling.
+fn ceiling_drop(gates: &Gates, gate: &mut Gate, room: &str, others: usize) {
+    let dropped = SHADOW_CEILING_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::warn!(
+        room,
+        copy = gate.bytes,
+        others,
+        ceiling = gates.ceiling,
+        dropped,
+        "the shadow copies reached their ceiling; a room's copy is dropped, and its ops go through unjudged until its next checkpoint"
+    );
+    gate.shadow = None;
+    forget_bytes(gates, gate);
+}
+
+/// R3-M4: a rebuild left the copy empty because it could not take its own base (a document
+/// past the state item cap). It fails open (later ops wait and go through unjudged); say so in
+/// the relay's log, which does not show the library's own warning by default.
+fn warn_empty_rebuild(room: &str, shadow: &Shadow, before: u64) {
+    if shadow.empty_rebuilds() > before {
+        tracing::warn!(room, "a shadow copy was rebuilt empty: its document is past the state item cap; its ops go through unjudged");
+    }
+}
+
+/// Take a copy's bytes out of the relay-wide counts (it is gone).
+fn forget_bytes(gates: &Gates, gate: &mut Gate) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = std::mem::take(&mut gate.bytes);
+    gates.shadow_bytes.fetch_sub(bytes, Relaxed);
+    if bytes > gates.floor {
+        gates.over_floor.fetch_sub(1, Relaxed);
+    }
+}
+
+/// Count the copy's bytes into the relay-wide counts.
+fn account(gates: &Gates, gate: &mut Gate, shadow: &Shadow) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = shadow.bytes();
+    gates.shadow_bytes.fetch_add(bytes, Relaxed);
+    gates.shadow_bytes.fetch_sub(gate.bytes, Relaxed);
+    match (gate.bytes > gates.floor, bytes > gates.floor) {
+        (false, true) => drop(gates.over_floor.fetch_add(1, Relaxed)),
+        (true, false) => drop(gates.over_floor.fetch_sub(1, Relaxed)),
+        _ => {}
+    }
+    gate.bytes = bytes;
+}
+
+/// Take an op back out of the room's copy when it is not ordered after all (the bus could not
+/// number it, or the room refused it). A rebuild, but not the sender's doing, so not counted
+/// against it.
+fn unadmit(gates: &Gates, gate: &mut Gate, mark: Option<Mark>) {
+    if let (Some(mark), Some(mut shadow)) = (mark, gate.shadow.take()) {
+        let empty_before = shadow.empty_rebuilds();
+        shadow.rollback(mark);
+        warn_empty_rebuild("(rollback)", &shadow, empty_before);
+        account(gates, gate, &shadow);
+        gate.shadow = Some(shadow);
+    }
+}
+
+/// Count an op of user `key.1` in room `key.0` that cost the copy a rebuild, and pause that
+/// user there when it is the [`MAX_STRIKES`]th within [`STRIKE_WINDOW`].
+fn strike(gates: &Gates, key: (String, String), now: std::time::Instant) {
+    let mut strikes = gates.strikes();
+    // Bounded by who struck lately: forget those with nothing recent.
+    strikes.retain(|_, s| s.paused_until.is_some_and(|u| now < u) || s.at.back().is_some_and(|t| now.duration_since(*t) <= STRIKE_WINDOW));
+    let s = strikes.entry(key.clone()).or_default();
+    while s.at.front().is_some_and(|t| now.duration_since(*t) > STRIKE_WINDOW) {
+        s.at.pop_front();
+    }
+    s.at.push_back(now);
+    if s.at.len() >= MAX_STRIKES {
+        s.at.clear();
+        s.paused_until = Some(now + STRIKE_PAUSE);
+        tracing::warn!(room = %key.0, uid = %key.1, "a user's ops cost the shadow copy {MAX_STRIKES} rebuilds within a minute; its ops there are refused for a while");
+    }
+}
+
 impl Relay {
     /// The gate that orders a room's broadcasts against its joins.
     ///
@@ -368,16 +788,19 @@ impl Relay {
     /// broadcast after the joiner is in the room and has been sent `joined`, and the long
     /// part, serialising a large replay onto the socket, blocks only that room rather than
     /// the global [`Relay::rooms`] lock.
-    fn gate(&self, key: &str) -> Arc<Mutex<()>> {
-        let mut gates = self.gates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn gate(&self, key: &str) -> Arc<Mutex<Gate>> {
+        let mut gates = self.gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(gates.entry(key.to_owned()).or_default())
     }
 
     /// Drop a room's gate once nobody holds or waits on it.
     fn forget_gate(&self, key: &str) {
-        let mut gates = self.gates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1) {
-            gates.remove(key);
+        let mut gates = self.gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1)
+            && let Some(gate) = gates.remove(key)
+            && let Ok(mut gate) = gate.try_lock()
+        {
+            forget_bytes(&self.gates, &mut gate);
         }
     }
 
@@ -578,14 +1001,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service_uid = std::env::var("COLLABCRAFT_SERVICE_UID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "craft_office".to_owned());
     let base = normalise_base(&std::env::var("COLLABCRAFT_BASE").unwrap_or_default())?;
     let public_apps = std::env::var("COLLABCRAFT_PUBLIC_APPS").is_ok_and(|v| v.trim() == "1");
-    tracing::info!(text_cap, base = %base, public_apps, "relay options");
+    let shadow = parse_shadow(&std::env::var("COLLABCRAFT_SHADOW").unwrap_or_default());
+    let shadow_bytes = parse_bytes_or(&std::env::var("COLLABCRAFT_SHADOW_BYTES").unwrap_or_default(), DEFAULT_SHADOW_BYTES);
+    let shadow_ceiling = parse_ceiling(&std::env::var("COLLABCRAFT_SHADOW_CEILING_BYTES").unwrap_or_default(), shadow_bytes)?;
+    tracing::info!(text_cap, base = %base, public_apps, shadow, shadow_bytes, shadow_ceiling, "relay options");
     let relay = Arc::new(Relay {
         text_cap,
         service_uid,
         secret: secret_bytes.clone(),
         bus: Mutex::new(bus),
         rooms: Mutex::new(HashMap::new()),
-        gates: std::sync::Mutex::new(HashMap::new()),
+        gates: Gates::new(
+            shadow,
+            parse_bytes_or(&std::env::var("COLLABCRAFT_SHADOW_ROOM_BYTES").unwrap_or_default(), DEFAULT_SHADOW_ROOM_BYTES),
+            shadow_bytes,
+        )
+        .with_floor(parse_bytes_or(&std::env::var("COLLABCRAFT_SHADOW_FLOOR_BYTES").unwrap_or_default(), DEFAULT_SHADOW_FLOOR_BYTES))
+        .with_ceiling(shadow_ceiling),
         room_grace: ROOM_GRACE,
     });
     // For the health route, which outlives the move into the socket layer.
@@ -1179,7 +1611,24 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     // A yrs update that does not decode, or whose ids overflow, is refused here: ordered, it
     // would be replayed to every joiner and abort the browser replicas that decode it. Before
     // the sequence number, so nothing is burned.
-    if !crdt_ops_sound(&msg.command, &msg.params) {
+    // Counted first, without decoding: past the block cap an op is too large to check.
+    let sound = if room::value_bytes(&msg.params) > BLOCKING_CHECK_BYTES {
+        let (command, params) = (msg.command.clone(), msg.params.clone());
+        tokio::task::spawn_blocking(move || if crdt_ops_too_large(&command, &params) { None } else { Some(crdt_ops_sound(&command, &params)) })
+            .await
+            .unwrap_or(Some(false))
+    } else if crdt_ops_too_large(&msg.command, &msg.params) {
+        None
+    } else {
+        Some(crdt_ops_sound(&msg.command, &msg.params))
+    };
+    let Some(sound) = sound else {
+        tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op with more blocks than a check takes");
+        let detail = Refusal::TooLarge { bytes: room::value_bytes(&msg.params) }.detail();
+        let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail, local, code: None });
+        return;
+    };
+    if !sound {
         tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op that is not a valid document update");
         let _ = socket.emit(
             "error",
@@ -1202,7 +1651,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
     // its broadcast, whenever it goes out, reaches the joined socket. The lock refresh and the
     // broadcast below run without the gate.
     let gate = relay.gate(&claims.rm);
-    let ordered = gate.lock().await;
+    let mut ordered = gate.lock().await;
 
     // A fenced submit (an ordered edit) is ordered only while its sender holds the scope under
     // the grant's token. Checked on the bus, inside the gate and before the sequence: a holder
@@ -1233,6 +1682,49 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         }
     }
 
+    // Tried on the room's shadow copy under the gate, so the copy takes ops in the order they
+    // are numbered, and before the sequence, so a refusal burns nothing. The gate above reads an
+    // op alone; this is what catches an op that decodes but breaks yrs in the document it lands
+    // in. See [`craft_collab::shadow`]. Only an op the room will record is tried (the room is
+    // asked first), and the copy is rolled back if the op is not ordered after all, so the copy
+    // holds exactly what peers are sent.
+    let mut mark = None;
+    if relay.gates.shadow
+        && let Some(updates) = crdt_updates(&msg.command, &msg.params)
+    {
+        let (schema, room_says) = {
+            let rooms = relay.rooms.lock().await;
+            let room = rooms.get(&claims.rm);
+            let says = room.map_or(Ok(()), |r| r.precheck(claims.may_edit(), &msg.command, room::value_bytes(&msg.params)));
+            (room.and_then(Room::schema).map(str::to_owned), says)
+        };
+        // Refused by the room below, with its own message; the copy is not asked.
+        if room_says.is_ok() {
+            let state = is_snapshot(&msg.command, &msg.params);
+            match admit_on_shadow(&relay.gates, &mut ordered, (&claims.rm, &claims.uid), schema, updates, state).await {
+                Ok(m) => mark = m,
+                Err(stop) => {
+                    drop(ordered);
+                    let (detail, code) = match stop {
+                        ShadowStop::Refused(refusal) => {
+                            tracing::warn!(room = %claims.rm, peer = %claims.pid, reason = %refusal, "refused an op the shadow copy could not take");
+                            ("that change is not a valid document update".to_owned(), Some(CODE_INVALID))
+                        }
+                        ShadowStop::Busy => {
+                            tracing::info!(room = %claims.rm, peer = %claims.pid, "refused an op for now: the shadow copy is at its cap, or this peer is paused");
+                            ("relay is busy checking this document; try again shortly".to_owned(), Some(CODE_RETRY))
+                        }
+                        ShadowStop::TooLarge => {
+                            tracing::warn!(room = %claims.rm, peer = %claims.pid, "refused an op too large for the shadow copy to check");
+                            (Refusal::TooLarge { bytes: room::value_bytes(&msg.params) }.detail(), None)
+                        }
+                    };
+                    let _ = socket.emit("error", &ErrorMsg { doc: room_name, detail, local, code });
+                    return;
+                }
+            }
+        }
+    }
     // The sequence comes from Valkey, so two relay instances cannot hand out
     // the same number.
     let floor = {
@@ -1244,6 +1736,8 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         match bus.next_seq(&claims.rm, floor).await {
             Ok(s) => s,
             Err(e) => {
+                unadmit(&relay.gates, &mut ordered, mark);
+                drop(ordered);
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
                 let _ = socket
                     .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
@@ -1267,6 +1761,9 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
             },
         )
     };
+    if outcome.is_err() {
+        unadmit(&relay.gates, &mut ordered, mark);
+    }
     drop(ordered);
 
     match outcome {

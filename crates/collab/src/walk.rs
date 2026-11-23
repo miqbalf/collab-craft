@@ -8,6 +8,13 @@
 //! an item names, and refuses any clock past [`MAX_CLOCK`] (2^31: no honest client writes that
 //! many characters, and anything below it cannot wrap a `u32`).
 //!
+//! It is also the resource cap in front of yrs's decoder (y-crdt #675/#750: a few bytes that
+//! claim billions of clients, blocks or values abort the process on allocation, which no
+//! `catch_unwind` catches). Every count is a loop here that must consume bytes on each turn, so
+//! a count the bytes cannot back fails at the end of the input, before yrs sizes anything by it;
+//! `Any` values nest at most 64 deep, client ids stay below 2^53 (#743), and the weak-link type
+//! (#733) and JSON content (#720's content ref 18) are refused.
+//!
 //! That only protects a replica if yrs parses the bytes into the same blocks. yrs ignores bytes
 //! after its delete set, so where the two readers disagree on one field, the rest of an update
 //! can mean one thing here and another to yrs. Two defences:
@@ -53,6 +60,11 @@ pub(crate) struct Shape {
     pub(crate) upper: BTreeMap<u64, u32>,
     /// The delete set, each client's ranges in written order (`Update::delete_set`).
     pub(crate) deletes: BTreeMap<u64, Ranges>,
+    /// What the update costs a reader, in entries: the blocks it writes (skips included), plus
+    /// one per client section and one per delete-set client and range. A section or a delete
+    /// entry writes no block but costs yrs a map entry and a range, so a flood of empty ones is
+    /// counted toward the same cap as a flood of blocks.
+    pub(crate) count: usize,
 }
 
 impl Shape {
@@ -63,9 +75,81 @@ impl Shape {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Blocks this thread's walks listed (a test's measure of what a walk allocated).
+    pub(crate) static LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// Where each item goes, when the caller asked ([`items`]).
+    items: Option<Vec<Placed>>,
+    /// The most items to list; past it the read stops before listing more, and `over` is set.
+    cap: usize,
+    over: bool,
+    /// The most entries to count ([`Shape::count`]); past it the read stops at once, before
+    /// it keeps anything more per section or delete range, and `over` is set.
+    count_cap: usize,
+}
+
+impl Reader<'_> {
+    /// Count one more entry, or stop the read (`None`) once the count passes `count_cap`.
+    fn tally(&mut self, count: &mut usize) -> Option<()> {
+        *count += 1;
+        if *count > self.count_cap {
+            self.over = true;
+            return None;
+        }
+        Some(())
+    }
+
+    /// List `p`, or stop the read (`None`) once the list holds `cap` items.
+    fn list(&mut self, p: Placed) -> Option<()> {
+        if let Some(items) = &mut self.items {
+            #[cfg(test)]
+            LISTED.with(|n| n.set(n.get() + 1));
+            if items.len() >= self.cap {
+                self.over = true;
+                return None;
+            }
+            items.push(p);
+        }
+        Some(())
+    }
+}
+
+/// Where an item says it goes: a root by name, a parent item, or beside its origin (or, without
+/// one, its right origin), whose parent yrs then gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Under {
+    Root(String),
+    Parent((u64, u32)),
+    /// Beside an origin and a right origin (at least one of them).
+    Beside(Option<(u64, u32)>, Option<(u64, u32)>),
+    /// The rest of an item with a named parent (a root or a parent item) whose first clocks the
+    /// document already holds: yrs keeps the named parent and puts it beside the last clock it
+    /// holds. Only made by the `fits` check, never read.
+    Within(Box<Under>, (u64, u32)),
+}
+
+/// One item of an update: its first id, its length, its content kind (`info & 0x0f`), the type
+/// byte of a type item, and where it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placed {
+    pub(crate) id: (u64, u32),
+    pub(crate) len: u32,
+    pub(crate) kind: u8,
+    pub(crate) type_ref: Option<u8>,
+    pub(crate) under: Under,
+    /// The key it names in its parent (a map entry). Only an item with no origin and no right
+    /// origin names one; yrs gives the others their neighbour's key (see the `fits` module).
+    /// A garbage-collected range is listed too, as kind 0 with no parent, so the `fits` index
+    /// knows those clocks hold nothing.
+    pub(crate) sub: Option<String>,
+    /// An embed whose value is a JSON string.
+    pub(crate) string_embed: bool,
 }
 
 impl Reader<'_> {
@@ -136,10 +220,14 @@ impl Reader<'_> {
         u32::try_from(s.encode_utf16().count()).ok()
     }
 
-    fn id(&mut self) -> Option<()> {
-        self.client()?;
-        self.clock()?;
-        Some(())
+    fn id(&mut self) -> Option<(u64, u32)> {
+        Some((self.client()?, self.clock()?))
+    }
+
+    /// A string, for a root name.
+    fn name(&mut self) -> Option<String> {
+        let n = self.u32()?;
+        std::str::from_utf8(self.take(u64::from(n))?).ok().map(str::to_owned)
     }
 
     fn any(&mut self, depth: usize) -> Option<()> {
@@ -174,32 +262,46 @@ impl Reader<'_> {
         }
     }
 
-    /// One item, after its info byte; returns its length in clocks.
-    fn item(&mut self, info: u8) -> Option<u32> {
+    /// One item, after its info byte, at `id`; returns its length in clocks.
+    fn item(&mut self, info: u8, id: (u64, u32)) -> Option<u32> {
         // yrs masks the content kind with 0x0f; it never writes 0x10.
         if info & 0x10 != 0 {
             return None;
         }
         let (origin, right, sub) = (info & 0x80 != 0, info & 0x40 != 0, info & 0x20 != 0);
-        if origin {
-            self.id()?;
-        }
-        if right {
-            self.id()?;
-        }
-        if !origin && !right {
-            // Parent: a root name (1) or the id of an item.
-            if self.u32()? == 1 {
-                self.string()?;
-            } else {
-                self.id()?;
+        let origin = if origin { Some(self.id()?) } else { None };
+        let right = if right { Some(self.id()?) } else { None };
+        let mut keyed = None;
+        let under = match (origin, right) {
+            (None, None) => {
+                // Parent: a root name (1) or the id of an item.
+                let under = if self.u32()? == 1 { Under::Root(self.name()?) } else { Under::Parent(self.id()?) };
+                // Only named here: an item with an origin takes its key from it.
+                if sub {
+                    keyed = Some(self.name()?);
+                }
+                under
             }
-            // Only named here: an item with an origin takes its key from it.
-            if sub {
-                self.string()?;
-            }
+            _ => Under::Beside(origin, right),
+        };
+        let kind = info & 0x0f;
+        let type_ref = (kind == 7).then(|| self.bytes.get(self.at).copied()).flatten();
+        let start = self.at;
+        let len = self.content(kind)?;
+        if self.items.is_some() {
+            // An embed's JSON follows its length; a string's starts with a quote.
+            let string_embed = kind == 5 && {
+                let mut peek = Reader { bytes: self.bytes, at: start, items: None, cap: 0, over: false, count_cap: usize::MAX };
+                peek.u32().is_some() && self.bytes[peek.at..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'"')
+            };
+            self.list(Placed { id, len, kind, type_ref, under, sub: keyed, string_embed })?;
         }
-        match info & 0x0f {
+        Some(len)
+    }
+
+    /// An item's content of kind `kind`; returns its length in clocks.
+    fn content(&mut self, kind: u8) -> Option<u32> {
+        match kind {
             // deleted
             1 => self.u32(),
             // binary
@@ -252,11 +354,80 @@ impl Reader<'_> {
 /// past it, a client with two sections or two delete entries, an id naming a clock past it, a
 /// delete range past it, an empty block, trailing bytes, and anything this reader cannot parse.
 pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
-    let mut r = Reader { bytes, at: 0 };
+    read_into(&mut Reader { bytes, at: 0, items: None, cap: 0, over: false, count_cap: usize::MAX })
+}
+
+/// What [`read_capped`] made of an update.
+pub(crate) enum Counted {
+    /// The reader takes it, and it counts at most the cap.
+    Within,
+    /// The reader does not take it.
+    Unread,
+    /// It counts more than the cap; the read stopped there.
+    Over,
+}
+
+/// [`read`], stopping as soon as the update counts more than `cap` entries (blocks, client
+/// sections, delete-set clients and ranges), so a flood of sections or delete ranges costs no
+/// more than the cap's worth of the read's own maps (C7b review M-2).
+pub(crate) fn read_capped(bytes: &[u8], cap: usize) -> Counted {
+    let mut r = Reader { bytes, at: 0, items: None, cap: 0, over: false, count_cap: cap };
+    match read_into(&mut r) {
+        Some(_) => Counted::Within,
+        None if r.over => Counted::Over,
+        None => Counted::Unread,
+    }
+}
+
+/// [`read`], and where every item goes, in the order written. For updates already bounded by
+/// what produced them (a document's own state, a local edit, held updates); an update from a
+/// peer goes through [`items_capped`].
+pub(crate) fn items(bytes: &[u8]) -> Option<(Shape, Vec<Placed>)> {
+    match items_capped(bytes, usize::MAX) {
+        Walked::Items(shape, items) => Some((shape, items)),
+        Walked::Unread | Walked::TooMany => None,
+    }
+}
+
+/// What [`items_capped`] made of an update.
+pub(crate) enum Walked {
+    Items(Shape, Vec<Placed>),
+    /// The reader does not take it.
+    Unread,
+    /// It holds more than the cap of blocks; the read stopped there, so the list never grew
+    /// past the cap (a 16 MiB update of two-byte blocks would list 8 M).
+    TooMany,
+}
+
+/// [`items`], refusing an update of more than `cap` blocks before listing any: the blocks are
+/// counted first by a read that keeps nothing per block (a GC run, say, is one range), so an
+/// update of millions of two-byte blocks costs one pass and no allocation per block.
+pub(crate) fn items_capped(bytes: &[u8], cap: usize) -> Walked {
+    match read_capped(bytes, cap) {
+        Counted::Unread => return Walked::Unread,
+        Counted::Over => return Walked::TooMany,
+        Counted::Within => {}
+    }
+    let mut r = Reader { bytes, at: 0, items: Some(Vec::new()), cap, over: false, count_cap: usize::MAX };
+    match read_into(&mut r) {
+        Some(shape) => Walked::Items(shape, r.items.take().unwrap_or_default()),
+        None if r.over => Walked::TooMany,
+        None => Walked::Unread,
+    }
+}
+
+fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
+    let bytes = r.bytes;
     let mut shape = Shape::default();
     let mut seen = HashSet::new();
     for _ in 0..r.u32()? {
         let blocks = r.u32()?;
+        // yrs never writes a section with no blocks; each one would cost a map entry here and
+        // in yrs's decode for nothing.
+        if blocks == 0 {
+            return None;
+        }
+        r.tally(&mut shape.count)?;
         let client = r.client()?;
         let mut clock = r.clock()?;
         if !seen.insert(client) {
@@ -267,10 +438,23 @@ pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
         let mut ranges = Ranges::new();
         for _ in 0..blocks {
             // yrs: exactly 0 is garbage-collected and 10 is a skip; any other byte is an item.
+            r.tally(&mut shape.count)?;
             let (len, skip) = match r.byte()? {
-                0 => (r.u32()?, false),
+                0 => {
+                    let len = r.u32()?;
+                    r.list(Placed {
+                        id: (client, clock),
+                        len,
+                        kind: 0,
+                        type_ref: None,
+                        under: Under::Beside(None, None),
+                        sub: None,
+                        string_embed: false,
+                    })?;
+                    (len, false)
+                }
                 10 => (r.u32()?, true),
-                info => (r.item(info)?, false),
+                info => (r.item(info, (client, clock))?, false),
             };
             if len == 0 {
                 return None;
@@ -298,9 +482,11 @@ pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
     }
     // The delete set.
     for _ in 0..r.u32()? {
+        r.tally(&mut shape.count)?;
         let client = r.client()?;
         let mut ranges = Ranges::new();
         for _ in 0..r.u32()? {
+            r.tally(&mut shape.count)?;
             let clock = r.clock()?;
             let end = u64::from(clock) + u64::from(r.u32()?);
             if end > MAX_CLOCK {

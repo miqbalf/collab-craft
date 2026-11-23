@@ -304,8 +304,9 @@ struct Fenced {
     /// when [`Fenced::log`] outgrew [`MAX_UNCONFIRMED_BYTES`]: a take-back then breaks the replica.
     base: Option<Vec<u8>>,
     /// The updates the room ordered since [`Fenced::base`], in the order this replica took them:
-    /// other peers' it applied, and its own fenced ones the relay ordered.
-    log: Vec<Vec<u8>>,
+    /// other peers' it applied, and its own fenced ones the relay ordered. Each says whether it
+    /// was a checkpoint snapshot, which a take-back replays under the state item cap.
+    log: Vec<(Vec<u8>, bool)>,
     log_bytes: usize,
     /// Edits made under the fence and not sent yet, oldest first.
     queue: Vec<Vec<u8>>,
@@ -388,8 +389,8 @@ impl Fenced {
         self.queue.len() + usize::from(self.inflight.is_some()) + self.held_back.len()
     }
 
-    /// Note an update the room ordered since the grant.
-    fn record(&mut self, update: &[u8]) {
+    /// Note an update the room ordered since the grant (`snapshot`: a checkpoint snapshot).
+    fn record(&mut self, update: &[u8], snapshot: bool) {
         if self.base.is_none() {
             return;
         }
@@ -402,7 +403,7 @@ impl Fenced {
             self.log_bytes = 0;
             return;
         }
-        self.log.push(update.to_vec());
+        self.log.push((update.to_vec(), snapshot));
     }
 }
 
@@ -471,8 +472,10 @@ pub struct Live<H, R: Replica = LiveDoc> {
     wire: Session,
     /// The replica, once the app has seeded it from the file.
     doc: Option<R>,
-    /// Updates that arrived before the file was loaded, in arrival order.
-    held: Vec<Vec<u8>>,
+    /// Updates that arrived before the file was loaded, in arrival order. Each says whether it
+    /// is a checkpoint snapshot (a second one before the load lands as an ordinary update, but
+    /// is still checked under the state item cap).
+    held: Vec<(Vec<u8>, bool)>,
     /// The id space the relay granted, once it has.
     space: Option<u32>,
     /// A snapshot to start from, waiting for [`Live::seed`].
@@ -489,7 +492,7 @@ pub struct Live<H, R: Replica = LiveDoc> {
     marked: bool,
     /// Updates applied to a file-seeded replica while [`Live::text_catchup`] was pending.
     /// A restart onto the room's snapshot replaces that replica, so they are applied again.
-    since_join: Vec<Vec<u8>>,
+    since_join: Vec<(Vec<u8>, bool)>,
     /// Some catch-up has been handled, or the link has gone live. A later join then shares
     /// the room's history and never restarts.
     settled: bool,
@@ -665,8 +668,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
             // snapshot, and these would be lost with it.
             self.since_join.extend(held.iter().cloned());
         }
-        for update in held {
-            match doc.apply(&update) {
+        for (update, snapshot) in held {
+            let applied = if snapshot { doc.apply_state(&update) } else { doc.apply(&update) };
+            match applied {
                 Ok(found) => merge_changes(&mut changes, found),
                 Err(e) => {
                     log::warn!("collab: a held update did not apply: {e}");
@@ -1426,8 +1430,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
     }
 
-    /// Merge `updates` in order into as few updates as surely fit the relay's cap. An update that
-    /// does not fit with anything goes as it was: it was sent once, so it fits alone.
+    /// Merge `updates` in order into as few updates as surely fit the relay's caps: the text cap
+    /// and the op block cap ([`MAX_OP_BLOCKS`](crate::MAX_OP_BLOCKS), counted as
+    /// [`update_blocks`](crate::update_blocks) counts it), past which the relay refuses an op for
+    /// good. Bytes alone do not bound the blocks: at the default text cap (just under 16 MiB) a
+    /// chunk of letters each typed apart from the last (about 152 k blocks per MiB) would pass
+    /// 2^20 blocks (re-review R3-M6). An update that does not fit with anything goes as it was:
+    /// it was sent once, so it fits alone.
     ///
     /// Merging only joins the updates' own items: no clock is minted, so an update the room
     /// already holds merges and lands as a no-op. Each group is merged once, so a reconnect
@@ -1439,22 +1448,31 @@ impl<H: Hub, R: Replica> Live<H, R> {
         let estimate = |bytes: usize| bytes.div_ceil(3) * 4 + 32;
         let budget = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX) / 10 * 9);
         let fits = |summed: usize| budget.is_none_or(|budget| estimate(summed) <= budget);
-        // Each group, with the summed size of the updates in it.
-        let mut groups: Vec<(Vec<Vec<u8>>, usize)> = Vec::new();
+        // A merge writes no more real blocks, client sections or delete entries than its parts
+        // (it drops or trims overlap, never splits a block), and at most one skip per real
+        // block: so twice the parts' summed count bounds the merged count, and a group whose
+        // summed count is under half the cap surely fits. An update the walk cannot read counts
+        // as past the cap, so it goes alone.
+        let blocks_of = |update: &[u8]| crate::update_blocks(update).unwrap_or(usize::MAX / 4);
+        let blocks_fit = |summed: usize| summed.saturating_mul(2) <= crate::MAX_OP_BLOCKS;
+        // Each group, with the summed size and block count of the updates in it.
+        let mut groups: Vec<(Vec<Vec<u8>>, usize, usize)> = Vec::new();
         for update in updates {
+            let blocks = blocks_of(&update);
             match groups.last_mut() {
-                Some((group, summed)) if fits(*summed + update.len()) => {
+                Some((group, summed, summed_blocks)) if fits(*summed + update.len()) && blocks_fit(summed_blocks.saturating_add(blocks)) => {
                     *summed += update.len();
+                    *summed_blocks = summed_blocks.saturating_add(blocks);
                     group.push(update);
                 }
                 _ => {
                     let size = update.len();
-                    groups.push((vec![update], size));
+                    groups.push((vec![update], size, blocks));
                 }
             }
         }
         let mut chunks = Vec::new();
-        for (group, _) in groups {
+        for (group, ..) in groups {
             if group.len() == 1 {
                 chunks.extend(group);
                 continue;
@@ -1501,14 +1519,19 @@ impl<H: Hub, R: Replica> Live<H, R> {
         // seeded once the room is known to have checkpointed past it. So is the first one a
         // replica waiting after a lost history sees.
         let restart = restart || (snap && self.awaiting_snapshot);
+        // Whether `updates` still starts with the snapshot (checked under the state cap).
+        let mut snapshot_first = snap && !updates.is_empty();
         if snap && !updates.is_empty() && (restart || self.doc.is_none()) {
             let snapshot = updates.remove(0);
             match self.restart_from(snapshot, &scope, work) {
-                Restart::Done => {}
+                Restart::Done => snapshot_first = false,
                 Restart::Refused => return,
                 Restart::Ordinary(snapshot) => updates.insert(0, snapshot),
             }
         }
+        // Each update with whether it is a checkpoint snapshot (checked under the state cap),
+        // a flag kept wherever it is held or replayed.
+        let mut updates: Vec<(Vec<u8>, bool)> = updates.into_iter().enumerate().map(|(i, update)| (update, snapshot_first && i == 0)).collect();
         if self.awaiting_snapshot && self.snapshot.is_none() {
             // Ordered before the snapshot this replica waits for, which carries them. Laid
             // over the file they would only show text the room does not have.
@@ -1536,11 +1559,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         let mut changes = Vec::new();
         let mut damaged = false;
-        for update in updates {
+        for (update, snapshot) in updates {
             if let Some(f) = self.fence.as_mut() {
-                f.record(&update);
+                f.record(&update, snapshot);
             }
-            match doc.apply(&update) {
+            // A snapshot holds the whole document: the state item cap.
+            let applied = if snapshot { doc.apply_state(&update) } else { doc.apply(&update) };
+            match applied {
                 Ok(found) => merge_changes(&mut changes, found),
                 Err(e) => {
                     log::warn!("collab: an update did not apply: {e}");
@@ -1861,8 +1886,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
             if let Some(space) = self.space {
                 doc.set_client(space)?;
             }
-            for update in &f.log {
-                doc.apply(update)?;
+            for (update, snapshot) in &f.log {
+                // A snapshot holds the whole document: the state item cap, as when it landed.
+                if *snapshot {
+                    doc.apply_state(update)?;
+                } else {
+                    doc.apply(update)?;
+                }
             }
             Ok(doc)
         });
@@ -1979,7 +2009,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 {
                     // Ordered under the lock, by any counter it went out with (an old one's order
                     // can arrive in a rejoin's catch-up): the room's now, so a take-back keeps it.
-                    f.record(&i.update);
+                    f.record(&i.update, false);
                     f.retry = false;
                     self.retry_wait = RETRY_FIRST;
                 }
@@ -2718,6 +2748,11 @@ mod tests {
         assert!(live.checkpoint().is_ok(), "the refusal was about being behind");
     }
 
+    thread_local! {
+        /// How many times this thread's `Note`s took an update as a snapshot (`apply_state`).
+        static STATE_APPLIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// A schema that is not `LiveDoc`: one text, written on `YReplica`. What `Live` needs from
     /// a replica is the trait, nothing of the block layout.
     struct Note {
@@ -2769,6 +2804,12 @@ mod tests {
         fn apply(&mut self, update: &[u8]) -> std::result::Result<Vec<()>, LiveError> {
             let before = self.read();
             self.y.apply(update)?;
+            Ok(if self.read() == before { Vec::new() } else { vec![()] })
+        }
+        fn apply_state(&mut self, update: &[u8]) -> std::result::Result<Vec<()>, LiveError> {
+            STATE_APPLIES.with(|n| n.set(n.get() + 1));
+            let before = self.read();
+            self.y.apply_state(update)?;
             Ok(if self.read() == before { Vec::new() } else { vec![()] })
         }
         fn state(&self) -> Vec<u8> {
@@ -2824,5 +2865,164 @@ mod tests {
         assert!(work.iter().any(|w| matches!(w, Work::Doc { changes } if !changes.is_empty())), "{work:?}");
         assert_eq!(b.doc().map(Note::read), a.doc().map(Note::read));
         assert_ne!(b.doc().map(Note::read).as_deref(), Some("hi"), "the edit did not land");
+    }
+
+    fn snapshot_op(seq: u64, state: &[u8]) -> ServerMsg {
+        let params = serde_json::to_value(TextPayload::snapshot(state)).unwrap();
+        ServerMsg::Op { doc: "d".to_owned(), seq, origin: "service".to_owned(), local: None, command: CRDT_TEXT.to_owned(), params, scope: None }
+    }
+
+    /// "hi", and a peer's later state of it with " there" appended.
+    fn two_snapshots() -> (Vec<u8>, Vec<u8>) {
+        let first = Note::seeded("hi").unwrap().state();
+        let mut peer = Note::from_state(&first).unwrap();
+        peer.set_client(7).unwrap();
+        peer.append(" there").unwrap();
+        (first, peer.state())
+    }
+
+    /// R3-M5: a second snapshot that arrives before the file is loaded is held as an ordinary
+    /// update, and still lands under the state item cap when the document is seeded.
+    #[test]
+    fn a_held_snapshot_lands_as_a_snapshot() {
+        let hub = Hub0::default();
+        let mut live: Live<Hub0, Note> = Live::with_replica(hub.clone(), "d");
+        let (first, second) = two_snapshots();
+        hub.0.borrow_mut().1.extend([joined(1), snapshot_op(1, &first), snapshot_op(2, &second)]);
+        live.pump();
+        assert!(live.doc().is_none());
+        STATE_APPLIES.with(|n| n.set(0));
+        live.seed("the file").unwrap();
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 1, "the held snapshot was applied under the op cap");
+        assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi there"));
+    }
+
+    /// R3-M5: a take-back replays a snapshot the room ordered under the fence as a snapshot
+    /// (the state item cap), as it was applied when it landed.
+    #[test]
+    fn a_take_back_replays_a_snapshot_as_a_snapshot() {
+        let hub = Hub0::default();
+        let mut live: Live<Hub0, Note> = Live::with_replica(hub.clone(), "d");
+        let (first, second) = two_snapshots();
+        hub.0.borrow_mut().1.extend([joined(1), snapshot_op(1, &first)]);
+        live.pump();
+        live.seed("the file").unwrap();
+        assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi"));
+        let scope = || "grid/struct".to_owned();
+        hub.0.borrow_mut().1.push(ServerMsg::LockGranted { doc: "d".to_owned(), scope: scope(), seq: Some(1), token: Some(1), lease_ms: Some(1000) });
+        live.pump();
+        live.edit(|n| n.append("!")).unwrap();
+        let local = hub
+            .0
+            .borrow()
+            .0
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ClientMsg::Submit { local, fence: Some(_), .. } => Some(*local),
+                _ => None,
+            })
+            .expect("a fenced submit");
+        STATE_APPLIES.with(|n| n.set(0));
+        hub.0.borrow_mut().1.push(snapshot_op(2, &second));
+        live.pump();
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 1, "the snapshot landed under the op cap");
+        hub.0.borrow_mut().1.push(ServerMsg::Error {
+            doc: "d".to_owned(),
+            detail: "fenced".to_owned(),
+            local: Some(local),
+            code: Some(FENCED.to_owned()),
+        });
+        let work = live.pump();
+        assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 2, "the take-back replayed the snapshot under the op cap");
+        assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi there"));
+    }
+
+    /// `n` letters each typed at the front of the root text `t` by `client`, as one update:
+    /// none merge, so each letter is its own block (the densest honest update).
+    fn letters_at_the_front(client: u8, n: u32) -> Vec<u8> {
+        fn varint(out: &mut Vec<u8>, mut v: u32) {
+            while v >= 0x80 {
+                out.push((v as u8 & 0x7f) | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let mut u = vec![1];
+        varint(&mut u, n);
+        u.extend([client, 0]);
+        // The first letter names its parent, the root `t`; each later one is put before the last.
+        u.extend([0x04, 1, 1, b't', 1, b'x']);
+        for clock in 1..n {
+            u.extend([0x44, client]);
+            varint(&mut u, clock - 1);
+            u.extend([1, b'x']);
+        }
+        u.push(0);
+        u
+    }
+
+    /// R3-M6 (ruled): a resend is chunked under the op block cap as well as the text cap. Three
+    /// dense updates of 400 k letters each fit the default text cap together (about 8 MiB), but
+    /// merged they would pass 2^20 blocks, which the relay refuses for good. Every chunk stays
+    /// under the cap, and no letter is lost.
+    #[test]
+    fn a_dense_resend_is_chunked_under_the_block_cap() {
+        const LETTERS: u32 = 400_000;
+        let mut live = Live::new(Hub0::default(), "d");
+        live.text_cap = Some(16 * 1024 * 1024 - 64 * 1024);
+        let updates: Vec<Vec<u8>> = (1..=3).map(|client| letters_at_the_front(client, LETTERS)).collect();
+        for u in &updates {
+            assert_eq!(crate::update_blocks(u), Some(LETTERS as usize + 1), "the fixture is not as dense as meant");
+        }
+        let total: usize = updates.iter().map(Vec::len).sum();
+        assert!(total.div_ceil(3) * 4 < 16 * 1024 * 1024 / 10 * 9, "the text cap alone would split it");
+        let chunks = live.chunked(updates);
+        let counts: Vec<usize> = chunks.iter().map(|c| crate::update_blocks(c).unwrap()).collect();
+        assert!(counts.iter().all(|&n| n <= crate::MAX_OP_BLOCKS), "a chunk the relay refuses for good: {counts:?}");
+        assert!(chunks.len() >= 2, "{counts:?}");
+        assert_eq!(counts.iter().sum::<usize>(), 3 * (LETTERS as usize + 1), "letters were lost or added: {counts:?}");
+    }
+
+    /// C7b review M-1: a live checkpoint that overtakes a marked fallback's text ops is kept
+    /// in `since_join` with its snapshot flag, so when the text ops restart the file-seeded
+    /// replica it is applied again under the state item cap, not the op cap.
+    #[test]
+    fn a_checkpoint_kept_since_join_is_replayed_as_a_snapshot() {
+        let hub = Hub0::default();
+        let mut live: Live<Hub0, Note> = Live::with_replica(hub.clone(), "d");
+        live.seed("hi").unwrap();
+        let (first, second) = two_snapshots();
+        let fallback = ServerMsg::Joined {
+            doc: "d".to_owned(),
+            peer: "p1".to_owned(),
+            seq: 0,
+            space: 1,
+            roster: Vec::new(),
+            locks: Vec::new(),
+            replay_until: Some(0),
+            fallback: true,
+            text_cap: None,
+            heartbeat: false,
+            history_lost: false,
+        };
+        STATE_APPLIES.with(|n| n.set(0));
+        hub.0.borrow_mut().1.extend([fallback, snapshot_op(1, &second)]);
+        live.pump();
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 1, "the live checkpoint landed under the op cap");
+        let text_ops = ServerMsg::TextOps {
+            doc: "d".to_owned(),
+            scope: DOC_SCOPE.to_owned(),
+            ops: serde_json::json!([update_to_wire(&first)]),
+            complete: true,
+            snap: true,
+            more: false,
+        };
+        hub.0.borrow_mut().1.push(text_ops);
+        let work = live.pump();
+        assert!(work.iter().any(|w| matches!(w, Work::Reset)), "the text ops did not restart the replica: {work:?}");
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 2, "the checkpoint kept since the join was replayed under the op cap");
+        assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi there"));
     }
 }

@@ -43,11 +43,10 @@ use serde_json::{Map, Value};
 use yrs::types::text::YChange;
 use yrs::types::{Attrs, Event, PathSegment};
 use yrs::{
-    Any, Array, ArrayRef, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact,
-    TransactionMut,
+    Any, Array, ArrayRef, DeepObservable, Doc, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact, TransactionMut,
 };
 
-use crate::replica::{REMOTE, Replica, YReplica, byte_at, byte_span, integrate, put_sorted, to_any, to_json};
+use crate::replica::{REMOTE, Replica, YReplica, byte_span, integrate, put_sorted, to_any, to_json};
 
 const BODY: &str = "body";
 const BLOCKS: &str = "blocks";
@@ -124,6 +123,10 @@ pub enum LiveError {
     /// no more local edits; rebuild it from a snapshot or reopen the file.
     #[error("the shared document is damaged; reopen the file")]
     Damaged,
+    /// The update has more items than one check takes (see the `fits` module). No update an
+    /// honest peer sends is this large; it is not judged as content that does not fit.
+    #[error("the update is too large to check")]
+    TooLarge,
 }
 
 /// One replica of a block document.
@@ -206,6 +209,9 @@ impl LiveDoc {
     /// would be different items from the ones the snapshot holds.
     pub fn from_state(state: &[u8]) -> Result<LiveDoc, LiveError> {
         let doc = YReplica::seed_doc();
+        // Typed first, so the fit check judges the state against the roots it will be read as.
+        doc.get_or_insert_array(BODY);
+        doc.get_or_insert_map(BLOCKS);
         integrate(&doc, state)?;
         Ok(assemble(doc, None))
     }
@@ -231,9 +237,23 @@ impl LiveDoc {
     /// arrived yet is held and lands when they do (up to a bound, past which
     /// [`needs_resync`](Self::needs_resync) is raised).
     pub fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        self.apply_with(update, false)
+    }
+
+    /// [`apply`](Self::apply) for a checkpoint snapshot the room ordered (see
+    /// [`YReplica::apply_state`]).
+    pub fn apply_state(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        self.apply_with(update, true)
+    }
+
+    fn apply_with(&mut self, update: &[u8], state: bool) -> Result<Vec<BlockChange>, LiveError> {
         let before = self.order();
         self.drain_seen();
-        self.y.apply(update)?;
+        if state {
+            self.y.apply_state(update)?;
+        } else {
+            self.y.apply(update)?;
+        }
         let after = self.order();
         let seen = self.drain_seen();
 
@@ -263,7 +283,7 @@ impl LiveDoc {
         let attrs = run_attrs_of(run_attrs);
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let at = byte_at(&t.get_string(txn), char_at)?;
+            let at = *char_offsets(txn, &t)?.get(char_at).ok_or(LiveError::OutOfRange)?;
             t.insert_with_attributes(txn, at, text, attrs);
             Ok(())
         })
@@ -273,7 +293,7 @@ impl LiveDoc {
     pub fn delete_text(&mut self, id: u64, char_at: usize, len: usize) -> Result<Vec<u8>, LiveError> {
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let (at, bytes) = byte_span(&t.get_string(txn), char_at, len)?;
+            let (at, bytes) = span_of(&char_offsets(txn, &t)?, char_at, len)?;
             if bytes > 0 {
                 t.remove_range(txn, at, bytes);
             }
@@ -287,7 +307,7 @@ impl LiveDoc {
         let attrs: Attrs = run_attrs.iter().map(|(k, v)| (Arc::from(k.as_str()), to_any(v))).collect();
         self.local(|txn, s| {
             let t = s.live_text(txn, id)?;
-            let (at, bytes) = byte_span(&t.get_string(txn), char_at, len)?;
+            let (at, bytes) = span_of(&char_offsets(txn, &t)?, char_at, len)?;
             if bytes > 0 && !attrs.is_empty() {
                 t.format(txn, at, bytes, attrs);
             }
@@ -330,9 +350,9 @@ impl LiveDoc {
                 return Err(LiveError::Exists);
             }
             let t = text_of(txn, &block).ok_or(LiveError::UnknownBlock)?;
-            let string = t.get_string(txn);
-            let total = string.chars().count();
-            let (at, bytes) = byte_span(&string, char_at, total.checked_sub(char_at).ok_or(LiveError::OutOfRange)?)?;
+            let offsets = char_offsets(txn, &t)?;
+            let total = offsets.len() - 1;
+            let (at, bytes) = span_of(&offsets, char_at, total.checked_sub(char_at).ok_or(LiveError::OutOfRange)?)?;
             let tail = slice_chunks(chunks(txn, &t), char_at);
             let attrs = attrs_map(txn, &block).map(|a| read_attrs(txn, &a)).unwrap_or_default();
             if bytes > 0 {
@@ -499,6 +519,9 @@ impl Replica for LiveDoc {
     }
     fn apply(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
         LiveDoc::apply(self, update)
+    }
+    fn apply_state(&mut self, update: &[u8]) -> Result<Vec<BlockChange>, LiveError> {
+        LiveDoc::apply_state(self, update)
     }
     fn state(&self) -> Vec<u8> {
         LiveDoc::state(self)
@@ -708,6 +731,42 @@ fn put_block(txn: &mut TransactionMut, blocks: &MapRef, block: &SeedBlock) {
 }
 
 /// The text as `(string, attributes)` chunks, attributes without nulls.
+/// Where each char boundary of a block's text sits in yrs offsets: `n + 1` entries for `n`
+/// chars, the last being the text's whole length.
+///
+/// Not the bytes of [`get_string`](yrs::GetString::get_string): yrs counts an embed or a
+/// nested type in a text as one unit, and the string leaves it out, so offsets taken from the
+/// string fall short after one and a cut runs past the end (`Couldn't remove … elements`, a
+/// panic). WordCraft never writes either, but a crafted update can put one in a block's text
+/// (the `fits` check lets them be, since a text may hold embeds). A char boundary next to one
+/// sits after it, and a span of chars takes the embeds between its chars with it.
+fn char_offsets<T: ReadTxn>(txn: &T, text: &TextRef) -> Result<Vec<u32>, LiveError> {
+    let mut out = Vec::new();
+    let mut at: usize = 0;
+    for d in text.diff(txn, YChange::identity) {
+        match d.insert {
+            Out::Any(Any::String(s)) => {
+                for c in s.chars() {
+                    out.push(u32::try_from(at).map_err(|_| LiveError::OutOfRange)?);
+                    at += c.len_utf8();
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    out.push(u32::try_from(at).map_err(|_| LiveError::OutOfRange)?);
+    Ok(out)
+}
+
+/// Offset and length in yrs units of `len` chars from `char_at`, by [`char_offsets`].
+fn span_of(offsets: &[u32], char_at: usize, len: usize) -> Result<(u32, u32), LiveError> {
+    let end = char_at.checked_add(len).ok_or(LiveError::OutOfRange)?;
+    match (offsets.get(char_at), offsets.get(end)) {
+        (Some(&a), Some(&b)) => Ok((a, b - a)),
+        _ => Err(LiveError::OutOfRange),
+    }
+}
+
 fn chunks<T: ReadTxn>(txn: &T, text: &TextRef) -> Vec<(String, Attributes)> {
     text.diff(txn, YChange::identity)
         .into_iter()
@@ -761,15 +820,164 @@ fn run_attrs_of(attrs: &Attributes) -> Attrs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
 
-    fn doc() -> LiveDoc {
+    pub(crate) fn doc() -> LiveDoc {
         let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "hello".to_owned(), ..SeedBlock::default() }]).unwrap();
         d.set_client(1).unwrap();
         d
+    }
+
+    /// Block 1's text: its id, and an update from client 77 that types one letter at its end.
+    pub(crate) fn text_id_and_letter(d: &LiveDoc) -> (yrs::ID, Vec<u8>) {
+        use yrs::branch::BranchID;
+        use yrs::updates::decoder::Decode;
+        let raw = yrs::Doc::with_options(yrs::Options {
+            offset_kind: yrs::OffsetKind::Bytes,
+            ..yrs::Options::with_client_id(yrs::block::ClientID::new(77))
+        });
+        raw.transact_mut().apply_update(yrs::Update::decode_v1(&d.state()).unwrap()).unwrap();
+        let blocks = raw.get_or_insert_map(BLOCKS);
+        let before = raw.transact().state_vector();
+        let id = {
+            let mut txn = raw.transact_mut();
+            let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+            let text = text_of(&txn, &block).unwrap();
+            let len = text.len(&txn);
+            text.insert(&mut txn, len, "!");
+            let BranchID::Nested(id) = AsRef::<yrs::branch::Branch>::as_ref(&text).id() else { panic!("a root text") };
+            id
+        };
+        (id, raw.transact().encode_diff_v1(&before))
+    }
+
+    /// The same id sent again, longer, naming `parent` and key `k`, with `content`
+    /// (`kind`: 0x08 Any, 0x04 string).
+    pub(crate) fn resent_keyed(parent: yrs::ID, kind: u8, content: &[u8]) -> Vec<u8> {
+        let (client, clock) = (parent.client.get(), u64::from(parent.clock));
+        assert!(client < 0x80 && clock < 0x80);
+        let mut u = vec![1, 1, 77, 0, 0x20 | kind, 0, client as u8, clock as u8, 1, b'k'];
+        u.extend(content);
+        u.push(0);
+        u
+    }
+
+    /// Re-review N1: one letter at the end of a block text, then the same id sent again two
+    /// long, naming the text as its parent and key `k`. yrs keeps the rest's key but links it
+    /// into the text's list, and a checkpoint then reads it back as an unkeyed value in the
+    /// text, which no restore takes. The second op is refused, and every checkpoint loads back.
+    #[test]
+    fn a_held_item_resent_with_its_own_key_is_refused() {
+        let mut d = doc();
+        let (text, letter) = text_id_and_letter(&d);
+        d.apply(&letter).unwrap();
+        let keyed_values = resent_keyed(text, 0x08, &[2, 0x7d, 1, 0x7d, 2]);
+        assert!(d.apply(&keyed_values).is_err(), "the keyed rest was taken");
+        assert!(LiveDoc::from_state(&d.state()).is_ok(), "the checkpoint does not load back");
+        assert_eq!(d.block(1).unwrap().text, "hello!");
+        d.delete_text(1, 0, 6).unwrap();
+    }
+
+    /// A state is checked against the typed roots it is read with: a string straight in the
+    /// body (an array of block ids) is refused on restore, as it is on apply.
+    #[test]
+    fn a_restore_checks_the_state_against_the_typed_roots() {
+        let string_in_body = [1, 1, 50, 0, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
+        assert!(LiveDoc::from_state(&string_in_body).is_err(), "from_state");
+        let mut d = doc();
+        assert!(d.apply(&string_in_body).is_err(), "apply");
+        assert!(d.y.rebuilt_from_state(&string_in_body).is_err(), "rebuilt_from_state");
+    }
+
+    /// An item that names no parent takes its origin's map key along with its parent (yrs
+    /// copies `parent_sub` from the left neighbour). So a keyed entry crafted into a block's
+    /// text, then a string placed right of it, is a keyed string in the text, which panics at
+    /// the next local cut (yrs text.rs:845). The fit check follows the key down the origin
+    /// chain and refuses the string.
+    #[test]
+    fn a_string_that_inherits_a_key_in_a_text_is_refused() {
+        use yrs::branch::BranchID;
+        let mut d = doc();
+        let text_id = {
+            let txn = d.y.doc().transact();
+            let blocks = txn.get_map(BLOCKS).unwrap();
+            let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+            let text = text_of(&txn, &block).unwrap();
+            let BranchID::Nested(id) = AsRef::<yrs::branch::Branch>::as_ref(&text).id() else { panic!("a root text") };
+            id
+        };
+        let mut keyed = vec![1, 1, 77, 0, 0x28, 0];
+        for n in [text_id.client.get(), u64::from(text_id.clock)] {
+            assert!(n < 0x80, "{n}");
+            keyed.push(n as u8);
+        }
+        keyed.extend([1, b'x', 1, 0x7d, 1, 0]);
+        d.apply(&keyed).unwrap();
+        // A string, origin the keyed entry, no parent named.
+        assert!(d.apply(&[1, 1, 77, 1, 0x84, 77, 0, 1, b'a', 0]).is_err(), "a keyed string got into the text");
+        d.delete_text(1, 0, 5).unwrap();
+        assert_eq!(d.block(1).unwrap().text, "");
+    }
+
+    /// An embed another peer put in a block's text (WordCraft never writes one; a crafted update
+    /// can) is counted the way yrs counts it: local cuts, formats, inserts and splits around and
+    /// over it neither panic nor land on the wrong characters.
+    #[test]
+    fn local_edits_count_an_embed_in_the_text() {
+        use yrs::updates::decoder::Decode;
+        use yrs::{OffsetKind, Options, Update};
+        // Before the first char, after a two-byte one, and at the end.
+        for at_byte in [0_u32, 3, 8] {
+            let mut d = LiveDoc::seeded(&[SeedBlock { id: 1, text: "h\u{e9}llo w".to_owned(), ..SeedBlock::default() }]).unwrap();
+            d.set_client(1).unwrap();
+            // Another peer, in raw yrs, puts an embed at byte `at_byte` of block 1's text.
+            let fresh = || {
+                let mut options = Options::with_client_id(yrs::block::ClientID::new(77));
+                options.offset_kind = OffsetKind::Bytes;
+                Doc::with_options(options)
+            };
+            let raw = fresh();
+            raw.transact_mut().apply_update(Update::decode_v1(&d.state()).unwrap()).unwrap();
+            let blocks = raw.get_or_insert_map(BLOCKS);
+            let before = raw.transact().state_vector();
+            {
+                let mut txn = raw.transact_mut();
+                let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+                let text = text_of(&txn, &block).unwrap();
+                text.insert_embed(&mut txn, at_byte, Any::from("img"));
+            }
+            // A string embed reads back as text, so the replica refuses it outright.
+            assert!(d.apply(&raw.transact().encode_diff_v1(&before)).is_err(), "a string embed was taken");
+            let raw = fresh();
+            raw.transact_mut().apply_update(Update::decode_v1(&d.state()).unwrap()).unwrap();
+            let blocks = raw.get_or_insert_map(BLOCKS);
+            let before = raw.transact().state_vector();
+            {
+                let mut txn = raw.transact_mut();
+                let Some(Out::YMap(block)) = blocks.get(&txn, &key(1)) else { panic!("no block 1") };
+                let text = text_of(&txn, &block).unwrap();
+                let img = Any::Map(Arc::new([("src".to_owned(), Any::from("img"))].into_iter().collect()));
+                text.insert_embed(&mut txn, at_byte, img);
+            }
+            d.apply(&raw.transact().encode_diff_v1(&before)).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "h\u{e9}llo w", "the embed is not text");
+
+            d.format(1, 0, 7, &[("b".to_owned(), Value::Bool(true))].into_iter().collect()).unwrap();
+            d.insert_text(1, 7, "orld", &Map::new()).unwrap();
+            d.delete_text(1, 1, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo world");
+            d.split(1, 3, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo");
+            assert_eq!(d.block(2).unwrap().text, " world");
+            d.merge(1, 2).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "hlo world");
+            d.delete_text(1, 0, 9).unwrap();
+            assert_eq!(d.block(1).unwrap().text, "");
+            assert!(!d.damaged());
+        }
     }
 
     /// The observer sees local changes too; they are drained, not left to pile up.

@@ -186,3 +186,120 @@ async fn junk_op_round(schema: Option<&str>) {
     let joined_text = format!("{replayed:?} {replay:?}");
     assert!(!joined_text.contains("/wEC") && !joined_text.contains(&overflow), "junk is in the replay: {joined_text}");
 }
+
+/// An op the gate takes alone but that breaks yrs in the document it lands in is refused by the
+/// relay's shadow copy, takes no sequence number and reaches nobody. The ops before and after
+/// it are ordered. With a schema the copy types the roots too, so a string straight in the
+/// WordCraft body (an array) is refused; with none, only what the ops themselves type is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_the_shadow_refuses_an_op_that_does_not_fit_the_document() {
+    shadow_round(Some("wordcraft/1")).await;
+    shadow_round(None).await;
+}
+
+async fn shadow_round(schema: Option<&str>) {
+    use base64::Engine as _;
+    let wire = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let Some(h) = start().await else { return };
+    let room = unique_room("shadow-round");
+    let mut alice = connect(&h.url, &room, "alice", schema).await;
+    let seen = answer(&mut alice).await;
+    let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
+    let mut bob = connect(&h.url, &room, "bob", schema).await;
+    answer(&mut bob).await;
+    let before = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+
+    // Client 50 puts an array in the body, then a string in that array (yrs cannot read it back:
+    // its array iterator spins for ever), then a string straight in the body.
+    let array = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+    let string_in_array = [1, 1, 50, 1, 0x04, 0, 50, 0, 2, 0xc3, 0xa9, 0];
+    let string_in_body = [1, 1, 50, 1, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
+    for op in [&array[..], &string_in_array, &string_in_body] {
+        assert!(craft_collab::update_is_sound(op), "the gate alone takes {op:?}");
+    }
+    // One at a time: submits sent together are ordered by whichever handler takes the gate
+    // first, and an op that arrives before the one it names waits at the copy, unjudged.
+    let mut heard_a = Vec::new();
+    for (local, op) in [(1, &array[..]), (2, &string_in_array), (3, &string_in_body)] {
+        alice.send(text_op(&doc, local, &wire(op))).unwrap();
+        heard_a.extend(listen(&mut alice, 500).await);
+    }
+    let heard_b = listen(&mut bob, 100).await;
+
+    let refused: Vec<u64> = heard_a
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Error { local: Some(l), code: Some(c), .. } if c == "invalid" => Some(*l),
+            _ => None,
+        })
+        .collect();
+    let (want_refused, want_ops) = if schema.is_some() { (vec![2, 3], 1) } else { (vec![2], 2) };
+    assert_eq!(refused, want_refused, "{heard_a:?}");
+    assert_eq!(ops(&heard_a), want_ops, "{heard_a:?}");
+    assert_eq!(ops(&heard_b), want_ops, "{heard_b:?}");
+    let after = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+    assert_eq!(after - before, want_ops as u64, "a refused op burned a sequence number");
+}
+
+/// The copy holds only what the room records, and judges the document scope whatever other
+/// scopes a peer invents. An editor's op that the room refuses after the copy (here: past the
+/// room's size limit, which only the room reads, with the padding outside the ops) once stayed
+/// in the copy, so a second op with the same ids and content that does not fit was taken as
+/// already there and ordered; and 64 invented scope names once filled the copy slots and turned
+/// the shadow off for the room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_the_shadow_holds_only_what_the_room_records() {
+    use base64::Engine as _;
+    let wire = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    // A text cap of 8 MiB: the room refuses params past 8 MiB, and the transport carries 64 KiB
+    // more, so an op can reach the copy and then be refused by the room.
+    let cap = crate::room::HISTORY_BYTES;
+    let Some(h) = crate::e2e_reconnect::start_capped(None, cap).await else { return };
+    let room = unique_room("shadow-holds");
+    let schema = Some("wordcraft/1");
+    let mut alice = connect(&h.url, &room, "alice", schema).await;
+    let seen = answer(&mut alice).await;
+    let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
+
+    // The same id (client 50, clock 0): an array in the body, then a string in the body.
+    let array = [1, 1, 50, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+    let string_in_body = [1, 1, 50, 0, 0x04, 1, 4, b'b', b'o', b'd', b'y', 2, 0xc3, 0xa9, 0];
+    let padded = craft_collab::ClientMsg::Submit {
+        doc: doc.clone(),
+        local: 1,
+        command: craft_collab::CRDT_TEXT.to_owned(),
+        params: serde_json::json!({ "scope": craft_collab::DOC_SCOPE, "ops": [wire(&array)], "pad": "x".repeat(cap + 1024) }),
+        scope: None,
+        fence: None,
+    };
+    alice.send(padded).unwrap();
+    let heard = listen(&mut alice, 3000).await;
+    let too_large =
+        heard.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(1), detail, .. } if detail.contains("more than this relay will carry")));
+    assert!(too_large, "the padded op was not refused by the room: {heard:?}");
+
+    // Ops in 70 invented scopes (each its own client), then the string on the document scope.
+    let mut heard_a = Vec::new();
+    for n in 0..70_u8 {
+        let op = [1, 1, 20 + n, 0, 0x07, 1, 4, b'b', b'o', b'd', b'y', 0, 0];
+        let params = serde_json::json!({ "scope": format!("junk-{n}"), "ops": [wire(&op)] });
+        let submit = craft_collab::ClientMsg::Submit {
+            doc: doc.clone(),
+            local: 100 + u64::from(n),
+            command: craft_collab::CRDT_TEXT.to_owned(),
+            params,
+            scope: None,
+            fence: None,
+        };
+        alice.send(submit).unwrap();
+    }
+    heard_a.extend(listen(&mut alice, 1500).await);
+    alice.send(text_op(&doc, 2, &wire(&string_in_body))).unwrap();
+    heard_a.extend(listen(&mut alice, 500).await);
+    let refused = heard_a.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(2), code: Some(c), .. } if c == "invalid"));
+    assert!(refused, "a string in the body was ordered: {heard_a:?}");
+    // The 70 junk ops are ordered; the string is not.
+    assert_eq!(ops(&heard_a), 70, "{heard_a:?}");
+}

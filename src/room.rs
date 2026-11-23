@@ -336,6 +336,26 @@ pub fn crdt_ops_sound(command: &str, params: &serde_json::Value) -> bool {
     ops.iter().all(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()).is_some_and(|bytes| craft_collab::update_is_sound(&bytes)))
 }
 
+/// Whether an op of a `crdt.*` payload writes more blocks than a check takes: past
+/// [`craft_collab::MAX_OP_BLOCKS`], or [`craft_collab::MAX_STATE_BLOCKS`] for a checkpoint
+/// snapshot (`snap`, ordered only from the document service). Asked before
+/// [`crdt_ops_sound`], which decodes, and answered by counting, so a 16 MiB op of two-byte
+/// blocks is refused as too large without listing them.
+#[must_use]
+pub fn crdt_ops_too_large(command: &str, params: &serde_json::Value) -> bool {
+    if !is_crdt_command(command) {
+        return false;
+    }
+    let snap = params.get("snap").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let cap = if snap { craft_collab::MAX_STATE_BLOCKS } else { craft_collab::MAX_OP_BLOCKS };
+    let Some(ops) = params.get("ops").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    ops.iter()
+        .filter_map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()))
+        .any(|bytes| craft_collab::update_exceeds_blocks(&bytes, cap))
+}
+
 /// Commands whose payload is a CRDT operation. They never take a region lock.
 #[must_use]
 pub fn is_crdt_command(command: &str) -> bool {
@@ -546,7 +566,6 @@ impl Room {
     }
 
     /// The replica schema the room is pinned to, if any.
-    #[cfg(test)]
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
@@ -701,16 +720,21 @@ impl Room {
     /// region lock would only serialize what the CRDT is meant to combine. A
     /// scope on those commands is stripped so a buggy client cannot lock a
     /// paragraph by accident.
-    pub fn submit(&mut self, seq: u64, s: Submission) -> Result<Op, Refusal> {
-        if !s.may_edit {
+    /// Whether [`Room::submit`] would take a CRDT op of `bytes` of params from this peer. The
+    /// relay asks before it tries the op on its shadow copy, so the copy never keeps an op the
+    /// room then refuses (a CRDT op is refused for nothing else: scope locks do not apply).
+    pub fn precheck(&self, may_edit: bool, command: &str, bytes: usize) -> Result<(), Refusal> {
+        if !may_edit {
             return Err(Refusal::ReadOnly);
         }
-        let bytes = value_bytes(&s.params);
         // A CRDT op may be a checkpoint snapshot, which the rooms retain up to the text cap.
-        let limit = if is_crdt_command(&s.command) { HISTORY_BYTES.max(self.scope_cap()) } else { HISTORY_BYTES };
-        if bytes > limit {
-            return Err(Refusal::TooLarge { bytes });
-        }
+        let limit = if is_crdt_command(command) { HISTORY_BYTES.max(self.scope_cap()) } else { HISTORY_BYTES };
+        if bytes > limit { Err(Refusal::TooLarge { bytes }) } else { Ok(()) }
+    }
+
+    pub fn submit(&mut self, seq: u64, s: Submission) -> Result<Op, Refusal> {
+        let bytes = value_bytes(&s.params);
+        self.precheck(s.may_edit, &s.command, bytes)?;
         let scope = if is_crdt_command(&s.command) { None } else { s.scope };
         if let Some(scope) = &scope
             && let Some(holder) = self.locks.get(scope)
@@ -923,7 +947,7 @@ impl Room {
 /// Measured by encoding it. A structural estimate would be cheaper and would also be the
 /// number an attacker optimises against, and a submit already pays one serialisation to reach
 /// the socket.
-fn value_bytes(value: &serde_json::Value) -> usize {
+pub(crate) fn value_bytes(value: &serde_json::Value) -> usize {
     serde_json::to_vec(value).map_or(0, |v| v.len())
 }
 
