@@ -19,7 +19,17 @@
 //!    file's ETag. Then every editor is told (`saved {seq, etag}`).
 //! 4. heartbeats the room every [`HEARTBEAT_MS`], and once no editor has been in the room for
 //!    [`EMPTY_GRACE_MS`], saves a last time, closes the room (which releases the app lock) and
-//!    leaves.
+//!    leaves. The close says how long the room has been empty (`?idle=` seconds); the app
+//!    refuses it (`409`) when it handed out an edit ticket into the room since. A refused close,
+//!    like a new notify for a room being served (another window got a ticket into this room,
+//!    whether or not an editor was in it then), or one that comes while a close went
+//!    unanswered, marks a window as expected: until an editor joins after the mark (each join
+//!    takes the oldest mark), or [`ALONE_MS`] has passed, the empty-room close does not run. So
+//!    a window the worker was told about never lands in a room the worker left, however slowly
+//!    it loads (up to [`ALONE_MS`]). Notifies that come within one turn count as one window, and
+//!    a refused close and the notify of the ticket that refused it count as one. A notify that
+//!    lands after a close failed and before the room's task ends is not seen here; the app's
+//!    stale-room job notifies again.
 //!
 //! Right after its first join has caught up, the worker checkpoints the room once, so an editor
 //! that joins later restores the room's document from that snapshot instead of seeding from a
@@ -30,6 +40,11 @@
 //! When the file changed outside the session (`412`), the version found there is copied aside
 //! as `"{stem} (conflict {YYYY-MM-DD HHMM}).{ext}"` (` 2` … ` 9` added when the name is
 //! taken), the editors get a `notice`, and the room goes on saving over that version's ETag.
+//! A write whose answer never came (a timeout, a dropped connection, a 5xx) may still have landed:
+//! the worker keeps a digest of each such write since the last answered one (the newest
+//! [`UNANSWERED_MAX`]). When the file found on a `412` is one of them (or the bytes being written
+//! now), it is the worker's own write, not a change made outside, and the room goes on from it
+//! without a copy.
 //! A write that keeps failing for another reason is given up after [`SAVE_GIVE_UP_MS`].
 //!
 //! When saving stops for good, and before the worker leaves a room, it sends the editors `ended`
@@ -134,8 +149,13 @@ pub const HEARTBEAT_MS: u64 = 30_000;
 pub const EMPTY_GRACE_MS: u64 = 10_000;
 /// Turns live before the first join counts as caught up (half a second at [`TICK`]).
 const SETTLE_STEPS: u32 = 5;
-/// A room no editor ever joined is given up after this long.
+/// A room no editor ever joined is given up after this long; an announced window is waited for
+/// this long.
 pub const ALONE_MS: u64 = 120_000;
+/// Announced windows kept at once (the oldest is dropped past it).
+const EXPECTED_MAX: usize = 64;
+/// Unanswered writes remembered at once (the oldest is dropped past it).
+pub const UNANSWERED_MAX: usize = 8;
 /// How long a service ticket is good for.
 pub const TICKET_SECS: i64 = 600;
 /// A ticket this old is replaced, so a reconnect never offers one close to expiry.
@@ -420,9 +440,14 @@ pub struct Nextcloud {
 
 impl Nextcloud {
     pub fn new(base: &str, secret: Arc<Secret>) -> Result<Nextcloud, String> {
+        Nextcloud::with_timeout(base, secret, HTTP_TIMEOUT)
+    }
+
+    /// [`Nextcloud::new`] with every call given up after `timeout` instead of 30 s (tests).
+    pub fn with_timeout(base: &str, secret: Arc<Secret>, timeout: Duration) -> Result<Nextcloud, String> {
         // No redirects: the signature header would follow one to wherever it points.
         let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("http client: {e}"))?;
@@ -496,7 +521,7 @@ impl RoomFiles {
     }
 
     /// Write the file over the version `etag`; the new ETag.
-    pub async fn put(&self, bytes: Vec<u8>, etag: &str) -> Result<String, FileError> {
+    pub async fn put(&self, bytes: Bytes, etag: &str) -> Result<String, FileError> {
         let req = self.nc.http.put(self.url("file", "")).header("If-Match", format!("\"{etag}\"")).body(bytes);
         let resp = self.send(req).await?;
         let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.map_err(|e| FileError::Http(e.without_url().to_string()))?)
@@ -518,9 +543,33 @@ impl RoomFiles {
         self.send(self.nc.http.post(self.url("room", "/heartbeat"))).await.map(drop)
     }
 
-    pub async fn close(&self) -> Result<(), FileError> {
-        self.send(self.nc.http.post(self.url("room", "/close"))).await.map(drop)
+    /// Close the room, which has had no editor for `idle_secs`. [`Closed::Reopened`] when the app
+    /// refused it because it handed out an edit ticket into the room since (`409`).
+    pub async fn close(&self, idle_secs: u64) -> Result<Closed, FileError> {
+        match self.send(self.nc.http.post(self.url("room", &format!("/close?idle={idle_secs}")))).await {
+            Ok(_) => Ok(Closed::Closed),
+            Err(FileError::Exists) => Ok(Closed::Reopened),
+            Err(e) => Err(e),
+        }
     }
+
+    /// Whether a notify for this room came since the last call (the app handed out another
+    /// ticket into it).
+    pub fn renotified(&mut self) -> bool {
+        let changed = self.token.has_changed().unwrap_or(false);
+        if changed {
+            self.token.borrow_and_update();
+        }
+        changed
+    }
+}
+
+/// What the app said to a room's close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    Closed,
+    /// Refused: an edit ticket into the room was handed out since it emptied.
+    Reopened,
 }
 
 fn bare_etag(e: &str) -> String {
@@ -664,10 +713,19 @@ pub struct Room<H: Hub, S: DocumentService> {
     checkpoint_now: bool,
     /// When the first of the writes failing in a row (not conflicts) failed.
     put_failing_since: Option<u64>,
+    /// The writes since the last answered one whose answer never came (a timeout, a dropped
+    /// connection, a 5xx from a proxy): the server may hold any of them all the same.
+    unanswered: Unanswered,
     beat: Beat,
     opened_at: u64,
     seen_editor: bool,
     empty_since: Option<u64>,
+    /// The windows announced (a notify, or a close refused as reopened) that have not joined
+    /// yet, by when, oldest first: the room is not closed for being empty while there is one.
+    /// Each editor joining takes the oldest; each is dropped [`ALONE_MS`] after it came.
+    expected: Vec<u64>,
+    /// The editors in the room at the last turn, to see one join.
+    editors_before: usize,
 }
 
 impl<H: Hub, S: DocumentService + Default> Room<H, S> {
@@ -734,10 +792,13 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             first_checkpoint: false,
             checkpoint_now: false,
             put_failing_since: None,
+            unanswered: Unanswered::default(),
             beat,
             opened_at: now,
             seen_editor: false,
             empty_since: None,
+            expected: Vec::new(),
+            editors_before: 0,
         })
     }
 
@@ -775,6 +836,9 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// heartbeat, start a save when one is due, and close the room once it has stayed empty.
     pub async fn step(&mut self) -> Flow {
         let now = self.clock.now_ms();
+        if self.files.renotified() {
+            self.expect_window(now);
+        }
         let editors = self.doc.pump();
         for n in self.doc.live_mut().take_notices() {
             say(&self.doc_id, format_args!("live: {n}"));
@@ -809,8 +873,14 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             return Flow::Done;
         }
 
+        self.expected.retain(|at| now.saturating_sub(*at) < ALONE_MS);
+        let joined = editors.saturating_sub(self.editors_before).min(self.expected.len());
+        self.expected.drain(..joined);
+        self.editors_before = editors;
         if editors == 0 {
-            if self.seen_editor || now.saturating_sub(self.opened_at) >= ALONE_MS {
+            if !self.expected.is_empty() {
+                self.empty_since = None;
+            } else if self.seen_editor || now.saturating_sub(self.opened_at) >= ALONE_MS {
                 self.empty_since.get_or_insert(now);
             }
         } else {
@@ -833,10 +903,25 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                 }
                 // Only a room the app closed is marked closed: one it still holds may get a
                 // worker again (its stale job re-notifies), and an editor rejoining it waits.
-                let closed = match self.files.close().await {
-                    Ok(()) => {
+                let idle_secs = now.saturating_sub(self.empty_since.unwrap_or(now)) / 1000;
+                let closed = match self.files.close(idle_secs).await {
+                    Ok(Closed::Closed) => {
                         say(&self.doc_id, "no editors left; room closed");
                         true
+                    }
+                    Ok(Closed::Reopened) => {
+                        say(&self.doc_id, "reopened while empty; serving it on");
+                        // The notify of the ticket that refused the close is the same window.
+                        self.files.renotified();
+                        self.expect_window(now);
+                        return Flow::Continue;
+                    }
+                    // A ticket into the room came while the close was unanswered (a slow server):
+                    // its window is served, as after a refused close.
+                    Err(e) if self.files.renotified() => {
+                        say(&self.doc_id, format_args!("closing the room failed: {e}; a window is on its way, serving it on"));
+                        self.expect_window(now);
+                        return Flow::Continue;
                     }
                     Err(e) => {
                         say(&self.doc_id, format_args!("closing the room failed: {e}; leaving it open"));
@@ -848,6 +933,17 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             }
         }
         Flow::Continue
+    }
+
+    /// A ticket into this room was handed out (a notify came, or the app refused the close): a
+    /// window is on its way. Until an editor joins after now, or [`ALONE_MS`] has passed, the
+    /// room is not closed for being empty.
+    fn expect_window(&mut self, now: u64) {
+        if self.expected.len() >= EXPECTED_MAX {
+            self.expected.remove(0);
+        }
+        self.expected.push(now);
+        self.empty_since = None;
     }
 
     /// Mark the document dirty when its body is no longer the one the file holds, however it
@@ -956,7 +1052,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                     if seq <= 1 {
                         self.first_checkpoint = true;
                     }
-                    self.write(inflight, seq, now).await;
+                    self.write(inflight, seq).await;
                 }
                 SaveEvent::Raced => {
                     self.unsaved(inflight.dirty_since);
@@ -978,7 +1074,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// Write the acknowledged checkpoint `inflight` (ordered at `seq`) to the file. One that
     /// holds what the file holds already (the first checkpoint, or edits undone) is only
     /// announced, with the file's ETag.
-    async fn write(&mut self, inflight: Inflight<Snapshot<S, H>>, seq: u64, now: u64) {
+    async fn write(&mut self, inflight: Inflight<Snapshot<S, H>>, seq: u64) {
         if self.doc.same(&inflight.body, &self.saved_body) && self.untold_copies.is_empty() {
             match self.doc.live_mut().announce_saved(seq, &self.etag) {
                 Ok(()) => self.announced_seq = self.announced_seq.max(seq),
@@ -994,7 +1090,11 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                 return;
             }
         };
-        match self.put(bytes).await {
+        let outcome = self.put(bytes).await;
+        // Retries count from when the write ended, which may be long after the turn began (a
+        // write waits up to the HTTP timeout).
+        let now = self.clock.now_ms();
+        match outcome {
             Ok(etag) => {
                 match self.doc.live_mut().announce_saved(seq, &etag) {
                     Ok(()) => self.announced_seq = self.announced_seq.max(seq),
@@ -1031,8 +1131,11 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// PUT over the known version. When it changed outside, copy that version aside, write over
     /// it, and only then tell the editors where it was kept.
     async fn put(&mut self, bytes: Vec<u8>) -> Result<String, WriteFail> {
-        let outcome = match self.files.put(bytes.clone(), &self.etag).await {
-            Err(FileError::Stale) => self.keep_outside(bytes).await,
+        let bytes = Bytes::from(bytes);
+        let digest = Unanswered::digest(&bytes);
+        let etag = self.etag.clone();
+        let outcome = match self.put_over(bytes.clone(), &digest, &etag).await {
+            Err(FileError::Stale) => self.keep_outside(bytes, &digest).await,
             // The write that follows a conflict copy is part of keeping the outside version.
             Err(e) if !self.untold_copies.is_empty() => Err(ConflictFail::from(e)),
             Err(e) => return Err(WriteFail::Retry(e)),
@@ -1045,6 +1148,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             }
             Err(ConflictFail::Stop(why)) => format!("could not keep the outside version: {why}"),
             Err(ConflictFail::Forbidden) => FORBIDDEN_WHY.to_owned(),
+            Err(ConflictFail::Plain(e)) => return Err(WriteFail::Retry(e)),
             Err(ConflictFail::Again(e)) => {
                 let now = self.clock.now_ms();
                 if self.conflict_failures == 0 {
@@ -1062,9 +1166,40 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         Err(WriteFail::Stop(if copies.is_empty() { why } else { format!("{why}; the outside version was kept as {}", copies.join(", ")) }))
     }
 
-    /// The outside version copied aside and the session written over it: the new ETag.
-    async fn keep_outside(&mut self, bytes: Vec<u8>) -> Result<String, ConflictFail> {
+    /// Write `bytes` (whose digest is `digest`) over the version `etag`. A write with no answer
+    /// (not one the server refused) may have landed all the same: its digest is kept, so a `412`
+    /// after it can tell the worker's own write from a change made outside.
+    async fn put_over(&mut self, bytes: Bytes, digest: &[u8], etag: &str) -> Result<String, FileError> {
+        let result = self.files.put(bytes, etag).await;
+        match &result {
+            Ok(_) => self.unanswered.clear(),
+            Err(FileError::Http(_)) => self.unanswered.note(digest),
+            // Refused: nothing written this time (an earlier unanswered write may still have been).
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// The file changed since the version the worker wrote over (`412`). When it holds what the
+    /// worker wrote itself (a write whose answer never came, or these very bytes), the worker
+    /// goes on from it. Otherwise the outside version is copied aside and the session written
+    /// over it. The new ETag.
+    async fn keep_outside(&mut self, bytes: Bytes, digest: &[u8]) -> Result<String, ConflictFail> {
         let outside = self.files.get().await.map_err(ConflictFail::from)?;
+        let found = Unanswered::digest(&outside.bytes);
+        if found == digest || self.unanswered.holds(&found) {
+            say(&self.doc_id, "the file holds the session's own version (a save whose answer never came); no copy, going on from it");
+            self.unanswered.clear();
+            self.etag = outside.etag;
+            if found == digest {
+                return Ok(self.etag.clone());
+            }
+            let etag = self.etag.clone();
+            // No outside version to keep: a failure here is a plain failed write (unless it is
+            // the write over a copy made earlier).
+            let plain = self.untold_copies.is_empty();
+            return self.put_over(bytes, digest, &etag).await.map_err(|e| if plain { ConflictFail::Plain(e) } else { ConflictFail::from(e) });
+        }
         // The file may have been renamed since it was first read: the copy is named after it as
         // it is now. Still a file the service saves, or the format it is written in would change.
         if outside.name != self.file_name && self.service.accepts(&outside.name) {
@@ -1074,7 +1209,8 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         say(&self.doc_id, "the file changed outside the session; that version was copied aside");
         self.untold_copies.push(name);
         self.etag = outside.etag;
-        self.files.put(bytes, &self.etag).await.map_err(ConflictFail::from)
+        let etag = self.etag.clone();
+        self.put_over(bytes, digest, &etag).await.map_err(ConflictFail::from)
     }
 
     /// A write went through: tell the editors of the conflict copies made for it.
@@ -1198,8 +1334,40 @@ async fn copy_aside(files: &RoomFiles, file_name: &str, unix_ms: i64) -> Result<
     Err(ConflictFail::Stop(format!("all {CONFLICT_NAMES} conflict names are taken")))
 }
 
+/// Digests (SHA-256) of the writes whose answer never came since the last answered one, oldest
+/// first, at most [`UNANSWERED_MAX`], each once.
+#[derive(Default)]
+struct Unanswered(Vec<Vec<u8>>);
+
+impl Unanswered {
+    fn digest(bytes: &[u8]) -> Vec<u8> {
+        <Sha256 as sha2::Digest>::digest(bytes).to_vec()
+    }
+
+    fn note(&mut self, digest: &[u8]) {
+        if self.holds(digest) {
+            return;
+        }
+        if self.0.len() >= UNANSWERED_MAX {
+            self.0.remove(0);
+        }
+        self.0.push(digest.to_vec());
+    }
+
+    fn holds(&self, digest: &[u8]) -> bool {
+        self.0.iter().any(|d| d == digest)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Why the outside version could not be kept.
 enum ConflictFail {
+    /// Not a conflict after all (the file held the session's own write), and the write over it
+    /// failed: a plain failed write.
+    Plain(FileError),
     /// `403`: this session may no longer write the file; stops at once.
     Forbidden,
     /// May pass (counts towards [`CONFLICT_TRIES`]).
@@ -1433,8 +1601,13 @@ pub async fn pinned_source<S: DocumentService>(service: &S, files: &RoomFiles, g
     match files.base().await {
         Ok((bytes, _)) => Ok(FileGot { bytes, ..got }),
         Err(e) => {
-            if let Err(c) = files.close().await {
-                say(files.room(), format_args!("closing the room failed: {c}"));
+            // No editor was ever served here, so the room is closed as idle for 0 s. A refused
+            // close (a window got a ticket meanwhile) changes nothing: without its base the room
+            // cannot be served, and the app's stale-room job takes it from here.
+            match files.close(0).await {
+                Ok(Closed::Closed) => {}
+                Ok(Closed::Reopened) => say(files.room(), "closing the room was refused: a window got a ticket into it meanwhile"),
+                Err(c) => say(files.room(), format_args!("closing the room failed: {c}")),
             }
             Err(e)
         }
@@ -1609,6 +1782,21 @@ mod tests {
         assert_eq!(conflict_name("Plan.docx", at, 1), "Plan (conflict 2026-11-21 1403).docx");
         assert_eq!(conflict_name("Plan.docx", at, 3), "Plan (conflict 2026-11-21 1403) 3.docx");
         assert_eq!(conflict_name("README", at, 1), "README (conflict 2026-11-21 1403)");
+    }
+
+    #[test]
+    fn unanswered_writes_are_capped_deduplicated_and_cleared() {
+        let d = |n: u8| Unanswered::digest(&[n]);
+        let mut u = Unanswered::default();
+        for n in 0..=8u8 {
+            u.note(&d(n));
+        }
+        assert!(!u.holds(&d(0)), "the oldest is dropped past the cap");
+        assert!((1..=8u8).all(|n| u.holds(&d(n))), "the newest {UNANSWERED_MAX} are kept");
+        u.note(&d(8));
+        assert_eq!(u.0.len(), UNANSWERED_MAX, "the same write is kept once");
+        u.clear();
+        assert!(!u.holds(&d(8)));
     }
 
     #[test]
