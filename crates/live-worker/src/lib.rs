@@ -26,7 +26,10 @@
 //!    unanswered, marks a window as expected: until an editor joins after the mark (each join
 //!    takes the oldest mark), or [`ALONE_MS`] has passed, the empty-room close does not run. So
 //!    a window the worker was told about never lands in a room the worker left, however slowly
-//!    it loads (up to [`ALONE_MS`]). Notifies that come within one turn count as one window.
+//!    it loads (up to [`ALONE_MS`]). Notifies that come within one turn count as one window, and
+//!    a refused close and the notify of the ticket that refused it count as one. A notify that
+//!    lands after a close failed and before the room's task ends is not seen here; the app's
+//!    stale-room job notifies again.
 //!
 //! Right after its first join has caught up, the worker checkpoints the room once, so an editor
 //! that joins later restores the room's document from that snapshot instead of seeding from a
@@ -38,9 +41,10 @@
 //! as `"{stem} (conflict {YYYY-MM-DD HHMM}).{ext}"` (` 2` … ` 9` added when the name is
 //! taken), the editors get a `notice`, and the room goes on saving over that version's ETag.
 //! A write whose answer never came (a timeout, a dropped connection, a 5xx) may still have landed:
-//! when the file found on a `412` holds exactly those bytes (or the ones being written now), it
-//! is the worker's own write, not a change made outside, and the room goes on from it without a
-//! copy.
+//! the worker keeps a digest of each such write since the last answered one (the newest
+//! [`UNANSWERED_MAX`]). When the file found on a `412` is one of them (or the bytes being written
+//! now), it is the worker's own write, not a change made outside, and the room goes on from it
+//! without a copy.
 //! A write that keeps failing for another reason is given up after [`SAVE_GIVE_UP_MS`].
 //!
 //! When saving stops for good, and before the worker leaves a room, it sends the editors `ended`
@@ -146,6 +150,8 @@ const SETTLE_STEPS: u32 = 5;
 pub const ALONE_MS: u64 = 120_000;
 /// Announced windows kept at once (the oldest is dropped past it).
 const EXPECTED_MAX: usize = 64;
+/// Unanswered writes remembered at once (the oldest is dropped past it).
+pub const UNANSWERED_MAX: usize = 8;
 /// How long a service ticket is good for.
 pub const TICKET_SECS: i64 = 600;
 /// A ticket this old is replaced, so a reconnect never offers one close to expiry.
@@ -496,7 +502,7 @@ impl RoomFiles {
     }
 
     /// Write the file over the version `etag`; the new ETag.
-    pub async fn put(&self, bytes: Vec<u8>, etag: &str) -> Result<String, FileError> {
+    pub async fn put(&self, bytes: Bytes, etag: &str) -> Result<String, FileError> {
         let req = self.nc.http.put(self.url("file", "")).header("If-Match", format!("\"{etag}\"")).body(bytes);
         let resp = self.send(req).await?;
         let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.map_err(|e| FileError::Http(e.without_url().to_string()))?)
@@ -688,10 +694,9 @@ pub struct Room<H: Hub, S: DocumentService> {
     checkpoint_now: bool,
     /// When the first of the writes failing in a row (not conflicts) failed.
     put_failing_since: Option<u64>,
-    /// The bytes of the newest write whose answer never came (a timeout, a dropped connection, a
-    /// 5xx from a proxy): the server may hold them all the same. Cleared by the next write that
-    /// is answered.
-    unanswered: Option<Vec<u8>>,
+    /// The writes since the last answered one whose answer never came (a timeout, a dropped
+    /// connection, a 5xx from a proxy): the server may hold any of them all the same.
+    unanswered: Unanswered,
     beat: Beat,
     opened_at: u64,
     seen_editor: bool,
@@ -767,7 +772,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             first_checkpoint: false,
             checkpoint_now: false,
             put_failing_since: None,
-            unanswered: None,
+            unanswered: Unanswered::default(),
             beat,
             opened_at: now,
             seen_editor: false,
@@ -886,6 +891,8 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                     }
                     Ok(Closed::Reopened) => {
                         say(&self.doc_id, "reopened while empty; serving it on");
+                        // The notify of the ticket that refused the close is the same window.
+                        self.files.renotified();
                         self.expect_window(now);
                         return Flow::Continue;
                     }
@@ -1025,7 +1032,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                     if seq <= 1 {
                         self.first_checkpoint = true;
                     }
-                    self.write(inflight, seq, now).await;
+                    self.write(inflight, seq).await;
                 }
                 SaveEvent::Raced => {
                     self.unsaved(inflight.dirty_since);
@@ -1047,7 +1054,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// Write the acknowledged checkpoint `inflight` (ordered at `seq`) to the file. One that
     /// holds what the file holds already (the first checkpoint, or edits undone) is only
     /// announced, with the file's ETag.
-    async fn write(&mut self, inflight: Inflight<Snapshot<S, H>>, seq: u64, now: u64) {
+    async fn write(&mut self, inflight: Inflight<Snapshot<S, H>>, seq: u64) {
         if self.doc.same(&inflight.body, &self.saved_body) && self.untold_copies.is_empty() {
             match self.doc.live_mut().announce_saved(seq, &self.etag) {
                 Ok(()) => self.announced_seq = self.announced_seq.max(seq),
@@ -1063,7 +1070,11 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
                 return;
             }
         };
-        match self.put(bytes).await {
+        let outcome = self.put(bytes).await;
+        // Retries count from when the write ended, which may be long after the turn began (a
+        // write waits up to the HTTP timeout).
+        let now = self.clock.now_ms();
+        match outcome {
             Ok(etag) => {
                 match self.doc.live_mut().announce_saved(seq, &etag) {
                     Ok(()) => self.announced_seq = self.announced_seq.max(seq),
@@ -1100,9 +1111,11 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// PUT over the known version. When it changed outside, copy that version aside, write over
     /// it, and only then tell the editors where it was kept.
     async fn put(&mut self, bytes: Vec<u8>) -> Result<String, WriteFail> {
+        let bytes = Bytes::from(bytes);
+        let digest = Unanswered::digest(&bytes);
         let etag = self.etag.clone();
-        let outcome = match self.put_over(bytes.clone(), &etag).await {
-            Err(FileError::Stale) => self.keep_outside(bytes).await,
+        let outcome = match self.put_over(bytes.clone(), &digest, &etag).await {
+            Err(FileError::Stale) => self.keep_outside(bytes, &digest).await,
             // The write that follows a conflict copy is part of keeping the outside version.
             Err(e) if !self.untold_copies.is_empty() => Err(ConflictFail::from(e)),
             Err(e) => return Err(WriteFail::Retry(e)),
@@ -1115,6 +1128,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
             }
             Err(ConflictFail::Stop(why)) => format!("could not keep the outside version: {why}"),
             Err(ConflictFail::Forbidden) => FORBIDDEN_WHY.to_owned(),
+            Err(ConflictFail::Plain(e)) => return Err(WriteFail::Retry(e)),
             Err(ConflictFail::Again(e)) => {
                 let now = self.clock.now_ms();
                 if self.conflict_failures == 0 {
@@ -1132,15 +1146,14 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         Err(WriteFail::Stop(if copies.is_empty() { why } else { format!("{why}; the outside version was kept as {}", copies.join(", ")) }))
     }
 
-    /// Write `bytes` over the version `etag`. A write with no answer (not one the server
-    /// refused) may have landed all the same: its bytes are kept, so a `412` after it can tell
-    /// the worker's own write from a change made outside.
-    async fn put_over(&mut self, bytes: Vec<u8>, etag: &str) -> Result<String, FileError> {
-        let sent = bytes.clone();
+    /// Write `bytes` (whose digest is `digest`) over the version `etag`. A write with no answer
+    /// (not one the server refused) may have landed all the same: its digest is kept, so a `412`
+    /// after it can tell the worker's own write from a change made outside.
+    async fn put_over(&mut self, bytes: Bytes, digest: &[u8], etag: &str) -> Result<String, FileError> {
         let result = self.files.put(bytes, etag).await;
         match &result {
-            Ok(_) => self.unanswered = None,
-            Err(FileError::Http(_)) => self.unanswered = Some(sent),
+            Ok(_) => self.unanswered.clear(),
+            Err(FileError::Http(_)) => self.unanswered.note(digest),
             // Refused: nothing written this time (an earlier unanswered write may still have been).
             Err(_) => {}
         }
@@ -1151,17 +1164,21 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
     /// worker wrote itself (a write whose answer never came, or these very bytes), the worker
     /// goes on from it. Otherwise the outside version is copied aside and the session written
     /// over it. The new ETag.
-    async fn keep_outside(&mut self, bytes: Vec<u8>) -> Result<String, ConflictFail> {
+    async fn keep_outside(&mut self, bytes: Bytes, digest: &[u8]) -> Result<String, ConflictFail> {
         let outside = self.files.get().await.map_err(ConflictFail::from)?;
-        if outside.bytes == bytes || self.unanswered.as_ref() == Some(&outside.bytes) {
+        let found = Unanswered::digest(&outside.bytes);
+        if found == digest || self.unanswered.holds(&found) {
             say(&self.doc_id, "the file holds the session's own version (a save whose answer never came); no copy, going on from it");
-            self.unanswered = None;
+            self.unanswered.clear();
             self.etag = outside.etag;
-            if outside.bytes == bytes {
+            if found == digest {
                 return Ok(self.etag.clone());
             }
             let etag = self.etag.clone();
-            return self.put_over(bytes, &etag).await.map_err(ConflictFail::from);
+            // No outside version to keep: a failure here is a plain failed write (unless it is
+            // the write over a copy made earlier).
+            let plain = self.untold_copies.is_empty();
+            return self.put_over(bytes, digest, &etag).await.map_err(|e| if plain { ConflictFail::Plain(e) } else { ConflictFail::from(e) });
         }
         // The file may have been renamed since it was first read: the copy is named after it as
         // it is now. Still a file the service saves, or the format it is written in would change.
@@ -1173,7 +1190,7 @@ impl<H: Hub, S: DocumentService> Room<H, S> {
         self.untold_copies.push(name);
         self.etag = outside.etag;
         let etag = self.etag.clone();
-        self.put_over(bytes, &etag).await.map_err(ConflictFail::from)
+        self.put_over(bytes, digest, &etag).await.map_err(ConflictFail::from)
     }
 
     /// A write went through: tell the editors of the conflict copies made for it.
@@ -1297,8 +1314,40 @@ async fn copy_aside(files: &RoomFiles, file_name: &str, unix_ms: i64) -> Result<
     Err(ConflictFail::Stop(format!("all {CONFLICT_NAMES} conflict names are taken")))
 }
 
+/// Digests (SHA-256) of the writes whose answer never came since the last answered one, oldest
+/// first, at most [`UNANSWERED_MAX`], each once.
+#[derive(Default)]
+struct Unanswered(Vec<Vec<u8>>);
+
+impl Unanswered {
+    fn digest(bytes: &[u8]) -> Vec<u8> {
+        <Sha256 as sha2::Digest>::digest(bytes).to_vec()
+    }
+
+    fn note(&mut self, digest: &[u8]) {
+        if self.holds(digest) {
+            return;
+        }
+        if self.0.len() >= UNANSWERED_MAX {
+            self.0.remove(0);
+        }
+        self.0.push(digest.to_vec());
+    }
+
+    fn holds(&self, digest: &[u8]) -> bool {
+        self.0.iter().any(|d| d == digest)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Why the outside version could not be kept.
 enum ConflictFail {
+    /// Not a conflict after all (the file held the session's own write), and the write over it
+    /// failed: a plain failed write.
+    Plain(FileError),
     /// `403`: this session may no longer write the file; stops at once.
     Forbidden,
     /// May pass (counts towards [`CONFLICT_TRIES`]).
@@ -1684,6 +1733,21 @@ mod tests {
         assert_eq!(conflict_name("Plan.docx", at, 1), "Plan (conflict 2026-11-21 1403).docx");
         assert_eq!(conflict_name("Plan.docx", at, 3), "Plan (conflict 2026-11-21 1403) 3.docx");
         assert_eq!(conflict_name("README", at, 1), "README (conflict 2026-11-21 1403)");
+    }
+
+    #[test]
+    fn unanswered_writes_are_capped_deduplicated_and_cleared() {
+        let d = |n: u8| Unanswered::digest(&[n]);
+        let mut u = Unanswered::default();
+        for n in 0..=8u8 {
+            u.note(&d(n));
+        }
+        assert!(!u.holds(&d(0)), "the oldest is dropped past the cap");
+        assert!((1..=8u8).all(|n| u.holds(&d(n))), "the newest {UNANSWERED_MAX} are kept");
+        u.note(&d(8));
+        assert_eq!(u.0.len(), UNANSWERED_MAX, "the same write is kept once");
+        u.clear();
+        assert!(!u.holds(&d(8)));
     }
 
     #[test]
