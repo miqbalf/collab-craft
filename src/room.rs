@@ -353,7 +353,7 @@ pub fn crdt_ops_too_large(command: &str, params: &serde_json::Value) -> bool {
     };
     ops.iter()
         .filter_map(|op| op.as_str().and_then(|t| craft_collab::update_from_wire(t).ok()))
-        .any(|bytes| craft_collab::update_blocks(&bytes).is_some_and(|n| n > cap))
+        .any(|bytes| craft_collab::update_exceeds_blocks(&bytes, cap))
 }
 
 /// Commands whose payload is a CRDT operation. They never take a region lock.

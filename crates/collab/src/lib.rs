@@ -78,7 +78,7 @@ pub use proto::{
     CRDT_POS, CRDT_TEXT, ClientMsg, DocId, FENCED, Fence, LockState, PROTO, PeerId, Presence, REFUSED_AUTH, REFUSED_FULL, REFUSED_PROTO,
     REFUSED_SCHEMA, RETRY, Scope, ServerMsg, is_crdt_command,
 };
-pub use replica::{MAX_OP_BLOCKS, MAX_STATE_BLOCKS, Replica, YReplica, update_blocks, update_is_sound};
+pub use replica::{MAX_OP_BLOCKS, MAX_STATE_BLOCKS, Replica, YReplica, update_blocks, update_exceeds_blocks, update_is_sound};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};

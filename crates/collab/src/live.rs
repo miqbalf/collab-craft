@@ -458,7 +458,7 @@ pub struct Live<H, R: Replica = LiveDoc> {
     marked: bool,
     /// Updates applied to a file-seeded replica while [`Live::text_catchup`] was pending.
     /// A restart onto the room's snapshot replaces that replica, so they are applied again.
-    since_join: Vec<Vec<u8>>,
+    since_join: Vec<(Vec<u8>, bool)>,
     /// Some catch-up has been handled, or the link has gone live. A later join then shares
     /// the room's history and never restarts.
     settled: bool,
@@ -622,7 +622,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
         if self.from_file && self.text_catchup && self.marked {
             // The text ops may still restart this file-seeded replica onto the room's
             // snapshot, and these would be lost with it.
-            self.since_join.extend(held.iter().map(|(update, _)| update.clone()));
+            self.since_join.extend(held.iter().cloned());
         }
         for (update, snapshot) in held {
             let applied = if snapshot { doc.apply_state(&update) } else { doc.apply(&update) };
@@ -1236,10 +1236,11 @@ impl<H: Hub, R: Replica> Live<H, R> {
         let estimate = |bytes: usize| bytes.div_ceil(3) * 4 + 32;
         let fits = |update: &[u8]| serde_json::to_value(TextPayload::new(update)).map(|params| self.over_cap(&params).is_none()).unwrap_or(false);
         let cap = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX));
-        // A merge writes no more blocks than its parts, plus at most one skip per part, and
-        // every non-empty part counts at least one: so twice the parts' summed count bounds
-        // the merged count. Under half the cap, no exact count is needed. An update the walk
-        // cannot read counts as past the cap, so it is never merged into.
+        // A merge writes no more real blocks, client sections or delete entries than its parts
+        // (it drops or trims overlap, never splits a block), and at most one skip per real
+        // block: so twice the parts' summed count bounds the merged count, and under half the
+        // cap no exact count is needed. An update the walk
+        // cannot read is merged only when the merged update reads and is under the cap.
         let blocks_of = |update: &[u8]| crate::update_blocks(update).unwrap_or(usize::MAX / 4);
         let block_cap = crate::MAX_OP_BLOCKS;
         // Each chunk, with the summed size and block count of the updates in it.
@@ -1316,6 +1317,9 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 Restart::Ordinary(snapshot) => updates.insert(0, snapshot),
             }
         }
+        // Each update with whether it is a checkpoint snapshot (checked under the state cap),
+        // a flag kept wherever it is held or replayed.
+        let mut updates: Vec<(Vec<u8>, bool)> = updates.into_iter().enumerate().map(|(i, update)| (update, snapshot_first && i == 0)).collect();
         if self.awaiting_snapshot && self.snapshot.is_none() {
             // Ordered before the snapshot this replica waits for, which carries them. Laid
             // over the file they would only show text the room does not have.
@@ -1332,7 +1336,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             self.since_join.extend(updates.iter().cloned());
         }
         let Some(doc) = self.doc.as_mut() else {
-            self.held.extend(updates.into_iter().enumerate().map(|(i, update)| (update, snapshot_first && i == 0)));
+            self.held.extend(updates);
             work.push(Work::SeedWanted { scope });
             return;
         };
@@ -1343,12 +1347,12 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
         let mut changes = Vec::new();
         let mut damaged = false;
-        for (i, update) in updates.into_iter().enumerate() {
+        for (update, snapshot) in updates {
             if let Some(f) = self.fence.as_mut() {
-                f.record(&update, snapshot_first && i == 0);
+                f.record(&update, snapshot);
             }
-            // A snapshot is the payload's only op, and holds the whole document.
-            let applied = if snapshot_first && i == 0 { doc.apply_state(&update) } else { doc.apply(&update) };
+            // A snapshot holds the whole document: the state item cap.
+            let applied = if snapshot { doc.apply_state(&update) } else { doc.apply(&update) };
             match applied {
                 Ok(found) => merge_changes(&mut changes, found),
                 Err(e) => {
@@ -2367,5 +2371,46 @@ mod tests {
         assert!(counts.iter().all(|&n| n <= crate::MAX_OP_BLOCKS), "a chunk the relay refuses for good: {counts:?}");
         assert!(chunks.len() >= 2, "{counts:?}");
         assert_eq!(counts.iter().sum::<usize>(), 3 * (LETTERS as usize + 1), "letters were lost or added: {counts:?}");
+    }
+
+    /// C7b review M-1: a live checkpoint that overtakes a marked fallback's text ops is kept
+    /// in `since_join` with its snapshot flag, so when the text ops restart the file-seeded
+    /// replica it is applied again under the state item cap, not the op cap.
+    #[test]
+    fn a_checkpoint_kept_since_join_is_replayed_as_a_snapshot() {
+        let hub = Hub0::default();
+        let mut live: Live<Hub0, Note> = Live::with_replica(hub.clone(), "d");
+        live.seed("hi").unwrap();
+        let (first, second) = two_snapshots();
+        let fallback = ServerMsg::Joined {
+            doc: "d".to_owned(),
+            peer: "p1".to_owned(),
+            seq: 0,
+            space: 1,
+            roster: Vec::new(),
+            locks: Vec::new(),
+            replay_until: Some(0),
+            fallback: true,
+            text_cap: None,
+            heartbeat: false,
+            history_lost: false,
+        };
+        STATE_APPLIES.with(|n| n.set(0));
+        hub.0.borrow_mut().1.extend([fallback, snapshot_op(1, &second)]);
+        live.pump();
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 1, "the live checkpoint landed under the op cap");
+        let text_ops = ServerMsg::TextOps {
+            doc: "d".to_owned(),
+            scope: DOC_SCOPE.to_owned(),
+            ops: serde_json::json!([update_to_wire(&first)]),
+            complete: true,
+            snap: true,
+            more: false,
+        };
+        hub.0.borrow_mut().1.push(text_ops);
+        let work = live.pump();
+        assert!(work.iter().any(|w| matches!(w, Work::Reset)), "the text ops did not restart the replica: {work:?}");
+        assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 2, "the checkpoint kept since the join was replayed under the op cap");
+        assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi there"));
     }
 }

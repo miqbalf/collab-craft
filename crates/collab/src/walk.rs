@@ -89,9 +89,22 @@ struct Reader<'a> {
     /// The most items to list; past it the read stops before listing more, and `over` is set.
     cap: usize,
     over: bool,
+    /// The most entries to count ([`Shape::count`]); past it the read stops at once, before
+    /// it keeps anything more per section or delete range, and `over` is set.
+    count_cap: usize,
 }
 
 impl Reader<'_> {
+    /// Count one more entry, or stop the read (`None`) once the count passes `count_cap`.
+    fn tally(&mut self, count: &mut usize) -> Option<()> {
+        *count += 1;
+        if *count > self.count_cap {
+            self.over = true;
+            return None;
+        }
+        Some(())
+    }
+
     /// List `p`, or stop the read (`None`) once the list holds `cap` items.
     fn list(&mut self, p: Placed) -> Option<()> {
         if let Some(items) = &mut self.items {
@@ -278,7 +291,7 @@ impl Reader<'_> {
         if self.items.is_some() {
             // An embed's JSON follows its length; a string's starts with a quote.
             let string_embed = kind == 5 && {
-                let mut peek = Reader { bytes: self.bytes, at: start, items: None, cap: 0, over: false };
+                let mut peek = Reader { bytes: self.bytes, at: start, items: None, cap: 0, over: false, count_cap: usize::MAX };
                 peek.u32().is_some() && self.bytes[peek.at..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'"')
             };
             self.list(Placed { id, len, kind, type_ref, under, sub: keyed, string_embed })?;
@@ -341,7 +354,29 @@ impl Reader<'_> {
 /// past it, a client with two sections or two delete entries, an id naming a clock past it, a
 /// delete range past it, an empty block, trailing bytes, and anything this reader cannot parse.
 pub(crate) fn read(bytes: &[u8]) -> Option<Shape> {
-    read_into(&mut Reader { bytes, at: 0, items: None, cap: 0, over: false })
+    read_into(&mut Reader { bytes, at: 0, items: None, cap: 0, over: false, count_cap: usize::MAX })
+}
+
+/// What [`read_capped`] made of an update.
+pub(crate) enum Counted {
+    /// The reader takes it, and it counts at most the cap.
+    Within,
+    /// The reader does not take it.
+    Unread,
+    /// It counts more than the cap; the read stopped there.
+    Over,
+}
+
+/// [`read`], stopping as soon as the update counts more than `cap` entries (blocks, client
+/// sections, delete-set clients and ranges), so a flood of sections or delete ranges costs no
+/// more than the cap's worth of the read's own maps (C7b review M-2).
+pub(crate) fn read_capped(bytes: &[u8], cap: usize) -> Counted {
+    let mut r = Reader { bytes, at: 0, items: None, cap: 0, over: false, count_cap: cap };
+    match read_into(&mut r) {
+        Some(_) => Counted::Within,
+        None if r.over => Counted::Over,
+        None => Counted::Unread,
+    }
 }
 
 /// [`read`], and where every item goes, in the order written. For updates already bounded by
@@ -368,12 +403,12 @@ pub(crate) enum Walked {
 /// counted first by a read that keeps nothing per block (a GC run, say, is one range), so an
 /// update of millions of two-byte blocks costs one pass and no allocation per block.
 pub(crate) fn items_capped(bytes: &[u8], cap: usize) -> Walked {
-    match read(bytes) {
-        None => return Walked::Unread,
-        Some(shape) if shape.count > cap => return Walked::TooMany,
-        Some(_) => {}
+    match read_capped(bytes, cap) {
+        Counted::Unread => return Walked::Unread,
+        Counted::Over => return Walked::TooMany,
+        Counted::Within => {}
     }
-    let mut r = Reader { bytes, at: 0, items: Some(Vec::new()), cap, over: false };
+    let mut r = Reader { bytes, at: 0, items: Some(Vec::new()), cap, over: false, count_cap: usize::MAX };
     match read_into(&mut r) {
         Some(shape) => Walked::Items(shape, r.items.take().unwrap_or_default()),
         None if r.over => Walked::TooMany,
@@ -392,7 +427,7 @@ fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
         if blocks == 0 {
             return None;
         }
-        shape.count += 1;
+        r.tally(&mut shape.count)?;
         let client = r.client()?;
         let mut clock = r.clock()?;
         if !seen.insert(client) {
@@ -403,7 +438,7 @@ fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
         let mut ranges = Ranges::new();
         for _ in 0..blocks {
             // yrs: exactly 0 is garbage-collected and 10 is a skip; any other byte is an item.
-            shape.count += 1;
+            r.tally(&mut shape.count)?;
             let (len, skip) = match r.byte()? {
                 0 => {
                     let len = r.u32()?;
@@ -447,11 +482,11 @@ fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
     }
     // The delete set.
     for _ in 0..r.u32()? {
-        shape.count += 1;
+        r.tally(&mut shape.count)?;
         let client = r.client()?;
         let mut ranges = Ranges::new();
         for _ in 0..r.u32()? {
-            shape.count += 1;
+            r.tally(&mut shape.count)?;
             let clock = r.clock()?;
             let end = u64::from(clock) + u64::from(r.u32()?);
             if end > MAX_CLOCK {

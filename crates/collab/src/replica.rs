@@ -700,6 +700,15 @@ pub fn update_blocks(bytes: &[u8]) -> Option<usize> {
     std::panic::catch_unwind(|| crate::walk::read(bytes).map(|shape| shape.count)).ok().flatten()
 }
 
+/// Whether `bytes` count more than `cap` entries as [`update_blocks`] counts them, read only
+/// as far as the cap: a relay's check before it decodes anything, which keeps no more than the
+/// cap's worth of the read's own maps however many sections or delete ranges the bytes carry.
+/// `false` when the byte reader does not take them before the cap (the gate refuses those).
+#[must_use]
+pub fn update_exceeds_blocks(bytes: &[u8], cap: usize) -> bool {
+    std::panic::catch_unwind(|| matches!(crate::walk::read_capped(bytes, cap), crate::walk::Counted::Over)).unwrap_or(false)
+}
+
 /// Whether `bytes` are a yrs update (v1) that decodes and whose ids are sane: no block or delete
 /// range runs past `u32::MAX`. For a relay to check an op before it orders it, so a crafted
 /// update never reaches a browser replica, where a yrs panic aborts the page.
@@ -1606,6 +1615,29 @@ mod tests {
         assert_eq!(y.apply(&empty), Err(LiveError::Decode));
         // An empty update (no sections, no deletes) is still taken.
         assert!(update_is_sound(&[0, 0]));
+    }
+
+    /// C7b review M-2: the counting read stops as soon as the count passes the cap, before it
+    /// keeps anything more per section. 600 k one-block sections pass 2^20 entries about
+    /// halfway; bytes after that point are never read, so a tail the reader would refuse
+    /// does not turn "too large" into "unreadable", and nothing is listed.
+    #[test]
+    fn the_counting_read_stops_at_the_cap() {
+        const SECTIONS: u64 = 600_000;
+        let mut bytes = Vec::new();
+        varint(&mut bytes, SECTIONS);
+        for client in 0..SECTIONS {
+            bytes.push(1);
+            varint(&mut bytes, client + 1);
+            bytes.extend([0, 0, 1]);
+        }
+        // Not a delete set: the reader refuses this tail if it gets there.
+        bytes.extend([0xff, 0xff, 0xff]);
+        crate::walk::LISTED.with(|n| n.set(0));
+        assert!(matches!(crate::walk::items_capped(&bytes, crate::fits::MAX_ITEMS), crate::walk::Walked::TooMany), "the read went past the cap");
+        assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0);
+        let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+        assert_eq!(y.apply(&bytes), Err(LiveError::TooLarge));
     }
 
     /// How many blocks the largest honest updates write, against the caps. A 1 MiB offline
