@@ -270,6 +270,31 @@ fn undo_covers_structure_too() {
     assert_eq!(a.block(2), Some(sample()[1].clone()));
 }
 
+/// One peer undoes inserting a block while another undoes removing it: the second undo puts the
+/// id back in the body, the first takes the block itself away. An id whose block is gone is not
+/// in the order on any replica, and its removal is reported, so every app drops it alike.
+#[test]
+fn an_id_whose_block_was_undone_away_is_not_in_the_order() {
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let new = (1 << 32) | 7;
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    b.apply(&up).unwrap();
+    let up = b.remove_block(new).unwrap();
+    a.apply(&up).unwrap();
+    let undo_insert = a.undo().unwrap();
+    let undo_remove = b.undo().unwrap();
+    let on_a = a.apply(&undo_remove).unwrap();
+    let on_b = b.apply(&undo_insert).unwrap();
+    for (name, d) in [("a", &a), ("b", &b)] {
+        assert!(d.order().iter().all(|id| d.block(*id).is_some()), "{name}: every id in the order has its block: {:?}", d.order());
+    }
+    assert_eq!(a.order(), b.order());
+    assert!(!a.order().contains(&new));
+    assert!(on_b.contains(&BlockChange::Removed { id: new }), "b, which had the block in its order, is told it left: {on_b:?}");
+    assert!(!on_a.iter().any(|c| matches!(c, BlockChange::Inserted { id, .. } if *id == new)), "a is not told it came back: {on_a:?}");
+}
+
 /// The relay's retained `crdt.text` log, in order, as `(seq, params)`.
 #[derive(Default)]
 struct Relay {
