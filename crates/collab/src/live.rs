@@ -1222,31 +1222,31 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
     }
 
-    /// Merge `updates` in order into as few updates as fit the relay's cap, each measured as
-    /// [`Live::over_cap`] measures a submit. An update that does not fit merged with anything
-    /// goes as it was: it was sent once, so it fits alone.
-    ///
-    /// Chunks are sized by bytes, not blocks, and the relay refuses an op of more than
-    /// [`MAX_OP_BLOCKS`](crate::MAX_OP_BLOCKS) (2^20) blocks as too large, which is permanent
-    /// for the client. The densest honest update is about 152 k blocks per MiB of binary (a
-    /// letter typed apart from the last, none merging), so a chunk stays under 2^20 blocks only
-    /// while it holds under about 6.9 MiB of binary (about 9 MiB of params on the wire). The
-    /// relay's default text cap is just under 16 MiB, so the bytes alone do not keep a chunk
-    /// that dense under the block cap. What keeps it under in practice is that resends are
-    /// small (unconfirmed edits are bounded only by [`MAX_UNCONFIRMED_BYTES`], 32 MiB, and a
-    /// run of typing merges into few blocks). Cap chunks with
-    /// [`update_blocks`](crate::update_blocks) if dense resends of that size become possible
-    /// (re-review R3-M6).
+    /// Merge `updates` in order into as few updates as fit the relay's caps: the text cap, each
+    /// measured as [`Live::over_cap`] measures a submit, and the op block cap
+    /// ([`MAX_OP_BLOCKS`](crate::MAX_OP_BLOCKS), counted as [`update_blocks`](crate::update_blocks)
+    /// counts it), past which the relay refuses an op for good. Bytes alone do not bound the
+    /// blocks: at the default text cap (just under 16 MiB) a chunk of letters each typed apart
+    /// from the last (about 152 k blocks per MiB) would pass 2^20 blocks (re-review R3-M6). An
+    /// update that does not fit merged with anything goes as it was: it was sent once, so it
+    /// fits alone.
     fn chunked(&self, updates: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
         // The params a submit of `bytes` of update would serialize to, about: base64, the
         // quotes, and the scope around it. Merged updates are no larger than the parts summed.
         let estimate = |bytes: usize| bytes.div_ceil(3) * 4 + 32;
         let fits = |update: &[u8]| serde_json::to_value(TextPayload::new(update)).map(|params| self.over_cap(&params).is_none()).unwrap_or(false);
         let cap = self.text_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX));
-        // Each chunk, with the summed size of the updates in it.
-        let mut chunks: Vec<(Vec<u8>, usize)> = Vec::new();
+        // A merge writes no more blocks than its parts, plus at most one skip per part, and
+        // every non-empty part counts at least one: so twice the parts' summed count bounds
+        // the merged count. Under half the cap, no exact count is needed. An update the walk
+        // cannot read counts as past the cap, so it is never merged into.
+        let blocks_of = |update: &[u8]| crate::update_blocks(update).unwrap_or(usize::MAX / 4);
+        let block_cap = crate::MAX_OP_BLOCKS;
+        // Each chunk, with the summed size and block count of the updates in it.
+        let mut chunks: Vec<(Vec<u8>, usize, usize)> = Vec::new();
         for update in updates {
-            let grown = chunks.last().and_then(|(last, summed)| {
+            let blocks = blocks_of(&update);
+            let grown = chunks.last().and_then(|(last, summed, last_blocks)| {
                 let summed = summed + update.len();
                 // Only near the cap is the exact measure worth its serialization.
                 let (sure, maybe) = match cap {
@@ -1256,17 +1256,23 @@ impl<H: Hub, R: Replica> Live<H, R> {
                 if !maybe {
                     return None;
                 }
-                yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok().filter(|merged| sure || fits(merged)).map(|merged| (merged, summed))
+                let blocks = last_blocks.saturating_add(blocks);
+                let merged = yrs::merge_updates_v1([last.as_slice(), update.as_slice()]).ok().filter(|merged| sure || fits(merged))?;
+                if blocks.saturating_mul(2) <= block_cap {
+                    return Some((merged, summed, blocks));
+                }
+                let exact = blocks_of(&merged);
+                (exact <= block_cap).then_some((merged, summed, exact))
             });
             match (grown, chunks.last_mut()) {
                 (Some(merged), Some(last)) => *last = merged,
                 _ => {
                     let size = update.len();
-                    chunks.push((update, size));
+                    chunks.push((update, size, blocks));
                 }
             }
         }
-        chunks.into_iter().map(|(chunk, _)| chunk).collect()
+        chunks.into_iter().map(|(chunk, ..)| chunk).collect()
     }
 
     /// Merge a batch of wire updates, or hold them until the document is loaded.
@@ -2315,5 +2321,51 @@ mod tests {
         assert!(work.iter().any(|w| matches!(w, Work::Reset)), "{work:?}");
         assert_eq!(STATE_APPLIES.with(std::cell::Cell::get), 2, "the take-back replayed the snapshot under the op cap");
         assert_eq!(live.doc().map(Note::read).as_deref(), Some("hi there"));
+    }
+
+    /// `n` letters each typed at the front of the root text `t` by `client`, as one update:
+    /// none merge, so each letter is its own block (the densest honest update).
+    fn letters_at_the_front(client: u8, n: u32) -> Vec<u8> {
+        fn varint(out: &mut Vec<u8>, mut v: u32) {
+            while v >= 0x80 {
+                out.push((v as u8 & 0x7f) | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let mut u = vec![1];
+        varint(&mut u, n);
+        u.extend([client, 0]);
+        // The first letter names its parent, the root `t`; each later one is put before the last.
+        u.extend([0x04, 1, 1, b't', 1, b'x']);
+        for clock in 1..n {
+            u.extend([0x44, client]);
+            varint(&mut u, clock - 1);
+            u.extend([1, b'x']);
+        }
+        u.push(0);
+        u
+    }
+
+    /// R3-M6 (ruled): a resend is chunked under the op block cap as well as the text cap. Three
+    /// dense updates of 400 k letters each fit the default text cap together (about 8 MiB), but
+    /// merged they would pass 2^20 blocks, which the relay refuses for good. Every chunk stays
+    /// under the cap, and no letter is lost.
+    #[test]
+    fn a_dense_resend_is_chunked_under_the_block_cap() {
+        const LETTERS: u32 = 400_000;
+        let mut live = Live::new(Hub0::default(), "d");
+        live.text_cap = Some(16 * 1024 * 1024 - 64 * 1024);
+        let updates: Vec<Vec<u8>> = (1..=3).map(|client| letters_at_the_front(client, LETTERS)).collect();
+        for u in &updates {
+            assert_eq!(crate::update_blocks(u), Some(LETTERS as usize + 1), "the fixture is not as dense as meant");
+        }
+        let total: usize = updates.iter().map(Vec::len).sum();
+        assert!(total.div_ceil(3) * 4 < 16 * 1024 * 1024 / 10 * 9, "the text cap alone would split it");
+        let chunks = live.chunked(updates);
+        let counts: Vec<usize> = chunks.iter().map(|c| crate::update_blocks(c).unwrap()).collect();
+        assert!(counts.iter().all(|&n| n <= crate::MAX_OP_BLOCKS), "a chunk the relay refuses for good: {counts:?}");
+        assert!(chunks.len() >= 2, "{counts:?}");
+        assert_eq!(counts.iter().sum::<usize>(), 3 * (LETTERS as usize + 1), "letters were lost or added: {counts:?}");
     }
 }
