@@ -479,6 +479,25 @@ impl Room {
         self.seq = self.seq.max(seq);
     }
 
+    /// Raise the room to `seq` after the bus counter was raised by a rejoin (R2), and say
+    /// whether that lifted it.
+    ///
+    /// Every raise past the room's sequence is a lift: whatever the room holds (its own ops, or
+    /// only the sequence its members joined at) cannot be replayed across the jump. The room is
+    /// then treated as one whose history was lost at `seq`: [`Room::history_lost`] holds until a
+    /// save or a snapshot ordered after the lift, and every joiner below `seq` gets the retained
+    /// text. A raise that does not pass the room's sequence is an ordinary
+    /// [`Room::observe_seq`], and `false`.
+    pub fn lift_seq(&mut self, seq: u64) -> bool {
+        if seq > self.seq {
+            self.inherited = Some(seq);
+            self.seq = seq;
+            return true;
+        }
+        self.observe_seq(seq);
+        false
+    }
+
     /// The sequence this room's own history starts after. See [`Room::inherited`] field.
     pub fn inherited(&self) -> u64 {
         self.inherited.unwrap_or(0)
@@ -938,6 +957,12 @@ impl Room {
                 return None;
             }
         }
+        // And it has to reach the room's sequence. A room lifted past its own ops
+        // ([`Room::lift_seq`]) holds none between its last op and its sequence, and a replay
+        // stopping short of the sequence leaves the same hole.
+        if ops.last().map_or(have, |op| op.seq) != self.seq {
+            return None;
+        }
         Some(ops)
     }
 }
@@ -1249,5 +1274,35 @@ mod tests {
         assert_eq!(r.seq(), 42, "the room must not hand out a sequence number already seen");
         r.observe_seq(10);
         assert_eq!(r.seq(), 42, "a stale read never pushes the counter backwards");
+    }
+
+    #[test]
+    fn a_lift_past_the_rooms_own_ops_is_a_lost_history() {
+        // Rebuilt on a wiped counter (inherits 0), then two ops of its own, then a rejoin
+        // raises the counter to 900: the ops below the jump cannot be replayed across it.
+        let mut r = Room::default();
+        r.observe_seq(0);
+        r.submit(1, crdt_sub("carol", "/body/0")).unwrap();
+        r.submit(2, crdt_sub("carol", "/body/0")).unwrap();
+        assert!(!r.history_lost());
+        assert!(r.lift_seq(900), "a raise past the room's own ops is a lift");
+        assert_eq!(r.seq(), 900);
+        assert_eq!(r.inherited(), 900);
+        assert!(r.history_lost(), "the lift must read as a lost history until a save or a snapshot");
+        assert_eq!(r.since(2), None, "nothing replays across the jump");
+    }
+
+    #[test]
+    fn every_raise_past_the_rooms_sequence_is_a_lift() {
+        // Members can sit at the old sequence without the room having ordered anything: a
+        // fresh loader, a viewer, an earlier rejoiner. A raise past it is a lift all the same.
+        let mut r = Room::default();
+        r.observe_seq(500);
+        assert!(r.lift_seq(900), "inherited, nothing ordered since: still a lift");
+        assert_eq!((r.seq(), r.inherited()), (900, 900));
+        assert!(r.history_lost());
+        assert!(!r.lift_seq(900), "not past the room's sequence: no lift");
+        assert!(!r.lift_seq(10));
+        assert_eq!(r.seq(), 900);
     }
 }

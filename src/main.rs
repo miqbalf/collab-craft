@@ -60,6 +60,8 @@ mod review_repro;
 mod review_reverify;
 
 #[cfg(test)]
+mod e2e_bus;
+#[cfg(test)]
 mod e2e_fixwave;
 #[cfg(test)]
 mod e2e_locks;
@@ -1173,17 +1175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/healthz",
             axum::routing::get(move || {
                 let relay = health_relay.clone();
-                async move {
-                    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        let mut bus = relay.bus.lock().await;
-                        bus.ping().await
-                    })
-                    .await;
-                    match pong {
-                        Ok(Ok(())) => (axum::http::StatusCode::OK, "ok"),
-                        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the bus is unreachable"),
-                    }
-                }
+                async move { health(&relay).await }
             }),
         )
         .merge(web)
@@ -1310,10 +1302,50 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // A failed read refuses the connection as transient rather than reading as zero: zero
     // would make a room rebuilt after a restart look like a brand new document, and a joiner
     // would then take the saved file as current next to replicas that are not on it.
-    let retained_seq = {
+    //
+    // A rejoining replica that has applied more than the counter holds raises it to what it
+    // applied (R2, the sequence floor): the counter was lost or went backwards (a wiped volume,
+    // a Valkey restart inside the `everysec` window), and numbering on from below would make
+    // every replica in the session drop the next ops as replays, without any error. It is
+    // raised [`bus::SEQ_RAISE_MARGIN`] past the claim, so no number handed out before the loss
+    // is handed out again, and every replica from before it (this one included) rejoins
+    // through the lost history with the retained text. The room is lifted to that sequence
+    // (see below).
+    //
+    // Only a peer that may edit raises it: a read-only ticket must not be able to move a
+    // document's ordering. A claim past [`bus::MAX_SEQ_CLAIM`] (which leaves room for the margin
+    // below [`bus::MAX_SEQ_FLOOR`]) is refused, and the join is then a fresh load.
+    let applied = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_CLAIM);
+    let claimed = if claims.may_edit() { applied.unwrap_or(0) } else { 0 };
+    //
+    // Which join may raise, and from what (fix round 3):
+    //
+    // * A join that rebuilds the room (none in memory) asks the bus, which also raises when
+    //   Valkey restarted since the room was last rebuilt ([`Bus::rebuild_seq`]): the counter
+    //   may then trail numbers replicas from before the restart still hold, even when this
+    //   joiner claims nothing past it.
+    // * A join to a live room raises only when the claim is past both the counter and the live
+    //   room's own sequence. The live room holds the true sequence, so a counter that merely
+    //   trails it (Valkey hard-killed under a running relay) is healed by the next `next_seq`
+    //   and needs no lift.
+    let live_seq = relay.rooms.lock().await.get(&room_key).map(Room::seq);
+    let (retained_seq, raised) = {
         let mut bus = relay.bus.lock().await;
-        match bus.current_seq(&room_key).await {
-            Ok(seq) => seq,
+        let read = match live_seq {
+            None => bus.rebuild_seq(&room_key, claimed).await,
+            Some(live) => match bus.current_seq(&room_key).await {
+                Ok(seq) if claimed > seq && claimed > live => {
+                    let target = claimed + bus::SEQ_RAISE_MARGIN;
+                    bus.raise_seq(&room_key, target).await.map(|raised| (raised.max(target), true))
+                }
+                other => other.map(|seq| (seq, false)),
+            },
+        };
+        if let Ok((seq, true)) = read {
+            tracing::warn!(room = %room_key, seq, applied = claimed, rebuilt = live_seq.is_none(), "the sequence counter could not be trusted; raised it");
+        }
+        match read {
+            Ok(read) => read,
             Err(e) => {
                 tracing::error!(error = %e, room = %room_key, "could not read the document's sequence");
                 let _ = socket.emit(
@@ -1334,23 +1366,44 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let gate = relay.gate(&room_key);
     let ordered = gate.lock().await;
     let mut rooms = relay.rooms.lock().await;
-    let joined = {
+    let (joined, lifted) = {
         let room = relay.room(&mut rooms, &room_key);
-        room.observe_seq(retained_seq);
+        // A raise lifts the room past every number it has (its own ops, or the old sequence its
+        // members joined at: a fresh loader, a viewer, an earlier rejoiner), so neither a
+        // replay nor the room's members can carry on across it. The room is lifted into a lost
+        // history: see the catch-up below and `lifted` after it.
+        let lifted = if raised {
+            room.lift_seq(retained_seq)
+        } else {
+            room.observe_seq(retained_seq);
+            false
+        };
         let peer = Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit(), uid: claims.uid.clone() };
         let schema = handshake.schema.as_deref();
-        match room.check_schema(schema).and_then(|()| room.join_as(peer, &socket.id.to_string())) {
+        let joined = match room.check_schema(schema).and_then(|()| room.join_as(peer, &socket.id.to_string())) {
             Ok(()) => {
                 room.pin_schema(schema);
                 for (scope, holder) in &locks {
                     room.record_holder(scope.clone(), holder.clone());
                 }
-                // See `catch_up` for which baseline and why.
-                let baseline = handshake.applied.unwrap_or_else(|| room.saved_seq());
-                Ok((catch_up(room, baseline), room.peers().to_vec(), room.ephemeral()))
+                // See `catch_up` for which baseline and why. A read-only peer that claims more
+                // than the document holds is caught up as a fresh load: it may not raise the
+                // sequence, and resuming past it would make it drop the next ops as replays.
+                let applied = applied.filter(|&applied| claims.may_edit() || applied <= room.seq());
+                let baseline = applied.unwrap_or_else(|| room.saved_seq());
+                let catch = if lifted {
+                    // The ops the room ordered before the lift are in no replay this joiner
+                    // can take; its retained text is, and the lost history makes the saver
+                    // checkpoint.
+                    CatchUp { seq: room.seq(), replay: Vec::new(), texts: retained_texts(room), history_lost: true }
+                } else {
+                    catch_up(room, baseline)
+                };
+                Ok((catch, room.peers().to_vec(), room.ephemeral()))
             }
             Err(refusal) => Err(refusal),
-        }
+        };
+        (joined, lifted)
     };
 
     drop(rooms);
@@ -1438,6 +1491,15 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     socket.join(room_name.clone());
     drop(ordered);
 
+    if lifted {
+        // The room's other members are on the ops ordered before the lift, and the next op is
+        // numbered past it, so each would hold every later op and wait in silence for the gap
+        // to fill. Closed now, they reconnect at once and rejoin through the lost history,
+        // with their unconfirmed edits sent again.
+        tracing::warn!(room = %room_key, seq, "the sequence was lifted past the room's own ops; reconnecting its other members");
+        let _ = socket.to(room_name.clone()).disconnect().await;
+    }
+
     // And on where everybody is, so somebody arriving late does not have to wait for each
     // person to move before their marker appears.
     for (peer, kind, payload) in ephemeral {
@@ -1447,6 +1509,21 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
 
     tracing::info!(uid = %claims.uid, peer = %peer_id, room = %room_key, may_edit = claims.may_edit(), history_lost, "peer joined");
+}
+
+/// The health route's answer: 200 while the bus answers a `PING`, 503 while it does not.
+///
+/// Bounded, so a bus that hangs reads as down rather than holding the route open.
+async fn health(relay: &Relay) -> (axum::http::StatusCode, &'static str) {
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut bus = relay.bus.lock().await;
+        bus.ping().await
+    })
+    .await;
+    match pong {
+        Ok(Ok(())) => (axum::http::StatusCode::OK, "ok"),
+        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the bus is unreachable"),
+    }
 }
 
 /// What a join is caught up with.
