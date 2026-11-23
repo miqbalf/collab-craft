@@ -1,8 +1,7 @@
-//! The shared Valkey, used as the bus and the arbiter.
+//! Valkey, used as the bus and the arbiter.
 //!
-//! No new message queue. This estate already runs a shared Valkey that
-//! Nextcloud itself uses for its distributed cache and file locking, so the
-//! relay rides the same instance.
+//! No new message queue. The relay uses a Valkey (on the Craft Office deployments, one of its
+//! own; it may also share an instance, which is why every key is namespaced).
 //!
 //! These two make the relay safe to run beside another instance. Fan-out does not: an ordered
 //! edit reaches the room through the in-process Socket.IO adapter, so a document is served by
@@ -17,18 +16,17 @@
 //! * **The lock table.** `SET NX` is atomic, so two instances cannot both grant
 //!   the same scope. Deciding locally would let them.
 //!
-//! Everything else stays in relay memory on purpose. The shared instance runs
-//! `maxmemory 2gb` with `maxmemory-policy noeviction`, which means a write at
-//! the ceiling fails loudly for **every app on it**, Nextcloud included. So the
-//! op history is bounded in process and never written here, and both key
-//! families carry a TTL.
+//! Everything else stays in relay memory on purpose. A Valkey run with `maxmemory` and
+//! `maxmemory-policy noeviction` fails writes loudly at the ceiling (for every app on it, when
+//! it is shared). So the op history is bounded in process and never written here, and every key
+//! family carries a TTL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use redis::AsyncCommands;
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 
 /// Key prefix. Namespaced because the instance is shared, and a bare `doc:1`
 /// would be a fine key for somebody else too.
@@ -38,6 +36,11 @@ const PREFIX: &str = "collabcraft";
 /// granted one per connection, so a real one is far below; a larger claim is ignored, so a
 /// client cannot push the counter towards its wrap, where grants would collide again.
 pub const MAX_SPACE_FLOOR: u32 = 1 << 31;
+
+/// The highest sequence a rejoining replica may name as what it applied (R2). Far above any real
+/// document's, and below the limit of `INCR` and of a JavaScript number, so a buggy client
+/// cannot push the counter towards either.
+pub const MAX_SEQ_FLOOR: u64 = 1 << 52;
 
 /// How long a sequence counter outlives its last edit.
 ///
@@ -92,9 +95,16 @@ pub enum ReleaseOutcome {
 }
 
 /// A connection to the shared Valkey.
+///
+/// A [`ConnectionManager`], so the bus survives a Valkey restart. A single connection opened at
+/// startup did not: once Valkey went away it was never replaced, every command failed from then
+/// on, and the relay stayed down (health 503, every edit refused) until it was restarted itself.
+/// The manager replaces a connection that failed: the command that found it broken fails (and
+/// a submit is refused as transient, `code: "retry"`), and the next one runs on a new
+/// connection.
 #[derive(Clone)]
 pub struct Bus {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     /// How long a lease lasts without a refresh. [`LOCK_TTL`] unless a test shortens it.
     lock_ttl: Duration,
     /// Fail this many [`Bus::next_seq`] calls, as a bus that did not answer in time, before
@@ -117,8 +127,13 @@ pub struct Bus {
 /// (`code: "retry"`), which a client sends again.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long connecting to the bus may take.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long connecting to the bus may take, at startup and on each reconnect.
+///
+/// A reconnect runs while a command waits for it, with the relay's bus lock held, so it is
+/// bounded like a command ([`RESPONSE_TIMEOUT`]), and made once per failed command rather than
+/// retried with a backoff inside it: a Valkey that is still down then costs each command one
+/// short attempt, not a stall of every document.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Bus {
     /// Connect.
@@ -132,8 +147,11 @@ impl Bus {
         let client = redis::Client::open(url)?;
         // Set here rather than left to the client's defaults, which have changed between
         // releases: the bound matters to the relay, so it is the relay's to state.
-        let config = redis::AsyncConnectionConfig::new().set_response_timeout(Some(RESPONSE_TIMEOUT)).set_connection_timeout(Some(CONNECT_TIMEOUT));
-        let conn = client.get_multiplexed_async_connection_with_config(&config).await?;
+        let config = ConnectionManagerConfig::new()
+            .set_response_timeout(Some(RESPONSE_TIMEOUT))
+            .set_connection_timeout(Some(CONNECT_TIMEOUT))
+            .set_number_of_retries(0);
+        let conn = ConnectionManager::new_with_config(client, config).await?;
         Ok(Bus {
             conn,
             lock_ttl: LOCK_TTL,
@@ -144,9 +162,20 @@ impl Bus {
     }
 
     /// Whether the bus still answers. The health route's whole question.
+    ///
+    /// Asked twice when the first `PING` finds the connection broken: that failure is what makes
+    /// the manager reconnect, and the second asks the new connection. So health reads 200 as
+    /// soon as Valkey is back, and 503 for as long as it is not. A `PING` changes nothing, so
+    /// asking again is safe; a write is never retried this way.
     pub async fn ping(&mut self) -> Result<(), BusError> {
-        redis::cmd("PING").query_async::<()>(&mut self.conn).await?;
-        Ok(())
+        match redis::cmd("PING").query_async::<()>(&mut self.conn).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_io_error() || e.is_unrecoverable_error() => {
+                redis::cmd("PING").query_async::<()>(&mut self.conn).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Fail now if this connection cannot write.
@@ -164,12 +193,28 @@ impl Bus {
 
     /// The next sequence for a document.
     ///
-    /// `floor` is the relay's own high-water mark for this document. When the
-    /// counter is absent, which happens on first use and after the TTL lapses,
-    /// it is seeded to `floor` before the increment. Without that seed an
-    /// expired key would hand out 1 again, and a client holding sequence 900
-    /// would treat the next hundred ops as replays and drop them all.
+    /// `floor` is the relay's own high-water mark for this document. The counter is raised to
+    /// at least `floor` before the increment, in the same script, so the number handed out is
+    /// always past every number the room has already ordered. Without it, a counter that is
+    /// absent (first use, a lapsed TTL, a wiped volume) would hand out 1 again, and one that
+    /// went backwards (a Valkey restart inside the `everysec` AOF window, which the relay now
+    /// survives, see [`Bus`]) would hand out a number already used; a client holding sequence
+    /// 900 would then treat the next ops as replays and drop them all. A live counter above
+    /// `floor` is never pushed backwards. A counter that is not a number is left alone, and
+    /// the `INCR` refuses it.
     pub async fn next_seq(&mut self, room: &str, floor: u64) -> Result<u64, BusError> {
+        const SCRIPT: &str = r#"
+            local floor = tonumber(ARGV[1])
+            local raw = redis.call('GET', KEYS[1])
+            local current = 0
+            if raw then current = tonumber(raw) end
+            if current and current < floor then
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            local next = redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            return next
+        "#;
         #[cfg(test)]
         if self.fail_next_seq > 0 {
             self.fail_next_seq -= 1;
@@ -179,27 +224,41 @@ impl Bus {
             ))));
         }
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
-
-        // NX, so a live counter is never pushed backwards by a late seed.
-        let seeded: Result<(), _> = redis::cmd("SET").arg(&key).arg(floor).arg("NX").query_async(&mut self.conn).await;
-        if let Err(e) = seeded {
-            if is_readonly(&e) {
-                return Err(BusError::ReadOnlyReplica);
-            }
-            return Err(e.into());
+        // The TTL is refreshed on every edit, so an active document never loses its counter
+        // and an abandoned one eventually stops costing memory.
+        match redis::Script::new(SCRIPT).key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async(&mut self.conn).await {
+            Ok(next) => Ok(next),
+            Err(e) if is_readonly(&e) => Err(BusError::ReadOnlyReplica),
+            Err(e) => Err(e.into()),
         }
+    }
 
-        let next: u64 = match self.conn.incr(&key, 1i64).await {
-            Ok(v) => v,
-            Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Refreshed on every edit, so an active document never loses its
-        // counter and an abandoned one eventually stops costing memory.
-        let _: Result<bool, _> = self.conn.expire(&key, SEQ_TTL.as_secs() as i64).await;
-
-        Ok(next)
+    /// Raise a document's sequence counter to at least `floor`, without handing out a number.
+    ///
+    /// For a rejoin that has applied more than the counter holds ([`MAX_SEQ_FLOOR`] bounds
+    /// what is honoured): the counter was lost or went backwards, and the next op must still be
+    /// numbered past what that replica applied. A counter already at or above `floor` is left
+    /// alone. Returns the counter after the raise.
+    pub async fn raise_seq(&mut self, room: &str, floor: u64) -> Result<u64, BusError> {
+        const SCRIPT: &str = r#"
+            local floor = tonumber(ARGV[1])
+            local raw = redis.call('GET', KEYS[1])
+            local current = 0
+            if raw then current = tonumber(raw) end
+            if current and current < floor then
+                redis.call('SET', KEYS[1], ARGV[1])
+                redis.call('EXPIRE', KEYS[1], ARGV[2])
+                return floor
+            end
+            return current
+        "#;
+        let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
+        let floor = floor.min(MAX_SEQ_FLOOR);
+        match redis::Script::new(SCRIPT).key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async::<Option<u64>>(&mut self.conn).await {
+            Ok(v) => Ok(v.unwrap_or(0)),
+            Err(e) if is_readonly(&e) => Err(BusError::ReadOnlyReplica),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The retained sequence high-water mark for a document, zero when absent.
@@ -296,6 +355,18 @@ impl Bus {
     #[cfg(test)]
     pub async fn rewind_spaces(&mut self, room: &str, to: u32) {
         let key = format!("{PREFIX}:doc:{}:space", encode_key(room));
+        if to == 0 {
+            let _: Result<i64, _> = self.conn.del(&key).await;
+        } else {
+            let _: Result<(), _> = self.conn.set(&key, to).await;
+        }
+    }
+
+    /// Set the room's sequence counter back to `to` (0 deletes it), as a lost write, a flush or
+    /// a wiped volume does, for a test of the sequence floor.
+    #[cfg(test)]
+    pub async fn rewind_seq(&mut self, room: &str, to: u64) {
+        let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
         if to == 0 {
             let _: Result<i64, _> = self.conn.del(&key).await;
         } else {

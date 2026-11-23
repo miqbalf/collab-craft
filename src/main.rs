@@ -60,6 +60,8 @@ mod review_repro;
 mod review_reverify;
 
 #[cfg(test)]
+mod e2e_bus;
+#[cfg(test)]
 mod e2e_fixwave;
 #[cfg(test)]
 mod e2e_locks;
@@ -741,17 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/healthz",
             axum::routing::get(move || {
                 let relay = health_relay.clone();
-                async move {
-                    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        let mut bus = relay.bus.lock().await;
-                        bus.ping().await
-                    })
-                    .await;
-                    match pong {
-                        Ok(Ok(())) => (axum::http::StatusCode::OK, "ok"),
-                        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the bus is unreachable"),
-                    }
-                }
+                async move { health(&relay).await }
             }),
         )
         .merge(web)
@@ -878,9 +870,24 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // A failed read refuses the connection as transient rather than reading as zero: zero
     // would make a room rebuilt after a restart look like a brand new document, and a joiner
     // would then take the saved file as current next to replicas that are not on it.
+    //
+    // A rejoining replica that has applied more than the counter holds raises it to what it
+    // applied (R2, the sequence floor): the counter was lost or went backwards (a wiped volume,
+    // a Valkey restart inside the `everysec` window), and numbering on from below would make
+    // every replica in the session drop the next ops as replays, without any error. Raised, the
+    // room inherits that sequence, and the rejoin is an ordinary one after a lost history. A
+    // claim past [`bus::MAX_SEQ_FLOOR`] is not honoured.
+    let claimed = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_FLOOR).unwrap_or(0);
     let retained_seq = {
         let mut bus = relay.bus.lock().await;
-        match bus.current_seq(&room_key).await {
+        let read = match bus.current_seq(&room_key).await {
+            Ok(seq) if claimed > seq => {
+                tracing::warn!(room = %room_key, counter = seq, applied = claimed, "a rejoin applied past the sequence counter; raising it");
+                bus.raise_seq(&room_key, claimed).await.map(|raised| raised.max(claimed))
+            }
+            other => other,
+        };
+        match read {
             Ok(seq) => seq,
             Err(e) => {
                 tracing::error!(error = %e, room = %room_key, "could not read the document's sequence");
@@ -1015,6 +1022,21 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     emit_live(socket.to(room_name.clone()), "presence", &serde_json::json!({ "doc": room_name, "roster": roster }));
 
     tracing::info!(uid = %claims.uid, peer = %peer_id, room = %room_key, may_edit = claims.may_edit(), history_lost, "peer joined");
+}
+
+/// The health route's answer: 200 while the bus answers a `PING`, 503 while it does not.
+///
+/// Bounded, so a bus that hangs reads as down rather than holding the route open.
+async fn health(relay: &Relay) -> (axum::http::StatusCode, &'static str) {
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut bus = relay.bus.lock().await;
+        bus.ping().await
+    })
+    .await;
+    match pong {
+        Ok(Ok(())) => (axum::http::StatusCode::OK, "ok"),
+        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the bus is unreachable"),
+    }
 }
 
 /// What a join is caught up with.
