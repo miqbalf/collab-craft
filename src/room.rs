@@ -460,15 +460,16 @@ impl Room {
     }
 
     /// Raise the room to `seq` after the bus counter was raised by a rejoin (R2), and say
-    /// whether that lifted the room past ops of its own.
+    /// whether that lifted it.
     ///
-    /// A room that ordered ops since it was (re)built, and is then raised past them, cannot be
-    /// replayed across the jump, and its history no longer agrees with the rejoiner's. It is
-    /// then treated as one whose history was lost at `seq`: [`Room::history_lost`] holds until
-    /// a save or a snapshot ordered after the lift. Without own ops it is an ordinary
+    /// Every raise past the room's sequence is a lift: whatever the room holds (its own ops, or
+    /// only the sequence its members joined at) cannot be replayed across the jump. The room is
+    /// then treated as one whose history was lost at `seq`: [`Room::history_lost`] holds until a
+    /// save or a snapshot ordered after the lift, and every joiner below `seq` gets the retained
+    /// text. A raise that does not pass the room's sequence is an ordinary
     /// [`Room::observe_seq`], and `false`.
     pub fn lift_seq(&mut self, seq: u64) -> bool {
-        if seq > self.seq && self.seq > self.inherited() {
+        if seq > self.seq {
             self.inherited = Some(seq);
             self.seq = seq;
             return true;
@@ -1268,13 +1269,16 @@ mod tests {
     }
 
     #[test]
-    fn a_raise_of_a_room_without_own_ops_is_an_ordinary_observe() {
-        let mut r = Room::default();
-        assert!(!r.lift_seq(900));
-        assert_eq!((r.seq(), r.inherited()), (900, 900));
+    fn every_raise_past_the_rooms_sequence_is_a_lift() {
+        // Members can sit at the old sequence without the room having ordered anything: a
+        // fresh loader, a viewer, an earlier rejoiner. A raise past it is a lift all the same.
         let mut r = Room::default();
         r.observe_seq(500);
-        assert!(!r.lift_seq(900), "inherited, but nothing ordered since: no lift");
+        assert!(r.lift_seq(900), "inherited, nothing ordered since: still a lift");
+        assert_eq!((r.seq(), r.inherited()), (900, 900));
+        assert!(r.history_lost());
+        assert!(!r.lift_seq(900), "not past the room's sequence: no lift");
+        assert!(!r.lift_seq(10));
         assert_eq!(r.seq(), 900);
     }
 }

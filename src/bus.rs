@@ -42,6 +42,21 @@ pub const MAX_SPACE_FLOOR: u32 = 1 << 31;
 /// cannot push the counter towards either.
 pub const MAX_SEQ_FLOOR: u64 = 1 << 52;
 
+/// How far past a rejoin's `applied` the sequence is raised (R2).
+///
+/// A lost counter also loses which numbers were already handed out: after a power cut inside the
+/// `everysec` window, replicas from before it can hold ops numbered above the highest `applied`
+/// the relay has heard so far (one more op had reached one of them). Numbering on right after
+/// that claim would hand those numbers out again for different ops, and a replica holding the
+/// old op would then be replayed over it in silence. Raised by this margin, every number from
+/// before the crash lies below where the room starts, so every replica from before it rejoins
+/// through the lost history with the retained text, and no number is ever reused.
+pub const SEQ_RAISE_MARGIN: u64 = 1_000_000;
+
+/// The highest `applied` a rejoin may name and still be honoured: one that leaves room for the
+/// margin below [`MAX_SEQ_FLOOR`]. A higher claim is refused (the join is a fresh load).
+pub const MAX_SEQ_CLAIM: u64 = MAX_SEQ_FLOOR - SEQ_RAISE_MARGIN;
+
 /// How long a sequence counter outlives its last edit.
 ///
 /// Long, because losing it is worse than keeping it. See [`Bus::next_seq`] for
@@ -200,14 +215,16 @@ impl Bus {
     /// went backwards (a Valkey restart inside the `everysec` AOF window, which the relay now
     /// survives, see [`Bus`]) would hand out a number already used; a client holding sequence
     /// 900 would then treat the next ops as replays and drop them all. A live counter above
-    /// `floor` is never pushed backwards. A counter that is not a number (a stray write) is
+    /// `floor` is never pushed backwards. A counter that is not a whole number (a stray write) is
     /// treated as lost and reset to `floor`, rather than refusing every submit for good.
     pub async fn next_seq(&mut self, room: &str, floor: u64) -> Result<u64, BusError> {
         const SCRIPT: &str = r#"
             local floor = tonumber(ARGV[1])
             local raw = redis.call('GET', KEYS[1])
             local current = 0
-            if raw then current = tonumber(raw) end
+            -- Only a plain run of digits is a counter INCR accepts; anything else ("3.5",
+            -- "1e3", a stray word) is treated as lost.
+            if raw then current = string.match(raw, '^%d+$') and tonumber(raw) or nil end
             if not current or current < floor then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
@@ -246,7 +263,9 @@ impl Bus {
             local floor = tonumber(ARGV[1])
             local raw = redis.call('GET', KEYS[1])
             local current = 0
-            if raw then current = tonumber(raw) end
+            -- Only a plain run of digits is a counter INCR accepts; anything else ("3.5",
+            -- "1e3", a stray word) is treated as lost.
+            if raw then current = string.match(raw, '^%d+$') and tonumber(raw) or nil end
             if not current or current < floor then
                 redis.call('SET', KEYS[1], ARGV[1])
                 redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -378,9 +397,9 @@ impl Bus {
     /// Overwrite the room's sequence counter with something that is not a number, as a stray
     /// write would, for a test that such a counter does not wedge the document.
     #[cfg(test)]
-    pub async fn corrupt_seq(&mut self, room: &str) {
+    pub async fn corrupt_seq(&mut self, room: &str, garbage: &str) {
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
-        let _: Result<(), _> = self.conn.set(&key, "not-a-number").await;
+        let _: Result<(), _> = self.conn.set(&key, garbage).await;
     }
 
     /// Set the room's sequence counter back to `to` (0 deletes it), as a lost write, a flush or

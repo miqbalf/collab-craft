@@ -874,20 +874,24 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // A rejoining replica that has applied more than the counter holds raises it to what it
     // applied (R2, the sequence floor): the counter was lost or went backwards (a wiped volume,
     // a Valkey restart inside the `everysec` window), and numbering on from below would make
-    // every replica in the session drop the next ops as replays, without any error. Raised, the
-    // room inherits that sequence, and the rejoin is an ordinary one after a lost history.
+    // every replica in the session drop the next ops as replays, without any error. It is
+    // raised [`bus::SEQ_RAISE_MARGIN`] past the claim, so no number handed out before the loss
+    // is handed out again, and every replica from before it (this one included) rejoins
+    // through the lost history with the retained text. The room is lifted to that sequence
+    // (see below).
     //
     // Only a peer that may edit raises it: a read-only ticket must not be able to move a
-    // document's ordering (every replica would see a gap and stall). A claim past
-    // [`bus::MAX_SEQ_FLOOR`] is not honoured at all, and the join is then a fresh load.
-    let applied = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_FLOOR);
+    // document's ordering. A claim past [`bus::MAX_SEQ_CLAIM`] (which leaves room for the margin
+    // below [`bus::MAX_SEQ_FLOOR`]) is refused, and the join is then a fresh load.
+    let applied = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_CLAIM);
     let claimed = if claims.may_edit() { applied.unwrap_or(0) } else { 0 };
     let (retained_seq, raised) = {
         let mut bus = relay.bus.lock().await;
         let read = match bus.current_seq(&room_key).await {
             Ok(seq) if claimed > seq => {
                 tracing::warn!(room = %room_key, counter = seq, applied = claimed, "a rejoin applied past the sequence counter; raising it");
-                bus.raise_seq(&room_key, claimed).await.map(|raised| (raised.max(claimed), true))
+                let target = claimed + bus::SEQ_RAISE_MARGIN;
+                bus.raise_seq(&room_key, target).await.map(|raised| (raised.max(target), true))
             }
             other => other.map(|seq| (seq, false)),
         };
@@ -915,10 +919,10 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let mut rooms = relay.rooms.lock().await;
     let (joined, lifted) = {
         let room = relay.room(&mut rooms, &room_key);
-        // A raise past a room that already ordered ops of its own since it was (re)built (a
-        // fresh loader edited on the wiped counter before this rejoin): those ops sit below the
-        // raised sequence, so neither a replay nor the room's members can carry on from them.
-        // The room is lifted into a lost history: see the catch-up below and `lifted` after it.
+        // A raise lifts the room past every number it has (its own ops, or the old sequence its
+        // members joined at: a fresh loader, a viewer, an earlier rejoiner), so neither a
+        // replay nor the room's members can carry on across it. The room is lifted into a lost
+        // history: see the catch-up below and `lifted` after it.
         let lifted = if raised {
             room.lift_seq(retained_seq)
         } else {

@@ -23,7 +23,7 @@ use rust_socketio::{Payload, TransportType};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::bus::MAX_SEQ_FLOOR;
+use crate::bus::{MAX_SEQ_CLAIM, MAX_SEQ_FLOOR, SEQ_RAISE_MARGIN};
 use crate::e2e_reconnect::{Harness, now, start, ticket, unique_room};
 use crate::test_text::Replica;
 
@@ -105,6 +105,33 @@ impl Wire {
     async fn close(self) {
         let _ = self.client.disconnect().await;
     }
+}
+
+fn joined_seq(w: &Wire) -> u64 {
+    w.joined["seq"].as_u64().expect("joined carries a seq")
+}
+
+/// Wait until `peer` is no longer in the room: the relay closed it.
+async fn left_the_room(h: &Harness, room: &str, peer: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let still = h.relay.rooms.lock().await.get(room).is_some_and(|r| r.peers().iter().any(|p| p.peer == peer));
+        if !still {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The relay restarts after Valkey lost the latest `INCR`s (a power cut inside the `everysec`
+/// window): the counter is `to` (0: gone), every room is gone and every socket closed.
+async fn crash(h: &Harness, room: &str, to: u64) {
+    h.relay.bus.lock().await.rewind_seq(room, to).await;
+    h.relay.rooms.lock().await.clear();
+    h.io.disconnect().await.expect("the relay closes every socket");
 }
 
 /// Poll the health route until it answers `want`, for at most `within`.
@@ -210,32 +237,36 @@ async fn a_rejoin_raises_the_sequence_past_what_it_applied() {
     let _ = b.client.disconnect().await;
 
     let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
-    assert_eq!(a.joined["seq"].as_u64(), Some(applied), "the rejoin was not caught up at what it applied: {}", a.joined);
+    let start = joined_seq(&a);
+    assert!(start >= applied + SEQ_RAISE_MARGIN, "the raise kept no margin past what was applied: {}", a.joined);
     assert_eq!(a.joined["history_lost"].as_bool(), Some(true), "the lost counter was not reported as a lost history: {}", a.joined);
     let mut b = Wire::join(&h.url, &room, "bob", Some(applied)).await;
-    assert_eq!(b.joined["seq"].as_u64(), Some(applied));
+    assert_eq!(joined_seq(&b), start);
 
     let seq = a.ordered(4, text.insert(0, "y")).await;
-    assert_eq!(seq, applied + 1, "the next op was numbered {seq}; the replicas had applied {applied}");
+    assert_eq!(seq, start + 1, "the next op was numbered {seq}; the room starts at {start}");
     let heard = b.next("op").await;
-    assert_eq!(heard["seq"].as_u64(), Some(applied + 1), "the other replica heard {heard}");
+    assert_eq!(heard["seq"].as_u64(), Some(start + 1), "the other replica heard {heard}");
     assert!(h.relay.bus.lock().await.current_seq(&room).await.expect("reads") > applied, "the Valkey counter was not raised");
     a.close().await;
     b.close().await;
 }
 
-/// R2: a claimed `applied` past [`MAX_SEQ_FLOOR`] (a buggy client) is not honoured, so the
-/// counter is not pushed towards its limit.
+/// R2: a claimed `applied` past [`MAX_SEQ_CLAIM`] (a buggy client) is not honoured, so the
+/// counter is not pushed towards its limit, margin included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn a_huge_applied_does_not_move_the_sequence() {
     let Some(h) = start().await else { return };
-    let (room, a, mut text, last) = three_edits(&h, "seq-huge").await;
+    let (room, a, mut text, mut last) = three_edits(&h, "seq-huge").await;
     a.close().await;
-    let mut a = Wire::join(&h.url, &room, "alice", Some(MAX_SEQ_FLOOR + 1)).await;
-    let seq = a.ordered(4, text.insert(0, "y")).await;
-    assert_eq!(seq, last + 1, "a huge applied moved the sequence to {seq}");
-    a.close().await;
+    for (i, huge) in [MAX_SEQ_FLOOR + 1, MAX_SEQ_CLAIM + 1].into_iter().enumerate() {
+        let mut a = Wire::join(&h.url, &room, "alice", Some(huge)).await;
+        let seq = a.ordered(4 + i as u64, text.insert(0, "y")).await;
+        assert_eq!(seq, last + 1, "an applied of {huge} moved the sequence to {seq}");
+        last = seq;
+        a.close().await;
+    }
 }
 
 /// The counter went backwards under a live room (a restart inside the `everysec` window): the
@@ -319,22 +350,109 @@ async fn a_raise_past_a_loaders_own_edits_loses_nothing_in_silence() {
 
     // Ordering carries on past what the rejoiner applied.
     let mut text = Replica::seeded(1, "hello");
-    assert_eq!(a.ordered(9, text.insert(0, "z")).await, applied + 1);
+    let start = joined_seq(&a);
+    assert!(start >= applied + SEQ_RAISE_MARGIN);
+    assert_eq!(a.ordered(9, text.insert(0, "z")).await, start + 1);
     a.close().await;
     c.close().await;
 }
 
-/// M6: a sequence counter that is not a number (a stray write) neither refuses every join nor
-/// every submit. It is treated as lost, and ordering carries on past the room's own.
+/// M6: a sequence counter that is not a whole number (a stray write) neither refuses every join
+/// nor every submit. It is treated as lost, like a wiped one: the rejoin raises past it, and
+/// ordering carries on right after the rejoiner's `joined` sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs REVIEW_VALKEY_URL"]
 async fn a_counter_that_is_not_a_number_does_not_wedge_the_document() {
     let Some(h) = start().await else { return };
-    let (room, mut a, mut text, last) = three_edits(&h, "seq-garbage").await;
-    h.relay.bus.lock().await.corrupt_seq(&room).await;
-    let b = Wire::join(&h.url, &room, "bob", Some(last)).await;
+    for garbage in ["not-a-number", "99999999.5"] {
+        let (room, a, _, last) = three_edits(&h, "seq-garbage").await;
+        a.close().await;
+        h.relay.bus.lock().await.corrupt_seq(&room, garbage).await;
+        let mut b = Wire::join(&h.url, &room, "bob", Some(last)).await;
+        let seq = b.ordered(1, Replica::seeded(4, "hello").insert(0, "b")).await;
+        assert_eq!(seq, joined_seq(&b) + 1, "a counter of {garbage:?} handed out {seq} after joined {}", b.joined);
+        assert!(seq > last, "a counter of {garbage:?} handed out a used number {seq}");
+        b.close().await;
+    }
+}
+
+/// N1/N2 (a): after a power cut, A rejoins at what it applied and B at one more (an op that
+/// reached B before the crash). Neither is left behind a gap: each hears the next op right
+/// after its own `joined` sequence, and B, which holds an op numbered past the raise point, is
+/// told the history is lost and gets the retained text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn two_rejoins_after_a_power_cut_both_carry_on() {
+    let Some(h) = start().await else { return };
+    let (room, a, mut text, applied) = three_edits(&h, "seq-skew").await;
+    a.close().await;
+    crash(&h, &room, applied - 2).await;
+
+    let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    let mut b = Wire::join(&h.url, &room, "bob", Some(applied + 1)).await;
+    assert_eq!(b.joined["history_lost"].as_bool(), Some(true), "{}", b.joined);
+    // Alice may have been closed by Bob's join and rejoined; either way the room carries on.
+    if left_the_room(&h, &room, "alice").await {
+        a = Wire::join(&h.url, &room, "alice", Some(joined_seq(&a))).await;
+    }
     let seq = a.ordered(4, text.insert(0, "y")).await;
-    assert_eq!(seq, last + 1, "a garbage counter handed out {seq}");
+    assert_eq!(seq, joined_seq(&a) + 1, "alice was left behind a gap: joined at {}, next op {seq}", joined_seq(&a));
+    let heard = b.next("op").await;
+    assert_eq!(heard["seq"].as_u64(), Some(joined_seq(&b) + 1), "bob was left behind a gap: joined {}, heard {heard}", b.joined);
     a.close().await;
     b.close().await;
+}
+
+/// N2: after a power cut, A rejoins and orders two ops; then B rejoins with one more than A had
+/// applied before the crash. B's op at that number is not A's new one, so B must not be caught
+/// up by a replay that skips it: it is told the history is lost and gets the retained text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_rejoin_past_the_raise_point_is_not_replayed_over() {
+    let Some(h) = start().await else { return };
+    let (room, a, mut text, applied) = three_edits(&h, "seq-past-raise").await;
+    a.close().await;
+    crash(&h, &room, applied - 2).await;
+
+    let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    a.ordered(4, text.insert(0, "y")).await;
+    a.ordered(5, text.insert(0, "y")).await;
+    let b = Wire::join(&h.url, &room, "bob", Some(applied + 1)).await;
+    assert_eq!(b.joined["history_lost"].as_bool(), Some(true), "{}", b.joined);
+    assert_eq!(b.joined["fallback"].as_bool(), Some(true), "bob was replayed over the op he holds: {}", b.joined);
+    a.close().await;
+    b.close().await;
+}
+
+/// N1 (b): after a wipe, a fresh loader joins and has not edited; then a rejoin raises the
+/// sequence. The loader is not left at the old sequence behind the gap: it is closed and
+/// rejoins through the lost history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_raise_does_not_strand_a_loader_that_has_not_edited() {
+    let Some(h) = start().await else { return };
+    let (room, a, _, applied) = three_edits(&h, "seq-idle-loader").await;
+    a.close().await;
+    crash(&h, &room, 0).await;
+    let c = Wire::join(&h.url, &room, "carol", None).await;
+    let a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    assert!(left_the_room(&h, &room, "carol").await, "the loader was left behind the raise");
+    a.close().await;
+    c.close().await;
+}
+
+/// N1 (c): after a wipe, only a read-only viewer is in the room; then a rejoin raises the
+/// sequence. The viewer is not left behind the gap either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_raise_does_not_strand_a_read_only_viewer() {
+    let Some(h) = start().await else { return };
+    let (room, a, _, applied) = three_edits(&h, "seq-viewer").await;
+    a.close().await;
+    crash(&h, &room, 0).await;
+    let r = Wire::join_reader(&h.url, &room, "rita", None).await;
+    let a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    assert!(left_the_room(&h, &room, "rita").await, "the viewer was left behind the raise");
+    a.close().await;
+    r.close().await;
 }
