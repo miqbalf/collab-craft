@@ -367,6 +367,12 @@ fn parse_text_bytes(raw: &str) -> Result<usize, &'static str> {
 /// The rooms' broadcast gates. See [`Relay::gate`].
 struct Gates {
     map: std::sync::Mutex<HashMap<String, Arc<Mutex<Gate>>>>,
+    /// The rooms whose gate holds a shadow copy, by weak reference: the only gates
+    /// [`make_room`] looks at (C7c N-2), so an op past the ceiling costs the rooms with a copy,
+    /// not every room. Weak, and upgraded only under this lock, which [`Gates::forget`] also
+    /// takes, so a scan never keeps a closing room's gate (and its copy's bytes) alive (C7c
+    /// N-1). Lock order: `map`, then `copies`.
+    copies: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<Gate>>>>,
     /// Whether each `crdt.*` op is tried on a shadow copy of its room's document before it is
     /// ordered (`COLLABCRAFT_SHADOW`, on unless set to `0`). See [`admit_on_shadow`].
     shadow: bool,
@@ -389,7 +395,17 @@ struct Gates {
     /// Per (room, user id): ops that cost a copy a rebuild. Kept here, not in the gate or by
     /// socket, so neither a reconnect nor an emptied room resets them. See [`MAX_STRIKES`].
     strikes: std::sync::Mutex<HashMap<(String, String), Strikes>>,
+    /// Tests: called by [`make_room`] between its scan and its drops, with no lock held.
+    #[cfg(test)]
+    scan_hook: Option<ScanHook>,
+    /// Tests: how many gates [`make_room`] has looked at.
+    #[cfg(test)]
+    scanned: std::sync::atomic::AtomicUsize,
 }
+
+/// Tests: see [`Gates::scan_hook`].
+#[cfg(test)]
+type ScanHook = Box<dyn Fn(&Gates) + Send + Sync>;
 
 impl Default for Gates {
     fn default() -> Self {
@@ -401,6 +417,7 @@ impl Gates {
     fn new(shadow: bool, room_cap: usize, global_cap: usize) -> Gates {
         Gates {
             map: std::sync::Mutex::new(HashMap::new()),
+            copies: std::sync::Mutex::new(HashMap::new()),
             shadow,
             shadow_bytes: std::sync::atomic::AtomicUsize::new(0),
             over_floor: std::sync::atomic::AtomicUsize::new(0),
@@ -409,6 +426,10 @@ impl Gates {
             floor: DEFAULT_SHADOW_FLOOR_BYTES,
             ceiling: default_ceiling(global_cap),
             strikes: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            scan_hook: None,
+            #[cfg(test)]
+            scanned: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -428,6 +449,38 @@ impl Gates {
 
     fn strikes(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Strikes>> {
         self.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn copies(&self) -> std::sync::MutexGuard<'_, HashMap<String, std::sync::Weak<Mutex<Gate>>>> {
+        self.copies.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Room `key`'s gate has just started a copy: list it among [`Gates::copies`]. A gate not
+    /// in the map (a test's bare gate) is not listed, and so never dropped for another room.
+    fn track(&self, key: &str) {
+        let gate = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).map(Arc::downgrade);
+        if let Some(gate) = gate {
+            self.copies().insert(key.to_owned(), gate);
+        }
+    }
+
+    /// Room `key`'s own copy is gone (the caller holds its gate).
+    fn untrack(&self, key: &str) {
+        self.copies().remove(key);
+    }
+
+    /// Drop a room's gate once nobody holds or waits on it, and its copy's bytes with it.
+    fn forget(&self, key: &str) {
+        let mut map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut copies = self.copies();
+        if map.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1)
+            && let Some(gate) = map.remove(key)
+        {
+            copies.remove(key);
+            if let Ok(mut gate) = gate.try_lock() {
+                forget_bytes(self, &mut gate);
+            }
+        }
     }
 }
 
@@ -591,6 +644,7 @@ async fn admit_on_shadow(
         tracing::debug!(room = %who.0, "the shadow copies are past their ceiling; an op goes through unjudged");
         return Ok(None);
     }
+    let fresh = gate.shadow.is_none();
     let mut shadow = gate.shadow.take().unwrap_or_else(|| Shadow::new(schema.as_deref()));
     let empty_before = shadow.empty_rebuilds();
     let judged = tokio::task::spawn_blocking(move || {
@@ -620,7 +674,8 @@ async fn admit_on_shadow(
     .await;
     match judged {
         Ok((None, ..)) => {
-            ceiling_drop(gates, gate, who.0, others);
+            drop(ceiling_drop(gates, gate, who.0, others));
+            gates.untrack(who.0);
             Ok(None)
         }
         Ok((Some(shadow), verdict, mark, cost)) => {
@@ -633,6 +688,9 @@ async fn admit_on_shadow(
             }
             account(gates, gate, &shadow);
             gate.shadow = Some(shadow);
+            if fresh {
+                gates.track(who.0);
+            }
             if cost > 0 {
                 strike(gates, key, now);
             }
@@ -642,6 +700,7 @@ async fn admit_on_shadow(
         // starts a fresh copy and the op is let through, as with the shadow off.
         Err(e) => {
             lose_copy(gates, gate, &e.to_string());
+            gates.untrack(who.0);
             Ok(None)
         }
     }
@@ -663,39 +722,61 @@ fn lose_copy(gates: &Gates, gate: &mut Gate, error: &str) {
 /// this room's, largest first. A room never loses its copy to the ceiling while a copy that
 /// is idle or larger exists, so an honest small active room keeps being judged. A gate held
 /// right now (its room is mid-op) is passed over, never waited for.
+///
+/// Only rooms that hold a copy are looked at ([`Gates::copies`], C7c N-2), and their gates
+/// only through weak references upgraded under that list's lock, so a room that closes during
+/// the scan is forgotten with its copy's bytes as usual (C7c N-1).
 fn make_room(gates: &Gates, room: &str, own: usize, need: usize, now: std::time::Instant) {
     use std::sync::atomic::Ordering::Relaxed;
     let past = || gates.shadow_bytes.load(Relaxed).saturating_sub(own).saturating_add(need) > gates.ceiling;
     if !past() {
         return;
     }
-    let all: Vec<(String, Arc<Mutex<Gate>>)> = {
-        let map = gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.iter().filter(|(key, _)| key.as_str() != room).map(|(key, gate)| (key.clone(), Arc::clone(gate))).collect()
-    };
-    // (idle, bytes, room, gate) of every copy that may go before this room's.
-    let mut victims: Vec<(bool, usize, String, Arc<Mutex<Gate>>)> = all
-        .into_iter()
-        .filter_map(|(key, gate)| {
-            let g = gate.try_lock().ok()?;
-            g.shadow.as_ref()?;
-            let idle = g.last_op.is_none_or(|t| now.duration_since(t) >= SHADOW_IDLE);
-            let (bytes, larger) = (g.bytes, g.bytes > gates.floor && g.bytes > own);
-            drop(g);
-            (idle || larger).then_some((idle, bytes, key, gate))
-        })
-        .collect();
+    // (idle, bytes, room, gate) of every copy that may go before this room's. An entry whose
+    // gate is gone, or that no longer holds a copy, is pruned on the way.
+    let mut victims: Vec<(bool, usize, String, std::sync::Weak<Mutex<Gate>>)> = Vec::new();
+    gates.copies().retain(|key, weak| {
+        let Some(gate) = weak.upgrade() else { return false };
+        #[cfg(test)]
+        gates.scanned.fetch_add(1, Relaxed);
+        if key.as_str() == room {
+            return true;
+        }
+        let Ok(g) = gate.try_lock() else { return true };
+        if g.shadow.is_none() {
+            return false;
+        }
+        let idle = g.last_op.is_none_or(|t| now.duration_since(t) >= SHADOW_IDLE);
+        let (bytes, larger) = (g.bytes, g.bytes > gates.floor && g.bytes > own);
+        if idle || larger {
+            victims.push((idle, bytes, key.clone(), weak.clone()));
+        }
+        true
+    });
+    #[cfg(test)]
+    if let Some(hook) = &gates.scan_hook {
+        hook(gates);
+    }
     victims.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    for (_, _, key, gate) in victims {
+    for (_, _, key, weak) in victims {
         if !past() {
             break;
         }
-        if let Ok(mut g) = gate.try_lock()
-            && g.shadow.is_some()
-        {
+        // The copy is taken under the lock and freed after it.
+        let dropped = {
+            let mut copies = gates.copies();
+            let Some(gate) = weak.upgrade() else { continue };
+            let Ok(mut g) = gate.try_lock() else { continue };
+            if g.shadow.is_none() {
+                continue;
+            }
             let others = gates.shadow_bytes.load(Relaxed).saturating_sub(g.bytes);
-            ceiling_drop(gates, &mut g, &key, others);
-        }
+            if copies.get(&key).is_some_and(|listed| listed.ptr_eq(&weak)) {
+                copies.remove(&key);
+            }
+            ceiling_drop(gates, &mut g, &key, others)
+        };
+        drop(dropped);
     }
 }
 
@@ -703,8 +784,8 @@ fn make_room(gates: &Gates, room: &str, own: usize, need: usize, now: std::time:
 /// idle or larger one, from [`make_room`]; or, when none is left, the room at hand's, whose op
 /// then goes through unjudged, as with the shadow off). Logged and counted
 /// ([`SHADOW_CEILING_DROPS`]); the room's next op starts a new copy once the total is back
-/// under the ceiling.
-fn ceiling_drop(gates: &Gates, gate: &mut Gate, room: &str, others: usize) {
+/// under the ceiling. The copy is handed back, for the caller to free once it holds no lock.
+fn ceiling_drop(gates: &Gates, gate: &mut Gate, room: &str, others: usize) -> Option<Shadow> {
     let dropped = SHADOW_CEILING_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     tracing::warn!(
         room,
@@ -714,8 +795,9 @@ fn ceiling_drop(gates: &Gates, gate: &mut Gate, room: &str, others: usize) {
         dropped,
         "the shadow copies reached their ceiling; a room's copy is dropped, and its ops go through unjudged until its next checkpoint"
     );
-    gate.shadow = None;
+    let copy = gate.shadow.take();
     forget_bytes(gates, gate);
+    copy
 }
 
 /// R3-M4: a rebuild left the copy empty because it could not take its own base (a document
@@ -795,15 +877,9 @@ impl Relay {
         Arc::clone(gates.entry(key.to_owned()).or_default())
     }
 
-    /// Drop a room's gate once nobody holds or waits on it.
+    /// Drop a room's gate once nobody holds or waits on it. See [`Gates::forget`].
     fn forget_gate(&self, key: &str) {
-        let mut gates = self.gates.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if gates.get(key).is_some_and(|gate| Arc::strong_count(gate) == 1)
-            && let Some(gate) = gates.remove(key)
-            && let Ok(mut gate) = gate.try_lock()
-        {
-            forget_bytes(&self.gates, &mut gate);
-        }
+        self.gates.forget(key);
     }
 
     /// The room for `key`, created with this relay's text cap if it does not exist yet.

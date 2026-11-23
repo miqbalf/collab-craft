@@ -2239,7 +2239,61 @@ mod relay_proto {
         }
         let gate = std::sync::Arc::new(tokio::sync::Mutex::new(gate));
         gates.map.lock().unwrap().insert(room.to_owned(), std::sync::Arc::clone(&gate));
+        gates.track(room);
         gate
+    }
+
+    /// C7c N-1: a room whose grace period ends while another room's op scans for copies to drop
+    /// is forgotten all the same: its gate leaves the map and its copy's bytes leave the count.
+    /// Before, the scan held a strong reference to every gate, so `forget` saw a second holder,
+    /// did nothing, and the copy stayed counted with nothing left to forget it.
+    #[tokio::test]
+    async fn a_room_that_closes_during_a_scan_is_forgotten() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let mut gates = crate::Gates::new(true, 1 << 30, 64 * MIB).with_ceiling(96 * MIB);
+        // The room closes (its grace period ends) right after the scan.
+        gates.scan_hook = Some(Box::new(|gates: &crate::Gates| gates.forget("closing")));
+        // Both idle, so both are listed. Once "closing" is forgotten its bytes are gone, the
+        // total is back under the ceiling, and "big" is kept.
+        let closing = planted_copy(&gates, "closing", 20 * MIB);
+        let big = planted_copy(&gates, "big", 76 * MIB);
+        drop(closing);
+        let mut gate = crate::Gate::default();
+        let judged = crate::admit_on_shadow(&gates, &mut gate, ("honest", "alice"), None, vec![text_state(MIB)], false).await;
+        assert!(matches!(judged, Ok(Some(_))), "{judged:?}");
+        assert!(!gates.map.lock().unwrap().contains_key("closing"), "the closed room's gate stayed");
+        assert_eq!(gates.shadow_bytes.load(Relaxed), 76 * MIB + gate.bytes, "the closed room's copy stayed counted");
+        assert!(big.lock().await.shadow.is_some(), "a copy went that the ceiling did not need to lose");
+    }
+
+    /// C7c N-2: past the ceiling with nothing to drop, an op looks only at the rooms that hold a
+    /// copy, not at every room the relay has a gate for.
+    #[tokio::test]
+    async fn past_the_ceiling_a_scan_looks_only_at_rooms_with_a_copy() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let gates = crate::Gates::new(true, 1 << 30, 64 * MIB).with_ceiling(96 * MIB);
+        for n in 0..1000 {
+            gates.map.lock().unwrap().insert(format!("empty-{n}"), std::sync::Arc::default());
+        }
+        // Six active copies at the floor: none idle, none over it, so none may go.
+        let now = std::time::Instant::now();
+        let active: Vec<_> = (0..6).map(|n| planted_copy(&gates, &format!("active-{n}"), 16 * MIB)).collect();
+        for g in &active {
+            g.lock().await.last_op = Some(now);
+        }
+        let mut gate = crate::Gate::default();
+        for _ in 0..3 {
+            let before = gates.scanned.load(Relaxed);
+            let judged = crate::admit_on_shadow(&gates, &mut gate, ("honest", "alice"), None, vec![ARRAY.to_vec()], false).await;
+            assert_eq!(judged, Ok(None), "past the ceiling, no copy is started");
+            let scanned = gates.scanned.load(Relaxed) - before;
+            assert!(scanned <= active.len(), "an op looked at {scanned} gates for {} copies", active.len());
+        }
+        for g in &active {
+            assert!(g.lock().await.shadow.is_some(), "an active copy at the floor was dropped");
+        }
     }
 
     /// C7b review I-1: idle copies past the ceiling (rooms that sent nothing, kept open) go
