@@ -419,7 +419,7 @@ impl LiveDoc {
     #[must_use]
     pub fn order(&self) -> Vec<u64> {
         let txn = self.y.doc().transact();
-        order_of(&txn, &self.body)
+        order_of(&txn, &self.body, &self.blocks)
     }
 
     /// One block's text, attributes and runs, including a removed block's.
@@ -553,15 +553,19 @@ impl Roots {
         let Some(Out::YMap(block)) = self.blocks.get(txn, &key(id)) else {
             return Err(LiveError::UnknownBlock);
         };
-        let index = raw_ids(txn, &self.body).iter().position(|o| *o == Some(id)).ok_or(LiveError::Gone)?;
+        let index = raw_ids(txn, &self.body, &self.blocks).iter().position(|o| *o == Some(id)).ok_or(LiveError::Gone)?;
         Ok((block, u32::try_from(index).map_err(|_| LiveError::OutOfRange)?))
     }
 
     /// Take every occurrence of `id` out of the body. Two peers inserting the same id at once
     /// leave it there twice; removing only one would leave the block in the order.
     fn remove_all(&self, txn: &mut TransactionMut, id: u64) {
-        let at: Vec<u32> =
-            raw_ids(txn, &self.body).iter().enumerate().filter(|(_, o)| **o == Some(id)).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
+        let at: Vec<u32> = raw_ids(txn, &self.body, &self.blocks)
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| **o == Some(id))
+            .filter_map(|(i, _)| u32::try_from(i).ok())
+            .collect();
         for i in at.into_iter().rev() {
             self.body.remove(txn, i);
         }
@@ -569,7 +573,7 @@ impl Roots {
 
     /// The body index that position `at` of [`order_of`] maps to, which may be the end.
     fn raw_index<T: ReadTxn>(&self, txn: &T, at: usize) -> Result<u32, LiveError> {
-        let raw = raw_ids(txn, &self.body);
+        let raw = raw_ids(txn, &self.body, &self.blocks);
         let mut seen = BTreeSet::new();
         let mut visible = 0;
         for (i, id) in raw.iter().enumerate() {
@@ -634,11 +638,16 @@ fn id_any(id: u64) -> Any {
     Any::Number(Number::Int(id as i64))
 }
 
-/// Every body entry, by index. `None` for an entry that is not an id.
-fn raw_ids<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<Option<u64>> {
+/// Every body entry, by index. `None` for an entry that is not an id, or names a block that is
+/// gone from `blocks`.
+///
+/// A block can be gone while its id is still in the body: one peer undoes inserting it (which
+/// takes the block away) while another undoes removing it (which puts the id back). Such an id
+/// is not in the order, on every replica alike.
+fn raw_ids<T: ReadTxn>(txn: &T, body: &ArrayRef, blocks: &MapRef) -> Vec<Option<u64>> {
     body.iter(txn)
         .map(|v| match v {
-            Out::Any(Any::Number(n)) => n.as_i64().map(|i| i as u64),
+            Out::Any(Any::Number(n)) => n.as_i64().map(|i| i as u64).filter(|id| blocks.contains_key(txn, &key(*id))),
             _ => None,
         })
         .collect()
@@ -646,9 +655,9 @@ fn raw_ids<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<Option<u64>> {
 
 /// The order: body ids, each kept at its first occurrence only. Two peers inserting the same id
 /// at once leave it in the body twice, and every replica keeps the same (first) one.
-fn order_of<T: ReadTxn>(txn: &T, body: &ArrayRef) -> Vec<u64> {
+fn order_of<T: ReadTxn>(txn: &T, body: &ArrayRef, blocks: &MapRef) -> Vec<u64> {
     let mut seen = BTreeSet::new();
-    raw_ids(txn, body).into_iter().flatten().filter(|id| seen.insert(*id)).collect()
+    raw_ids(txn, body, blocks).into_iter().flatten().filter(|id| seen.insert(*id)).collect()
 }
 
 fn text_of<T: ReadTxn>(txn: &T, block: &MapRef) -> Option<TextRef> {
