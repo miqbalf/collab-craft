@@ -200,15 +200,15 @@ impl Bus {
     /// went backwards (a Valkey restart inside the `everysec` AOF window, which the relay now
     /// survives, see [`Bus`]) would hand out a number already used; a client holding sequence
     /// 900 would then treat the next ops as replays and drop them all. A live counter above
-    /// `floor` is never pushed backwards. A counter that is not a number is left alone, and
-    /// the `INCR` refuses it.
+    /// `floor` is never pushed backwards. A counter that is not a number (a stray write) is
+    /// treated as lost and reset to `floor`, rather than refusing every submit for good.
     pub async fn next_seq(&mut self, room: &str, floor: u64) -> Result<u64, BusError> {
         const SCRIPT: &str = r#"
             local floor = tonumber(ARGV[1])
             local raw = redis.call('GET', KEYS[1])
             local current = 0
             if raw then current = tonumber(raw) end
-            if current and current < floor then
+            if not current or current < floor then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
             local next = redis.call('INCR', KEYS[1])
@@ -226,7 +226,9 @@ impl Bus {
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
         // The TTL is refreshed on every edit, so an active document never loses its counter
         // and an abandoned one eventually stops costing memory.
-        match redis::Script::new(SCRIPT).key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async(&mut self.conn).await {
+        // Built once: the hottest bus call should not hash its script on every edit.
+        static NEXT_SEQ: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| redis::Script::new(SCRIPT));
+        match NEXT_SEQ.key(&key).arg(floor).arg(SEQ_TTL.as_secs() as i64).invoke_async(&mut self.conn).await {
             Ok(next) => Ok(next),
             Err(e) if is_readonly(&e) => Err(BusError::ReadOnlyReplica),
             Err(e) => Err(e.into()),
@@ -245,7 +247,7 @@ impl Bus {
             local raw = redis.call('GET', KEYS[1])
             local current = 0
             if raw then current = tonumber(raw) end
-            if current and current < floor then
+            if not current or current < floor then
                 redis.call('SET', KEYS[1], ARGV[1])
                 redis.call('EXPIRE', KEYS[1], ARGV[2])
                 return floor
@@ -266,14 +268,25 @@ impl Bus {
     /// Read-only, so a peer joining an empty in-memory room can learn where the
     /// document already was without advancing the counter. Used to seed the
     /// room's sequence on join.
+    ///
+    /// A counter that is not a number reads as absent (and is logged): refusing the read would
+    /// refuse every join for good, and [`Bus::next_seq`] and [`Bus::raise_seq`] reset such a
+    /// counter to their floor.
     pub async fn current_seq(&mut self, room: &str) -> Result<u64, BusError> {
         let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
-        let v: Option<u64> = match self.conn.get(&key).await {
+        let v: Option<String> = match self.conn.get(&key).await {
             Ok(v) => v,
             Err(e) if is_readonly(&e) => return Err(BusError::ReadOnlyReplica),
             Err(e) => return Err(e.into()),
         };
-        Ok(v.unwrap_or(0))
+        Ok(match v.map(|raw| raw.parse::<u64>().map_err(|_| raw)) {
+            None => 0,
+            Some(Ok(seq)) => seq,
+            Some(Err(raw)) => {
+                tracing::error!(room, bytes = raw.len(), "the sequence counter is not a number; treating it as lost");
+                0
+            }
+        })
     }
 
     /// The next CRDT id space for a document, above `kept`.
@@ -360,6 +373,14 @@ impl Bus {
         } else {
             let _: Result<(), _> = self.conn.set(&key, to).await;
         }
+    }
+
+    /// Overwrite the room's sequence counter with something that is not a number, as a stray
+    /// write would, for a test that such a counter does not wedge the document.
+    #[cfg(test)]
+    pub async fn corrupt_seq(&mut self, room: &str) {
+        let key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
+        let _: Result<(), _> = self.conn.set(&key, "not-a-number").await;
     }
 
     /// Set the room's sequence counter back to `to` (0 deletes it), as a lost write, a flush or

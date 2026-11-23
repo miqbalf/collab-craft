@@ -37,9 +37,19 @@ struct Wire {
 impl Wire {
     /// Join `room` as `pid`, resuming at `applied` when it is given.
     async fn join(url: &str, room: &str, pid: &str, applied: Option<u64>) -> Wire {
+        Wire::join_with(url, ticket(room, pid, now()), applied).await
+    }
+
+    /// Join with a read ticket: it may watch, never edit.
+    async fn join_reader(url: &str, room: &str, pid: &str, applied: Option<u64>) -> Wire {
+        let token = crate::token::sign_at(crate::e2e_reconnect::SECRET, room, pid, pid, false, pid, now()).unwrap();
+        Wire::join_with(url, token, applied).await
+    }
+
+    async fn join_with(url: &str, token: String, applied: Option<u64>) -> Wire {
         let (tx, heard) = unbounded_channel();
         let mut builder = ClientBuilder::new(url.to_owned()).reconnect(false).transport_type(TransportType::Websocket);
-        for event in ["op", "error", "joined"] {
+        for event in ["op", "error", "joined", "text_ops"] {
             let tx = tx.clone();
             builder = builder.on(event, move |payload, _| {
                 let tx = tx.clone();
@@ -53,7 +63,7 @@ impl Wire {
                 .boxed()
             });
         }
-        let mut auth = json!({ "token": ticket(room, pid, now()), "proto": craft_collab::PROTO });
+        let mut auth = json!({ "token": token, "proto": craft_collab::PROTO });
         if let Some(applied) = applied {
             auth["applied"] = json!(applied);
         }
@@ -80,11 +90,16 @@ impl Wire {
         self.client.emit("submit", json!({ "local": local, "command": craft_collab::CRDT_TEXT, "params": params })).await.expect("emits");
     }
 
-    /// Submit one edit and wait for the room to order it: the `op` this socket hears back.
+    /// Submit one edit and wait for the room to order it: the `op` this socket hears back with
+    /// that `local` (a catch-up replay may come first).
     async fn ordered(&mut self, local: u64, params: Value) -> u64 {
         self.submit(local, params).await;
-        let op = self.next("op").await;
-        op["seq"].as_u64().expect("the op carries a seq")
+        loop {
+            let op = self.next("op").await;
+            if op["local"].as_u64() == Some(local) {
+                return op["seq"].as_u64().expect("the op carries a seq");
+            }
+        }
     }
 
     async fn close(self) {
@@ -234,4 +249,92 @@ async fn a_counter_behind_the_room_never_hands_out_a_used_number() {
     let seq = a.ordered(4, text.insert(0, "y")).await;
     assert_eq!(seq, last + 1, "a counter behind the room handed out {seq}");
     a.close().await;
+}
+
+/// I1: a read-only peer that claims to have applied far more than the document holds does not
+/// move the sequence. It is caught up as a fresh load instead, and hears the next op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_read_only_rejoin_does_not_raise_the_sequence() {
+    let Some(h) = start().await else { return };
+    let (room, mut a, mut text, last) = three_edits(&h, "seq-reader").await;
+    let mut r = Wire::join_reader(&h.url, &room, "rita", Some(last + 100)).await;
+    assert_eq!(h.relay.bus.lock().await.current_seq(&room).await.expect("reads"), last, "a read-only claim raised the counter");
+    let seq = a.ordered(4, text.insert(0, "y")).await;
+    assert_eq!(seq, last + 1, "a read-only claim moved the sequence to {seq}");
+    let heard = loop {
+        let op = r.next("op").await;
+        if op["seq"].as_u64() == Some(last + 1) {
+            break op;
+        }
+    };
+    assert_eq!(heard["seq"].as_u64(), Some(last + 1));
+    a.close().await;
+    r.close().await;
+}
+
+/// I2: the counter is wiped and the relay restarts; a fresh loader joins first and orders edits
+/// of its own; then a replica rejoins with a higher `applied` and raises the sequence past
+/// them. No edit is lost in silence: the rejoiner is told the history is lost and is sent the
+/// room's retained text (the loader's edits), and the loader is reconnected at once, not left
+/// holding ops behind a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_raise_past_a_loaders_own_edits_loses_nothing_in_silence() {
+    let Some(h) = start().await else { return };
+    let (room, a, _, applied) = three_edits(&h, "seq-lift").await;
+    a.close().await;
+
+    // Valkey lost the counter, and the relay restarted.
+    h.relay.bus.lock().await.rewind_seq(&room, 0).await;
+    h.relay.rooms.lock().await.clear();
+    h.io.disconnect().await.expect("the relay closes every socket");
+
+    // A fresh loader is first, and edits on the wiped counter.
+    let mut c = Wire::join(&h.url, &room, "carol", None).await;
+    let mut loader = Replica::seeded(2, "hello");
+    assert_eq!(c.ordered(1, loader.insert(0, "c")).await, 1);
+    assert_eq!(c.ordered(2, loader.insert(0, "c")).await, 2);
+    assert!(applied > 2);
+
+    // Alice's replica rejoins, ahead of the room.
+    let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    assert_eq!(a.joined["history_lost"].as_bool(), Some(true), "the rejoin past the loader's edits was not told: {}", a.joined);
+    assert_eq!(a.joined["fallback"].as_bool(), Some(true), "the rejoin was not sent the retained text: {}", a.joined);
+    let texts = a.next("text_ops").await;
+    assert!(texts["ops"].as_array().is_some_and(|ops| ops.len() >= 2), "the loader's edits are not in the catch-up: {texts}");
+    let lost = h.relay.rooms.lock().await.get(&room).map(crate::room::Room::history_lost);
+    assert_eq!(lost, Some(true));
+
+    // The loader is closed now, so it rejoins through the lost history instead of waiting.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let still = h.relay.rooms.lock().await.get(&room).is_some_and(|r| r.peers().iter().any(|p| p.peer == "carol"));
+        if !still {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the loader was left in the room behind the jump");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Ordering carries on past what the rejoiner applied.
+    let mut text = Replica::seeded(1, "hello");
+    assert_eq!(a.ordered(9, text.insert(0, "z")).await, applied + 1);
+    a.close().await;
+    c.close().await;
+}
+
+/// M6: a sequence counter that is not a number (a stray write) neither refuses every join nor
+/// every submit. It is treated as lost, and ordering carries on past the room's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_counter_that_is_not_a_number_does_not_wedge_the_document() {
+    let Some(h) = start().await else { return };
+    let (room, mut a, mut text, last) = three_edits(&h, "seq-garbage").await;
+    h.relay.bus.lock().await.corrupt_seq(&room).await;
+    let b = Wire::join(&h.url, &room, "bob", Some(last)).await;
+    let seq = a.ordered(4, text.insert(0, "y")).await;
+    assert_eq!(seq, last + 1, "a garbage counter handed out {seq}");
+    a.close().await;
+    b.close().await;
 }

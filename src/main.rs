@@ -875,20 +875,24 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // applied (R2, the sequence floor): the counter was lost or went backwards (a wiped volume,
     // a Valkey restart inside the `everysec` window), and numbering on from below would make
     // every replica in the session drop the next ops as replays, without any error. Raised, the
-    // room inherits that sequence, and the rejoin is an ordinary one after a lost history. A
-    // claim past [`bus::MAX_SEQ_FLOOR`] is not honoured.
-    let claimed = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_FLOOR).unwrap_or(0);
-    let retained_seq = {
+    // room inherits that sequence, and the rejoin is an ordinary one after a lost history.
+    //
+    // Only a peer that may edit raises it: a read-only ticket must not be able to move a
+    // document's ordering (every replica would see a gap and stall). A claim past
+    // [`bus::MAX_SEQ_FLOOR`] is not honoured at all, and the join is then a fresh load.
+    let applied = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_FLOOR);
+    let claimed = if claims.may_edit() { applied.unwrap_or(0) } else { 0 };
+    let (retained_seq, raised) = {
         let mut bus = relay.bus.lock().await;
         let read = match bus.current_seq(&room_key).await {
             Ok(seq) if claimed > seq => {
                 tracing::warn!(room = %room_key, counter = seq, applied = claimed, "a rejoin applied past the sequence counter; raising it");
-                bus.raise_seq(&room_key, claimed).await.map(|raised| raised.max(claimed))
+                bus.raise_seq(&room_key, claimed).await.map(|raised| (raised.max(claimed), true))
             }
-            other => other,
+            other => other.map(|seq| (seq, false)),
         };
         match read {
-            Ok(seq) => seq,
+            Ok(read) => read,
             Err(e) => {
                 tracing::error!(error = %e, room = %room_key, "could not read the document's sequence");
                 let _ = socket.emit(
@@ -909,23 +913,44 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     let gate = relay.gate(&room_key);
     let ordered = gate.lock().await;
     let mut rooms = relay.rooms.lock().await;
-    let joined = {
+    let (joined, lifted) = {
         let room = relay.room(&mut rooms, &room_key);
-        room.observe_seq(retained_seq);
+        // A raise past a room that already ordered ops of its own since it was (re)built (a
+        // fresh loader edited on the wiped counter before this rejoin): those ops sit below the
+        // raised sequence, so neither a replay nor the room's members can carry on from them.
+        // The room is lifted into a lost history: see the catch-up below and `lifted` after it.
+        let lifted = if raised {
+            room.lift_seq(retained_seq)
+        } else {
+            room.observe_seq(retained_seq);
+            false
+        };
         let peer = Peer { peer: peer_id.clone(), display: claims.dsp.clone(), may_edit: claims.may_edit(), uid: claims.uid.clone() };
         let schema = handshake.schema.as_deref();
-        match room.check_schema(schema).and_then(|()| room.join_as(peer, &socket.id.to_string())) {
+        let joined = match room.check_schema(schema).and_then(|()| room.join_as(peer, &socket.id.to_string())) {
             Ok(()) => {
                 room.pin_schema(schema);
                 for (scope, holder) in &locks {
                     room.record_holder(scope.clone(), holder.clone());
                 }
-                // See `catch_up` for which baseline and why.
-                let baseline = handshake.applied.unwrap_or_else(|| room.saved_seq());
-                Ok((catch_up(room, baseline), room.peers().to_vec(), room.ephemeral()))
+                // See `catch_up` for which baseline and why. A read-only peer that claims more
+                // than the document holds is caught up as a fresh load: it may not raise the
+                // sequence, and resuming past it would make it drop the next ops as replays.
+                let applied = applied.filter(|&applied| claims.may_edit() || applied <= room.seq());
+                let baseline = applied.unwrap_or_else(|| room.saved_seq());
+                let catch = if lifted {
+                    // The ops the room ordered before the lift are in no replay this joiner
+                    // can take; its retained text is, and the lost history makes the saver
+                    // checkpoint.
+                    CatchUp { seq: room.seq(), replay: Vec::new(), texts: retained_texts(room), history_lost: true }
+                } else {
+                    catch_up(room, baseline)
+                };
+                Ok((catch, room.peers().to_vec(), room.ephemeral()))
             }
             Err(refusal) => Err(refusal),
-        }
+        };
+        (joined, lifted)
     };
 
     drop(rooms);
@@ -1012,6 +1037,15 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     }
     socket.join(room_name.clone());
     drop(ordered);
+
+    if lifted {
+        // The room's other members are on the ops ordered before the lift, and the next op is
+        // numbered past it, so each would hold every later op and wait in silence for the gap
+        // to fill. Closed now, they reconnect at once and rejoin through the lost history,
+        // with their unconfirmed edits sent again.
+        tracing::warn!(room = %room_key, seq, "the sequence was lifted past the room's own ops; reconnecting its other members");
+        let _ = socket.to(room_name.clone()).disconnect().await;
+    }
 
     // And on where everybody is, so somebody arriving late does not have to wait for each
     // person to move before their marker appears.
