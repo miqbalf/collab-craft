@@ -2161,12 +2161,70 @@ mod relay_proto {
         assert!(ordinary.bytes >= 2 * MIB && ordinary.bytes <= gates.floor, "{}", ordinary.bytes);
         assert!(crate::admit_on_shadow(&gates, &mut ordinary, who, None, vec![ARRAY.to_vec()], false).await.is_ok(), "an edit");
 
-        // With a floor under that copy, it is one of the largest and past its share: it waits.
+        // A copy over a lower floor, once the others pass the cap, is one of the largest and
+        // past its share: it waits. (The floor is on the copy alone, so it took its document
+        // while the relay had room.)
         let gates = crate::Gates::new(true, 1 << 30, 8 * MIB).with_floor(MIB);
+        let mut large = crate::Gate::default();
+        assert!(crate::admit_on_shadow(&gates, &mut large, who, None, vec![text_state(2 * MIB)], false).await.is_ok());
+        assert!(large.bytes > gates.floor);
         gates.shadow_bytes.fetch_add(3 * 256 * MIB, Relaxed);
         gates.over_floor.fetch_add(3, Relaxed);
-        let mut large = crate::Gate::default();
-        assert_eq!(crate::admit_on_shadow(&gates, &mut large, who, None, vec![text_state(2 * MIB)], false).await, Err(ShadowStop::Busy));
+        assert_eq!(crate::admit_on_shadow(&gates, &mut large, who, None, vec![ARRAY.to_vec()], false).await, Err(ShadowStop::Busy));
+    }
+
+    /// R3-M1: the floor is on the copy alone. A copy just under the floor, sent a checkpoint
+    /// larger than what is left under it, goes on while the relay-wide cap is passed and its
+    /// share is small; judged on the copy plus twice the op, it would wait for ever.
+    #[tokio::test]
+    async fn a_copy_under_the_floor_takes_an_op_past_the_floor() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let state = text_state(MIB);
+        let first = crate::Gates::new(true, 1 << 30, 1 << 40);
+        let mut room = crate::Gate::default();
+        assert!(crate::admit_on_shadow(&first, &mut room, ("r", "service"), None, vec![state.clone()], false).await.is_ok());
+        let copy = room.bytes;
+        // Just under the floor, with three large rooms past a relay-wide cap whose share is
+        // smaller than the copy plus the op.
+        let gates = crate::Gates::new(true, 1 << 30, 8 * MIB).with_floor(copy + 1024);
+        gates.shadow_bytes.fetch_add(copy + 3 * 256 * MIB, Relaxed);
+        gates.over_floor.fetch_add(3, Relaxed);
+        assert!(copy + 2 * state.len() > gates.floor && copy + 2 * state.len() > gates.fair_share(), "the test needs an op past the headroom");
+        let again = crate::admit_on_shadow(&gates, &mut room, ("r", "service"), None, vec![state], true).await;
+        assert!(again.is_ok(), "a copy under the floor waited: {again:?}");
+    }
+
+    /// R3-M3: past the relay-wide ceiling the relay stops judging instead of refusing. An op
+    /// that would take the copies past it goes through unjudged (no mark), its room's copy is
+    /// dropped and counted, and a room with no copy does not start one.
+    #[tokio::test]
+    async fn past_the_ceiling_ops_go_through_unjudged_and_the_copy_is_dropped() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MIB: usize = 1024 * 1024;
+        let gates = crate::Gates::new(true, 1 << 30, 1 << 40).with_ceiling(64 * MIB);
+        let mut room = crate::Gate::default();
+        assert!(matches!(crate::admit_on_shadow(&gates, &mut room, ("r", "alice"), None, vec![text_state(MIB)], false).await, Ok(Some(_))));
+        assert!(room.shadow.is_some() && room.bytes > 0);
+        let others = 63 * MIB;
+        gates.shadow_bytes.fetch_add(others, Relaxed);
+        let dropped = crate::SHADOW_CEILING_DROPS.load(Relaxed);
+        assert_eq!(
+            crate::admit_on_shadow(&gates, &mut room, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await,
+            Ok(None),
+            "judged past the ceiling"
+        );
+        assert!(room.shadow.is_none(), "the copy was kept");
+        assert_eq!((room.bytes, gates.shadow_bytes.load(Relaxed)), (0, others), "the copy's bytes were kept");
+        assert!(crate::SHADOW_CEILING_DROPS.load(Relaxed) > dropped, "the drop was not counted");
+        // Still past it: no new copy.
+        gates.shadow_bytes.fetch_add(MIB, Relaxed);
+        let mut fresh = crate::Gate::default();
+        assert_eq!(crate::admit_on_shadow(&gates, &mut fresh, ("s", "bob"), None, vec![ARRAY.to_vec()], false).await, Ok(None));
+        assert!(fresh.shadow.is_none() && fresh.bytes == 0);
+        // Back under it, rooms are judged again.
+        gates.shadow_bytes.store(0, Relaxed);
+        assert!(matches!(crate::admit_on_shadow(&gates, &mut fresh, ("s", "bob"), None, vec![ARRAY.to_vec()], false).await, Ok(Some(_))));
     }
 
     /// The room is asked before the copy: what it would refuse (read-only, too large) never

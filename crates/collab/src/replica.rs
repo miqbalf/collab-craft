@@ -691,8 +691,9 @@ pub const MAX_OP_BLOCKS: usize = crate::fits::MAX_ITEMS;
 /// The most blocks a checkpoint snapshot from the document service may write.
 pub const MAX_STATE_BLOCKS: usize = crate::fits::MAX_STATE_ITEMS;
 
-/// How many blocks `bytes` write, read without allocating per block; `None` when the byte
-/// reader does not take them. For a relay to refuse an update past [`MAX_OP_BLOCKS`] as too
+/// How many blocks `bytes` write, read without allocating per block, with each client section
+/// and each delete-set client and range counted as one more (they cost a reader a map entry
+/// each, as a block does); `None` when the byte reader does not take them. For a relay to refuse an update past [`MAX_OP_BLOCKS`] as too
 /// large before anything decodes it.
 #[must_use]
 pub fn update_blocks(bytes: &[u8]) -> Option<usize> {
@@ -1555,9 +1556,56 @@ mod tests {
         assert_eq!(y.apply_state(&bomb), Err(LiveError::TooLarge), "past the state cap too");
         assert_eq!(integrate(&YReplica::seed_doc(), &bomb), Err(Integrate::TooLarge));
         assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0, "blocks were listed");
-        assert_eq!(update_blocks(&bomb), Some(BLOCKS as usize));
-        assert!(took < std::time::Duration::from_secs(1), "the refusals took {took:?}");
+        assert_eq!(update_blocks(&bomb), Some(BLOCKS as usize + 1), "the blocks and their one section");
+        // About 1.1 s in debug on a build host at load 25 (88c15ed and after); listing the
+        // 8 M blocks would cost far more, and gigabytes.
+        assert!(took < std::time::Duration::from_secs(2), "the refusals took {took:?}");
         assert_eq!(LiveError::from(Integrate::TooLarge), LiveError::TooLarge);
+    }
+
+    /// R3-M2: client sections and delete-set entries count toward the cap, as blocks do. An
+    /// update of one GC block in each of 600 k client sections writes 600 k blocks, under the
+    /// cap, but costs a reader 1.2 M entries; a delete set of 1.1 M ranges writes no block at
+    /// all. Both are refused as too large, before anything is listed.
+    #[test]
+    fn client_sections_and_delete_entries_count_toward_the_cap() {
+        const SECTIONS: u64 = 600_000;
+        let mut sections = Vec::new();
+        varint(&mut sections, SECTIONS);
+        for client in 0..SECTIONS {
+            sections.push(1);
+            varint(&mut sections, client + 1);
+            sections.extend([0, 0, 1]);
+        }
+        sections.push(0);
+        const RANGES: u64 = (1 << 20) + 50_000;
+        let mut deletes = vec![0, 1, 7];
+        varint(&mut deletes, RANGES);
+        for i in 0..RANGES {
+            varint(&mut deletes, 2 * i);
+            deletes.push(1);
+        }
+        assert_eq!(update_blocks(&sections), Some(2 * SECTIONS as usize));
+        assert_eq!(update_blocks(&deletes), Some(1 + RANGES as usize));
+        for (name, bytes) in [("sections", &sections), ("deletes", &deletes)] {
+            let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+            crate::walk::LISTED.with(|n| n.set(0));
+            assert_eq!(y.apply(bytes), Err(LiveError::TooLarge), "{name}");
+            assert_eq!(crate::walk::LISTED.with(std::cell::Cell::get), 0, "{name}: blocks were listed");
+        }
+    }
+
+    /// R3-M2: a client section with no blocks (yrs never writes one) is refused: a flood of
+    /// them would cost a map entry each for nothing.
+    #[test]
+    fn a_client_section_with_no_blocks_is_refused() {
+        let empty = [1, 0, 5, 0, 0];
+        assert!(!update_is_sound(&empty));
+        assert_eq!(update_blocks(&empty), None);
+        let mut y = YReplica::assemble(YReplica::seed_doc(), None, |_, _| {});
+        assert_eq!(y.apply(&empty), Err(LiveError::Decode));
+        // An empty update (no sections, no deletes) is still taken.
+        assert!(update_is_sound(&[0, 0]));
     }
 
     /// How many blocks the largest honest updates write, against the caps. A 1 MiB offline

@@ -60,7 +60,10 @@ pub(crate) struct Shape {
     pub(crate) upper: BTreeMap<u64, u32>,
     /// The delete set, each client's ranges in written order (`Update::delete_set`).
     pub(crate) deletes: BTreeMap<u64, Ranges>,
-    /// How many blocks the update writes, skips included.
+    /// What the update costs a reader, in entries: the blocks it writes (skips included), plus
+    /// one per client section and one per delete-set client and range. A section or a delete
+    /// entry writes no block but costs yrs a map entry and a range, so a flood of empty ones is
+    /// counted toward the same cap as a flood of blocks.
     pub(crate) count: usize,
 }
 
@@ -384,6 +387,12 @@ fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
     let mut seen = HashSet::new();
     for _ in 0..r.u32()? {
         let blocks = r.u32()?;
+        // yrs never writes a section with no blocks; each one would cost a map entry here and
+        // in yrs's decode for nothing.
+        if blocks == 0 {
+            return None;
+        }
+        shape.count += 1;
         let client = r.client()?;
         let mut clock = r.clock()?;
         if !seen.insert(client) {
@@ -438,9 +447,11 @@ fn read_into(r: &mut Reader<'_>) -> Option<Shape> {
     }
     // The delete set.
     for _ in 0..r.u32()? {
+        shape.count += 1;
         let client = r.client()?;
         let mut ranges = Ranges::new();
         for _ in 0..r.u32()? {
+            shape.count += 1;
             let clock = r.clock()?;
             let end = u64::from(clock) + u64::from(r.u32()?);
             if end > MAX_CLOCK {

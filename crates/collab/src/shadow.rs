@@ -45,6 +45,8 @@ pub struct Shadow {
     log: Vec<Vec<u8>>,
     log_bytes: usize,
     rebuilds: u64,
+    /// Rebuilds whose base the copy could not take (see [`empty_rebuilds`](Self::empty_rebuilds)).
+    empty_rebuilds: u64,
 }
 
 /// Where a [`Shadow`] stood, for [`Shadow::rollback`].
@@ -82,7 +84,15 @@ impl Shadow {
     /// replicas cannot read it back is refused; with no schema, or an unknown one, they are not.
     #[must_use]
     pub fn new(schema: Option<&str>) -> Shadow {
-        Shadow { y: fresh(schema), schema: schema.map(str::to_owned), base: Vec::new(), log: Vec::new(), log_bytes: 0, rebuilds: 0 }
+        Shadow {
+            y: fresh(schema),
+            schema: schema.map(str::to_owned),
+            base: Vec::new(),
+            log: Vec::new(),
+            log_bytes: 0,
+            rebuilds: 0,
+            empty_rebuilds: 0,
+        }
     }
 
     /// The schema the copy was made for.
@@ -165,6 +175,15 @@ impl Shadow {
         self.rebuilds
     }
 
+    /// How many rebuilds left the copy without its document because the copy could not take
+    /// its own compacted base: a state past the state item cap (2^22 blocks, an honest document
+    /// of roughly 28 MiB of dense text; nothing caps a document's size). The copy then fails
+    /// open: later ops wait and go through unjudged. Each one is logged.
+    #[must_use]
+    pub fn empty_rebuilds(&self) -> u64 {
+        self.empty_rebuilds
+    }
+
     /// Type the roots by `schema` from now on, if the copy was made without one.
     pub fn set_schema(&mut self, schema: Option<&str>) {
         if self.schema.is_none() && schema.is_some() {
@@ -231,8 +250,14 @@ impl Shadow {
         self.rebuilds += 1;
         let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut y = fresh(self.schema.as_deref());
-            if !self.base.is_empty() {
-                let _ = y.apply_state(&self.base);
+            if !self.base.is_empty()
+                && let Err(e) = y.apply_state(&self.base)
+            {
+                log::warn!(
+                    "collab: a shadow copy could not take its own base ({} bytes) on a rebuild: {e}; it starts empty and lets ops through unjudged",
+                    self.base.len()
+                );
+                self.empty_rebuilds += 1;
             }
             for op in &self.log {
                 // Each was admitted already, a snapshot under the state cap.
@@ -353,6 +378,32 @@ mod tests {
         shadow.rebuild();
         println!("COST rebuild after a panic: {:?}", t.elapsed());
         assert!(!shadow.is_waiting());
+    }
+
+    /// R3-M4: a rebuild whose base is past the state item cap leaves an empty copy (which
+    /// fails open), and says so: it is counted and logged, not silent.
+    #[test]
+    fn a_rebuild_that_cannot_take_its_base_is_counted() {
+        const BLOCKS: u32 = (1 << 22) + 1;
+        let mut base = vec![1];
+        let mut n = BLOCKS;
+        while n >= 0x80 {
+            base.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        base.push(n as u8);
+        base.extend([0x7f, 0]);
+        for _ in 0..BLOCKS {
+            base.extend([0, 1]);
+        }
+        base.push(0);
+        let mut shadow = Shadow::new(Some("wordcraft/1"));
+        shadow.rebuild();
+        assert_eq!(shadow.empty_rebuilds(), 0, "an empty base is not a lost one");
+        shadow.base = base;
+        shadow.rebuild();
+        assert_eq!(shadow.empty_rebuilds(), 1);
+        assert_eq!(shadow.rebuilds(), 2);
     }
 
     /// The shadow refuses an op its replica refuses, keeps going, and stays level with a replica
