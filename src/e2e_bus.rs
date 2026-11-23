@@ -391,10 +391,9 @@ async fn two_rejoins_after_a_power_cut_both_carry_on() {
     let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
     let mut b = Wire::join(&h.url, &room, "bob", Some(applied + 1)).await;
     assert_eq!(b.joined["history_lost"].as_bool(), Some(true), "{}", b.joined);
-    // Alice may have been closed by Bob's join and rejoined; either way the room carries on.
-    if left_the_room(&h, &room, "alice").await {
-        a = Wire::join(&h.url, &room, "alice", Some(joined_seq(&a))).await;
-    }
+    // Bob's join does not raise again (the margin already covers him): no second lift, so
+    // Alice stays connected.
+    assert!(!left_the_room(&h, &room, "alice").await, "bob's join lifted the room again and closed alice");
     let seq = a.ordered(4, text.insert(0, "y")).await;
     assert_eq!(seq, joined_seq(&a) + 1, "alice was left behind a gap: joined at {}, next op {seq}", joined_seq(&a));
     let heard = b.next("op").await;
@@ -455,4 +454,66 @@ async fn a_raise_does_not_strand_a_read_only_viewer() {
     assert!(left_the_room(&h, &room, "rita").await, "the viewer was left behind the raise");
     a.close().await;
     r.close().await;
+}
+
+/// N5: a power cut leaves the counter at 1 with A at 1 and B at 3 (B was a little ahead). The
+/// relay restarts. A rejoins first with nothing to raise past, and the rebuilt room numbers A's
+/// next ops 2 and 3 again; B then rejoins at 3. B holds different ops under 2 and 3, so it must
+/// not be replayed over them: it gets the lost history with the retained text (A's new ops).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_rebuild_after_a_power_cut_never_reuses_a_number() {
+    let Some(h) = start().await else { return };
+    let (room, a, mut text, applied) = three_edits(&h, "seq-rebuild").await;
+    assert_eq!(applied, 3);
+    a.close().await;
+    // Valkey restarted (so what it holds may trail) and lost the last two INCRs.
+    h.relay.bus.lock().await.forget_epoch(&room).await;
+    crash(&h, &room, 1).await;
+
+    let mut a = Wire::join(&h.url, &room, "alice", Some(1)).await;
+    let first = a.ordered(4, text.insert(0, "y")).await;
+    let second = a.ordered(5, text.insert(0, "y")).await;
+    assert!(first > applied && second > applied, "the rebuilt room reused pre-crash numbers: {first}, {second}");
+    let b = Wire::join(&h.url, &room, "bob", Some(applied)).await;
+    assert_eq!(b.joined["history_lost"].as_bool(), Some(true), "{}", b.joined);
+    assert_eq!(b.joined["fallback"].as_bool(), Some(true), "bob was replayed over the ops he holds: {}", b.joined);
+    a.close().await;
+    b.close().await;
+}
+
+/// N5's guard: a healthy room (Valkey never restarted) reopened after its idle close is an
+/// ordinary rejoin. Nothing is raised, nobody is told the history is lost by a lift, and the
+/// next op follows straight on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_healthy_room_reopened_after_idle_is_not_lifted() {
+    let Some(h) = start().await else { return };
+    let (room, a, mut text, applied) = three_edits(&h, "seq-idle").await;
+    a.close().await;
+    // The room is dropped after its grace period; the relay and Valkey both kept running.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.relay.rooms.lock().await.remove(&room);
+    let mut a = Wire::join(&h.url, &room, "alice", Some(applied)).await;
+    assert_eq!(joined_seq(&a), applied, "a healthy reopen moved the sequence: {}", a.joined);
+    assert_eq!(h.relay.bus.lock().await.current_seq(&room).await.expect("reads"), applied, "a healthy reopen raised the counter");
+    assert_eq!(a.ordered(4, text.insert(0, "y")).await, applied + 1);
+    a.close().await;
+}
+
+/// N6: Valkey is hard-killed under a live relay and comes back a little behind the live room.
+/// An editor that reconnects with what it applied (not past the live room) does not lift the
+/// room: nobody is disconnected and the next op follows the room's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn a_counter_trailing_a_live_room_does_not_lift_it() {
+    let Some(h) = start().await else { return };
+    let (room, mut a, mut text, last) = three_edits(&h, "seq-trailing").await;
+    h.relay.bus.lock().await.rewind_seq(&room, last - 2).await;
+    let b = Wire::join(&h.url, &room, "bob", Some(last)).await;
+    assert_eq!(joined_seq(&b), last, "the trailing counter lifted the live room: {}", b.joined);
+    assert!(!left_the_room(&h, &room, "alice").await, "alice was disconnected by a needless lift");
+    assert_eq!(a.ordered(4, text.insert(0, "y")).await, last + 1);
+    a.close().await;
+    b.close().await;
 }

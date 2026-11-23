@@ -252,6 +252,83 @@ impl Bus {
         }
     }
 
+    /// The sequence for a join that rebuilds the room (none in this relay's memory), raised when
+    /// the counter cannot be trusted. Returns the counter after it, and whether it was raised.
+    ///
+    /// A counter can trail what was handed out only when Valkey restarted since (a power cut or
+    /// a hard kill inside the `everysec` window, a wiped volume). A rebuilt room numbering on
+    /// from a trailing counter hands out numbers again that replicas from before the restart
+    /// still hold for other ops, and a replica rejoining at one of them would be replayed over
+    /// it in silence. So each room records which Valkey run (`INFO server` `run_id`) it was last
+    /// rebuilt under, next to its counter. When that differs from the current run (Valkey
+    /// restarted since, or the record is gone with the rest), the counter is raised to
+    /// `max(counter, claimed) + SEQ_RAISE_MARGIN` (when either is above 0): every number from
+    /// before the restart then lies below where the room starts, and every replica from before
+    /// it rejoins through the lost history. A room rebuilt under the same run (a reopen after
+    /// the idle close, a relay restart beside a healthy Valkey) is raised only as a live one
+    /// is: when `claimed` is past the counter.
+    pub async fn rebuild_seq(&mut self, room: &str, claimed: u64) -> Result<(u64, bool), BusError> {
+        const SCRIPT: &str = r#"
+            local raw = redis.call('GET', KEYS[1])
+            local counter = 0
+            if raw and string.match(raw, '^%d+$') then counter = tonumber(raw) end
+            local claimed = tonumber(ARGV[1])
+            local margin = tonumber(ARGV[2])
+            local run = ARGV[3]
+            local ceiling = tonumber(ARGV[5])
+            local target = nil
+            if redis.call('GET', KEYS[2]) ~= run then
+                local base = math.max(counter, claimed)
+                if base > 0 then target = base + margin end
+                redis.call('SET', KEYS[2], run, 'EX', ARGV[4])
+            elseif claimed > counter then
+                target = claimed + margin
+            end
+            if target and target > ceiling then target = ceiling end
+            if target and target > counter then
+                redis.call('SET', KEYS[1], string.format('%d', target))
+                redis.call('EXPIRE', KEYS[1], ARGV[4])
+                return {target, 1}
+            end
+            return {counter, 0}
+        "#;
+        let run = self.run_id().await?;
+        let seq_key = format!("{PREFIX}:doc:{}:seq", encode_key(room));
+        let epoch_key = format!("{PREFIX}:doc:{}:epoch", encode_key(room));
+        let claimed = claimed.min(MAX_SEQ_CLAIM);
+        match redis::Script::new(SCRIPT)
+            .key(&seq_key)
+            .key(&epoch_key)
+            .arg(claimed)
+            .arg(SEQ_RAISE_MARGIN)
+            .arg(&run)
+            .arg(SEQ_TTL.as_secs() as i64)
+            .arg(MAX_SEQ_FLOOR)
+            .invoke_async::<(u64, i64)>(&mut self.conn)
+            .await
+        {
+            Ok((seq, raised)) => Ok((seq, raised == 1)),
+            Err(e) if is_readonly(&e) => Err(BusError::ReadOnlyReplica),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The current Valkey run's id (`INFO server` `run_id`): new on every Valkey start.
+    async fn run_id(&mut self) -> Result<String, BusError> {
+        let info: String = redis::cmd("INFO").arg("server").query_async(&mut self.conn).await?;
+        info.lines().find_map(|line| line.strip_prefix("run_id:")).map(|id| id.trim().to_owned()).ok_or_else(|| {
+            BusError::Redis(redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, "INFO server names no run_id")))
+        })
+    }
+
+    /// Mark the room as last rebuilt under another Valkey run, as a Valkey restart does, for a
+    /// test of the rebuild raise.
+    #[cfg(test)]
+    pub async fn forget_epoch(&mut self, room: &str) {
+        let key = format!("{PREFIX}:doc:{}:epoch", encode_key(room));
+        let _: Result<(), _> = self.conn.set(&key, "a-previous-run").await;
+    }
+
     /// Raise a document's sequence counter to at least `floor`, without handing out a number.
     ///
     /// For a rejoin that has applied more than the counter holds ([`MAX_SEQ_FLOOR`] bounds

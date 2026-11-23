@@ -885,16 +885,33 @@ async fn on_connect(socket: SocketRef, Data(handshake): Data<Handshake>, State(r
     // below [`bus::MAX_SEQ_FLOOR`]) is refused, and the join is then a fresh load.
     let applied = handshake.applied.filter(|&applied| applied <= bus::MAX_SEQ_CLAIM);
     let claimed = if claims.may_edit() { applied.unwrap_or(0) } else { 0 };
+    //
+    // Which join may raise, and from what (fix round 3):
+    //
+    // * A join that rebuilds the room (none in memory) asks the bus, which also raises when
+    //   Valkey restarted since the room was last rebuilt ([`Bus::rebuild_seq`]): the counter
+    //   may then trail numbers replicas from before the restart still hold, even when this
+    //   joiner claims nothing past it.
+    // * A join to a live room raises only when the claim is past both the counter and the live
+    //   room's own sequence. The live room holds the true sequence, so a counter that merely
+    //   trails it (Valkey hard-killed under a running relay) is healed by the next `next_seq`
+    //   and needs no lift.
+    let live_seq = relay.rooms.lock().await.get(&room_key).map(Room::seq);
     let (retained_seq, raised) = {
         let mut bus = relay.bus.lock().await;
-        let read = match bus.current_seq(&room_key).await {
-            Ok(seq) if claimed > seq => {
-                tracing::warn!(room = %room_key, counter = seq, applied = claimed, "a rejoin applied past the sequence counter; raising it");
-                let target = claimed + bus::SEQ_RAISE_MARGIN;
-                bus.raise_seq(&room_key, target).await.map(|raised| (raised.max(target), true))
-            }
-            other => other.map(|seq| (seq, false)),
+        let read = match live_seq {
+            None => bus.rebuild_seq(&room_key, claimed).await,
+            Some(live) => match bus.current_seq(&room_key).await {
+                Ok(seq) if claimed > seq && claimed > live => {
+                    let target = claimed + bus::SEQ_RAISE_MARGIN;
+                    bus.raise_seq(&room_key, target).await.map(|raised| (raised.max(target), true))
+                }
+                other => other.map(|seq| (seq, false)),
+            },
         };
+        if let Ok((seq, true)) = read {
+            tracing::warn!(room = %room_key, seq, applied = claimed, rebuilt = live_seq.is_none(), "the sequence counter could not be trusted; raised it");
+        }
         match read {
             Ok(read) => read,
             Err(e) => {
