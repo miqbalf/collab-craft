@@ -35,6 +35,10 @@
 //! One yrs `UndoManager` over both roots, tracking only transactions this replica made through
 //! its own edit methods. Updates that arrive through [`LiveDoc::apply`] are never undone. Every
 //! local edit is its own undo step. A `set_client` starts a fresh history.
+//!
+//! Undoing an edit that inserted a block (a paste's new paragraph, the tail of an Enter) takes
+//! the whole block away, with any text another replica has typed in it since.
+//! [`LiveDoc::undo_takes_others_text`] finds that before the undo runs, so the app can refuse it.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -43,8 +47,8 @@ use serde_json::{Map, Value};
 use yrs::types::text::YChange;
 use yrs::types::{Attrs, Event, PathSegment};
 use yrs::{
-    Any, Array, ArrayRef, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Text, TextPrelim, TextRef, Transact,
-    TransactionMut,
+    Any, Array, ArrayRef, BranchID, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Snapshot, Text, TextPrelim,
+    TextRef, Transact, TransactionMut,
 };
 
 use crate::replica::{REMOTE, Replica, YReplica, byte_at, byte_span, integrate, put_sorted, to_any, to_json};
@@ -405,6 +409,40 @@ impl LiveDoc {
         self.y.redo()
     }
 
+    /// Whether undoing the newest `steps` local edits would take away another replica's text:
+    /// one of those edits inserted a block in the order (a paste's new paragraph, the tail of an
+    /// Enter) and another replica has typed in it since. Undo removes such a block whole, so
+    /// the app refuses that undo. Typing in a block the undo keeps does not count, because
+    /// undo takes back only this replica's own characters there. Asking changes nothing.
+    #[must_use]
+    pub fn undo_takes_others_text(&self, steps: usize) -> bool {
+        let Some(me) = self.y.client().map(|space| yrs::block::ClientID::new(u64::from(space))) else {
+            return false;
+        };
+        let made = self.y.undo_insertions(steps);
+        if made.is_empty() {
+            return false;
+        }
+        // Not a local edit: no origin, so the undo manager does not track it, and it changes
+        // nothing (the diff below only splits items at the snapshots).
+        let mut txn = self.y.doc().transact_mut();
+        let texts: Vec<TextRef> = order_of(&txn, &self.body, &self.blocks)
+            .into_iter()
+            .filter_map(|id| match self.blocks.get(&txn, &key(id)) {
+                Some(Out::YMap(block)) => match AsRef::<yrs::branch::Branch>::as_ref(&block).id() {
+                    // The block's own entry was one of the edits' insertions.
+                    BranchID::Nested(entry) if made.iter().any(|set| set.contains(&entry)) => text_of(&txn, &block),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // Every visible character, tagged with the item (and so the client) that wrote it.
+        let now = txn.snapshot();
+        let never = Snapshot::default();
+        texts.iter().any(|t| t.diff_range(&mut txn, Some(&now), Some(&never), |c| c.id.client).iter().any(|d| d.ychange.is_some_and(|c| c != me)))
+    }
+
     /// The whole document as one update (v1), for a checkpoint or a peer starting from nothing.
     #[must_use]
     pub fn state(&self) -> Vec<u8> {
@@ -483,6 +521,9 @@ impl Replica for LiveDoc {
     }
     fn damaged(&self) -> bool {
         LiveDoc::damaged(self)
+    }
+    fn undo_takes_others_text(&self, steps: usize) -> bool {
+        LiveDoc::undo_takes_others_text(self, steps)
     }
 }
 

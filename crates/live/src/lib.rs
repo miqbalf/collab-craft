@@ -145,6 +145,9 @@ const HISTORY_WAIT_MS: f64 = 20_000.0;
 /// The same without a clock, in frames.
 const HISTORY_WAIT_FRAMES: u32 = 1200;
 const AFTER_UNDO: &str = "An edit made right after Undo was not kept. Please make it again.";
+/// An Undo refused because it would remove what another editor typed
+/// ([`craft_collab::LiveDoc::undo_takes_others_text`]). The undo step stays.
+pub const UNDO_TAKES_OTHERS: &str = "Someone else has typed in what this Undo would remove, so it wasn't undone.";
 /// The service closed the room: nothing saves edits made in it any more.
 const CLOSED: &str = "The live session ended. Reopen the file to keep editing.";
 
@@ -895,6 +898,12 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             drop(s);
             let why = self.not_editable();
             self.notices.push(why);
+            return;
+        }
+        // Undo never takes away another editor's text: the step stays, nothing changes.
+        if !redo && self.live.undo_takes_others_text(steps) {
+            lock(&self.shared).undo.push(steps);
+            self.notices.push(UNDO_TAKES_OTHERS.to_owned());
             return;
         }
         let mut done = 0;
