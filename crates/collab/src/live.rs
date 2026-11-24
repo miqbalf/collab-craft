@@ -740,6 +740,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
             self.catchup = None;
             self.text_catchup = false;
         }
+        if !self.joined_once && seq == 0 && !self.text_catchup && !history_lost {
+            // A room that never saved: every replica starts from the same file and nothing in
+            // the catch-up can restart one (only a join past a save starts from a snapshot),
+            // so this replica is the room's already. Settled now, a rejoin never re-arms a
+            // restart, and an edit made while the link is down is safe before any op arrived.
+            self.settled = true;
+        }
         self.marked = replay_until.is_some();
         self.since_join.clear();
         // Pieces of an earlier catch-up that never finished are abandoned: the relay sends the

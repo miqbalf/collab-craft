@@ -402,3 +402,21 @@ fn a_renewed_ticket_switches_links_without_a_drop() {
     assert_eq!(peers.len(), 1, "one Alice in the room after the switch: {peers:?}");
     assert!(a.le.take_notices().iter().all(|n| !n.contains("econnect")), "the user saw no reconnect");
 }
+
+/// LP2: a window that has shared nothing yet (no edit from anyone) keeps typing across a drop
+/// too: in a room that never saved, the first join is settled at once.
+#[test]
+fn typing_at_a_drop_before_any_edit_is_kept() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert!(a.le.editable(), "{:?}", a.le.status());
+    a.set(1, "first words");
+    relay.restore_link(a.le.hub());
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "first words");
+    assert_eq!(a.line(1), "first words");
+}
