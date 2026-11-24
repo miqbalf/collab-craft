@@ -75,11 +75,36 @@ pub const FENCED: &str = "fenced";
 pub const CRDT_POS: &str = "crdt.pos";
 
 /// Who is in a document.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     pub peer: PeerId,
     /// Shown in the UI. A display name, not an identity.
     pub display: String,
+    /// What the member's ticket lets it do. Absent from an older relay's roster, and then read
+    /// as [`PeerAccess::Edit`], as every member was shown before.
+    #[serde(default)]
+    pub access: PeerAccess,
+}
+
+/// What a member of a document may do, as the relay knows it from the member's ticket: `"edit"`
+/// or `"view"` on the wire. A value this client does not know (a later relay's) reads as
+/// [`PeerAccess::Edit`], as a missing one does, so a roster never fails to parse over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerAccess {
+    View,
+    // Last: serde's catch-all for an unknown value must be the last variant.
+    #[default]
+    #[serde(other)]
+    Edit,
+}
+
+impl PeerAccess {
+    /// From the relay's own flag for a member.
+    #[must_use]
+    pub fn from_may_edit(may_edit: bool) -> PeerAccess {
+        if may_edit { PeerAccess::Edit } else { PeerAccess::View }
+    }
 }
 
 /// The lock an ordered edit is made under: the scope, and the fencing token of the grant

@@ -288,7 +288,11 @@ impl Hub for MemHub {
 
 impl Relay {
     fn roster(&self) -> Vec<Presence> {
-        self.conns.iter().filter(|c| c.connected).map(|c| Presence { peer: c.pid.clone(), display: c.display.clone() }).collect()
+        self.conns
+            .iter()
+            .filter(|c| c.connected)
+            .map(|c| Presence { peer: c.pid.clone(), display: c.display.clone(), access: craft_collab::PeerAccess::from_may_edit(c.may_edit) })
+            .collect()
     }
 
     fn join(&mut self, at: usize) {

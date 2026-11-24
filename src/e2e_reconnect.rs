@@ -344,7 +344,7 @@ async fn e2e_a_stale_socket_closing_late_leaves_the_peer_in_the_room() {
     let doc = format!("doc:{room}");
     let mut a = LivePeer::open(&url, &ticket(&room, "alice", now()), &doc, "hello").await;
     let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
-    assert!(b.until(Duration::from_secs(5), |live, _| live.roster.iter().any(|(p, _)| p == "alice")).await);
+    assert!(b.until(Duration::from_secs(5), |live, _| live.roster.iter().any(|p| p.peer == "alice")).await);
 
     hole.notify_one();
     assert!(a.until(Duration::from_secs(20), |live, _| !live.hub().connected()).await, "the half-open link was never noticed");
@@ -355,11 +355,11 @@ async fn e2e_a_stale_socket_closing_late_leaves_the_peer_in_the_room() {
     let reaped = tokio::time::Instant::now() + Duration::from_secs(40);
     while h.io.sockets().len() > 2 && tokio::time::Instant::now() < reaped {
         b.until(Duration::from_millis(100), |_, _| false).await;
-        assert!(b.live.roster.iter().any(|(p, _)| p == "alice"), "bob was told alice left");
+        assert!(b.live.roster.iter().any(|p| p.peer == "alice"), "bob was told alice left");
     }
     assert_eq!(h.io.sockets().len(), 2, "the stale socket was reaped");
     b.until(Duration::from_millis(500), |_, _| false).await;
-    assert!(b.live.roster.iter().any(|(p, _)| p == "alice"), "bob was told alice left");
+    assert!(b.live.roster.iter().any(|p| p.peer == "alice"), "bob was told alice left");
     let peers: Vec<String> = h.relay.rooms.lock().await.get(&room).map(|r| r.peers().iter().map(|p| p.peer.clone()).collect()).unwrap_or_default();
     assert!(peers.contains(&"alice".to_owned()), "the relay dropped alice: {peers:?}");
 

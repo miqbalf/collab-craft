@@ -196,6 +196,10 @@ pub struct Peer<P> {
     pub color_seed: u64,
     /// Where the caret is, kept on the same content through edits.
     pub caret: Option<P>,
+    /// What the peer's ticket lets it do, as the relay says: [`Access::Read`] for a member who
+    /// only views (a host may label it "viewing"). [`Access::Edit`] when the relay does not say
+    /// (an older relay).
+    pub access: Access,
 }
 
 /// A checkpoint's outcome, for the saver.
@@ -1313,7 +1317,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// Count how long the link has been live with no document service in the room.
     fn watch_saver(&mut self) {
         let service = &self.service_uid;
-        if self.live.roster.iter().any(|(id, _)| uid_of(id) == service) {
+        if self.live.roster.iter().any(|p| uid_of(&p.peer) == service) {
             self.saver_wait = None;
             self.saver_missing = false;
             return;
@@ -1409,15 +1413,19 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// The other editors, without the document service, with their carets.
     fn roster(&mut self) -> Vec<Peer<K::Pos>> {
         let roster = &self.live.roster;
-        self.carets.retain(|id, _| roster.iter().any(|(p, _)| p == id));
+        self.carets.retain(|id, _| roster.iter().any(|p| &p.peer == id));
         roster
             .iter()
-            .filter(|(id, _)| uid_of(id) != self.service_uid)
-            .map(|(id, display)| Peer {
-                id: id.clone(),
-                display: display.clone(),
-                color_seed: fnv(uid_of(id)),
-                caret: self.carets.get(id).map(K::pos),
+            .filter(|p| uid_of(&p.peer) != self.service_uid)
+            .map(|p| Peer {
+                id: p.peer.clone(),
+                display: p.display.clone(),
+                color_seed: fnv(uid_of(&p.peer)),
+                caret: self.carets.get(&p.peer).map(K::pos),
+                access: match p.access {
+                    craft_collab::PeerAccess::Edit => Access::Edit,
+                    craft_collab::PeerAccess::View => Access::Read,
+                },
             })
             .collect()
     }

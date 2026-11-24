@@ -122,12 +122,19 @@ pub struct Op {
 pub struct Peer {
     pub peer: String,
     pub display: String,
-    /// Whether this peer may submit. A reader joins and watches.
-    #[serde(skip)]
+    /// Whether this peer may submit. A reader joins and watches. Sent in the roster as
+    /// `access`, `"edit"` or `"view"` ([`craft_collab::PeerAccess`]), so the others can label a
+    /// member who only views; a client from before reads a missing one as edit.
+    #[serde(rename = "access", serialize_with = "access_on_the_wire")]
     pub may_edit: bool,
     /// The ticket's user, for [`MAX_PEERS_PER_UID`]. Never sent: the roster names peers.
     #[serde(skip)]
     pub uid: String,
+}
+
+/// [`Peer::may_edit`] as the roster sends it.
+fn access_on_the_wire<S: serde::Serializer>(may_edit: &bool, s: S) -> Result<S::Ok, S::Error> {
+    craft_collab::PeerAccess::from_may_edit(*may_edit).serialize(s)
 }
 
 /// One peer's offered edit, before the relay has ordered it.
@@ -979,6 +986,21 @@ pub(crate) fn value_bytes(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C13: the roster says what each member may do, `"view"` for a reader, and never sends
+    /// the ticket's user id.
+    #[test]
+    fn the_roster_sends_each_members_access() {
+        let reader = Peer { peer: "v~1".to_owned(), display: "V".to_owned(), may_edit: false, uid: "v".to_owned() };
+        let editor = Peer { may_edit: true, peer: "e~1".to_owned(), ..reader.clone() };
+        let json = serde_json::to_value([&editor, &reader]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{ "peer": "e~1", "display": "V", "access": "edit" }, { "peer": "v~1", "display": "V", "access": "view" }])
+        );
+        let parsed: Vec<craft_collab::Presence> = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed[1].access, craft_collab::PeerAccess::View);
+    }
 
     fn peer(id: &str) -> Peer {
         Peer { peer: id.to_owned(), display: id.to_owned(), may_edit: true, uid: id.to_owned() }

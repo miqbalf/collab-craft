@@ -241,6 +241,31 @@ async fn e2e_an_edit_refused_for_a_transient_bus_failure_is_sent_again() {
     assert!(b.until(Duration::from_secs(5), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == ">hello!")).await);
 }
 
+/// C13: through the relay, a member whose ticket only lets it view is on the others' roster as
+/// view, and an editor as edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_view_only_member_is_on_the_roster_as_view() {
+    use craft_collab::PeerAccess;
+    let Some(h) = start().await else { return };
+    let room = unique_room("access");
+    let doc = format!("doc:{room}");
+    let mut a = LivePeer::open(&h.url, &ticket(&room, "alice", now()), &doc, "hello").await;
+    let view = crate::token::sign_at(SECRET, &room, "vera", "Vera", false, "vera", now()).unwrap();
+    let mut v = LivePeer::connect(&h.url, &view, &doc).await;
+    let sees = |live: &craft_collab::Live<craft_collab::native::NativeHub>, who: &str, access: PeerAccess| {
+        live.roster.iter().any(|p| p.peer == who && p.access == access)
+    };
+    assert!(
+        until_both(&mut a, &mut v, Duration::from_secs(10), |a, v| sees(&a.live, "vera", PeerAccess::View)
+            && sees(&v.live, "alice", PeerAccess::Edit))
+        .await,
+        "alice sees {:?}; vera sees {:?}",
+        a.live.roster,
+        v.live.roster
+    );
+}
+
 /// C7d review D-1: an op the bus could not number is rolled back out of the room's shadow copy
 /// with the relay-wide bus lock released, so other rooms' bus calls do not wait for the
 /// rebuild. The rollback hook checks that the bus lock can be taken while the rollback runs.

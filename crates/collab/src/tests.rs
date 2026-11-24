@@ -13,7 +13,7 @@ fn joined(seq: u64) -> ServerMsg {
         peer: "me".to_owned(),
         seq,
         space: 7,
-        roster: vec![Presence { peer: "me".to_owned(), display: "Alice".to_owned() }],
+        roster: vec![Presence { peer: "me".to_owned(), display: "Alice".to_owned(), ..Presence::default() }],
         locks: Vec::new(),
         replay_until: None,
         fallback: false,
@@ -371,11 +371,35 @@ fn request_and_join_messages_carry_the_document() {
 
 // ---- presence and notices --------------------------------------------------
 
+/// C13: a roster entry says what the member may do. One without `access` (an older relay) and
+/// one with a value this client does not know both read as edit; `"view"` reads as view, and
+/// the field goes out as `"edit"` or `"view"`.
+#[test]
+fn a_roster_entry_says_edit_or_view_and_an_old_one_reads_as_edit() {
+    use crate::proto::PeerAccess;
+    let old: Presence = serde_json::from_value(serde_json::json!({ "peer": "a~1", "display": "A" })).unwrap();
+    assert_eq!(old.access, PeerAccess::Edit);
+    let later: Presence = serde_json::from_value(serde_json::json!({ "peer": "a~1", "display": "A", "access": "comment" })).unwrap();
+    assert_eq!(later.access, PeerAccess::Edit);
+    let viewer: Presence = serde_json::from_value(serde_json::json!({ "peer": "v~1", "display": "V", "access": "view" })).unwrap();
+    assert_eq!(viewer.access, PeerAccess::View);
+    assert_eq!(serde_json::to_value(&viewer).unwrap()["access"], "view");
+    assert_eq!(serde_json::to_value(&old).unwrap()["access"], "edit");
+    let msg: ServerMsg = serde_json::from_value(serde_json::json!({
+        "t": "presence", "doc": DOC, "roster": [{ "peer": "a~1", "display": "A" }, { "peer": "v~1", "display": "V", "access": "view" }]
+    }))
+    .unwrap();
+    let ServerMsg::Presence { roster, .. } = msg else { panic!("{msg:?}") };
+    assert_eq!(roster.iter().map(|p| p.access).collect::<Vec<_>>(), vec![PeerAccess::Edit, PeerAccess::View]);
+}
+
 #[test]
 fn presence_updates_the_roster() {
     let mut s = session();
-    let roster =
-        vec![Presence { peer: "me".to_owned(), display: "Alice".to_owned() }, Presence { peer: "bob".to_owned(), display: "Bob".to_owned() }];
+    let roster = vec![
+        Presence { peer: "me".to_owned(), display: "Alice".to_owned(), ..Presence::default() },
+        Presence { peer: "bob".to_owned(), display: "Bob".to_owned(), ..Presence::default() },
+    ];
     let out = s.handle(ServerMsg::Presence { doc: DOC.to_owned(), roster: roster.clone() });
     assert_eq!(out, vec![Effect::Roster { roster: roster.clone() }]);
     assert_eq!(s.roster(), roster.as_slice());

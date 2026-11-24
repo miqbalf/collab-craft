@@ -549,9 +549,9 @@ pub struct Live<H, R: Replica = LiveDoc> {
     told_damaged: bool,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
-    /// Who else is in the document. The identifier comes with the name because a badge's
-    /// colour is derived from it.
-    pub roster: Vec<(String, String)>,
+    /// Who else is in the document: the relay's peer id (a badge's colour is derived from it),
+    /// the display name, and what the member may do ([`PeerAccess`](crate::PeerAccess)).
+    pub roster: Vec<crate::Presence>,
     was_connected: bool,
 }
 
@@ -2061,7 +2061,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
             Effect::LockRefused { scope, holder } => work.push(Work::Lock(LockEvent::Denied { scope, holder })),
             Effect::Roster { roster } => {
                 let me = self.wire.me().cloned();
-                self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).map(|p| (p.peer.to_string(), p.display)).collect();
+                self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).collect();
             }
             Effect::Notice { detail } => {
                 log::info!("collab: {detail}");

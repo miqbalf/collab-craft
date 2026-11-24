@@ -1863,3 +1863,18 @@ fn a_failed_ask_is_asked_again_on_the_rejoin() {
     q.ask_failed();
     assert_eq!(q.rejoined(3.0), vec![Action::SendLock], "the item would wait for a request that never went out");
 }
+
+/// C13: a member who may only view is seen as viewing by its peers, and an editor as editing.
+#[test]
+fn a_view_only_member_is_seen_as_view_by_its_peers() {
+    let relay = MemRelay::new();
+    let mut editor = Window::join(&relay, "alice", Access::Edit);
+    let mut viewer = Window::join(&relay, "bob", Access::Read);
+    settle(&mut [&mut editor, &mut viewer]);
+    let seen_by_editor = editor.pump();
+    let bob = seen_by_editor.iter().find(|p| p.id.starts_with("bob~")).expect("bob is on alice's roster");
+    assert_eq!(bob.access, Access::Read, "{seen_by_editor:?}");
+    let seen_by_viewer = viewer.pump();
+    let alice = seen_by_viewer.iter().find(|p| p.id.starts_with("alice~")).expect("alice is on bob's roster");
+    assert_eq!(alice.access, Access::Edit, "{seen_by_viewer:?}");
+}
