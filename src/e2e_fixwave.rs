@@ -241,6 +241,41 @@ async fn e2e_an_edit_refused_for_a_transient_bus_failure_is_sent_again() {
     assert!(b.until(Duration::from_secs(5), |live, _| live.doc().and_then(|d| d.block(0)).is_some_and(|p| p.text == ">hello!")).await);
 }
 
+/// C7d review D-1: an op the bus could not number is rolled back out of the room's shadow copy
+/// with the relay-wide bus lock released, so other rooms' bus calls do not wait for the
+/// rebuild. The rollback hook checks that the bus lock can be taken while the rollback runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_rollback_after_a_bus_failure_does_not_hold_the_bus() {
+    let Some(h) = start().await else { return };
+    let (probed, free) =
+        (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let relay = std::sync::Arc::downgrade(&h.relay);
+    let (p, f) = (probed.clone(), free.clone());
+    let set = h.relay.gates.rollback_hook.set(Box::new(move || {
+        let Some(relay) = relay.upgrade() else { return };
+        // Another call may hold the bus for a moment; this submit's own hold never ends here.
+        let took = (0..200).any(|_| {
+            relay.bus.try_lock().is_ok() || {
+                std::thread::sleep(Duration::from_millis(1));
+                false
+            }
+        });
+        f.store(took, Ordering::SeqCst);
+        p.store(true, Ordering::SeqCst);
+    }));
+    assert!(set.is_ok());
+    let room = unique_room("rollback-bus");
+    let doc = format!("doc:{room}");
+    let mut a = LivePeer::open(&h.url, &ticket(&room, "alice", now()), &doc, "hello").await;
+    let mut b = LivePeer::open(&h.url, &ticket(&room, "bob", now()), &doc, "hello").await;
+    h.relay.bus.lock().await.fail_next_seq = 1;
+    a.insert(5, "!");
+    assert!(until_both(&mut a, &mut b, Duration::from_secs(10), |_, b| b.text() == "hello!").await, "bob has {:?}", b.text());
+    assert!(probed.load(Ordering::SeqCst), "the refused op was not rolled back out of a copy");
+    assert!(free.load(Ordering::SeqCst), "the rollback ran with the bus lock held");
+}
+
 /// I4: an editor naming a fresh scope per edit used to make the catch-up larger than the
 /// socket's buffer, and every join was cut and retried for ever. With the scope cap the
 /// fresh joiner gets in on its first connection.

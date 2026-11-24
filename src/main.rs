@@ -401,11 +401,17 @@ struct Gates {
     /// Tests: how many gates [`make_room`] has looked at.
     #[cfg(test)]
     scanned: std::sync::atomic::AtomicUsize,
+    /// Tests: called by [`unadmit`] as its rollback starts.
+    #[cfg(test)]
+    rollback_hook: std::sync::OnceLock<RollbackHook>,
 }
 
 /// Tests: see [`Gates::scan_hook`].
 #[cfg(test)]
 type ScanHook = Box<dyn Fn(&Gates) + Send + Sync>;
+/// Tests: see [`Gates::rollback_hook`].
+#[cfg(test)]
+type RollbackHook = Box<dyn Fn() + Send + Sync>;
 
 impl Default for Gates {
     fn default() -> Self {
@@ -430,6 +436,8 @@ impl Gates {
             scan_hook: None,
             #[cfg(test)]
             scanned: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            rollback_hook: std::sync::OnceLock::new(),
         }
     }
 
@@ -840,6 +848,10 @@ fn account(gates: &Gates, gate: &mut Gate, shadow: &Shadow) {
 /// milliseconds or more.
 async fn unadmit(gates: &Gates, gate: &mut Gate, mark: Option<Mark>) {
     if let (Some(mark), Some(mut shadow)) = (mark, gate.shadow.take()) {
+        #[cfg(test)]
+        if let Some(hook) = gates.rollback_hook.get() {
+            hook();
+        }
         let rolled = tokio::task::spawn_blocking(move || {
             let empty_before = shadow.empty_rebuilds();
             shadow.rollback(mark);
@@ -1897,18 +1909,19 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         let rooms = relay.rooms.lock().await;
         rooms.get(&claims.rm).map(Room::seq).unwrap_or(0)
     };
-    let seq = {
-        let mut bus = relay.bus.lock().await;
-        match bus.next_seq(&claims.rm, floor).await {
-            Ok(s) => s,
-            Err(e) => {
-                unadmit(&relay.gates, &mut ordered, mark).await;
-                drop(ordered);
-                tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
-                let _ = socket
-                    .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
-                return;
-            }
+    // The bus lock is relay-wide, so it is released before a refused op is rolled back out of
+    // the copy (C7d review D-1): the rollback is a rebuild, and every room's sequence, raise,
+    // lock and the bus reconnect would wait behind it. The room's gate stays held.
+    let numbered = relay.bus.lock().await.next_seq(&claims.rm, floor).await;
+    let seq = match numbered {
+        Ok(s) => s,
+        Err(e) => {
+            unadmit(&relay.gates, &mut ordered, mark).await;
+            drop(ordered);
+            tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
+            let _ = socket
+                .emit("error", &ErrorMsg { doc: room_name, detail: "relay could not order that edit".to_owned(), local, code: Some(CODE_RETRY) });
+            return;
         }
     };
 
