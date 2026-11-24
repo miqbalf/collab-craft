@@ -242,6 +242,42 @@ async fn shadow_round(schema: Option<&str>) {
     assert_eq!(after - before, want_ops as u64, "a refused op burned a sequence number");
 }
 
+/// C14: a room joined as a GridCraft build (`"gridcraft/1_abc"`, GridCraft ruling R1) gets the
+/// typed GridCraft copy: a string straight in the `sheets` array, which GridCraft's replicas
+/// cannot read back, is refused as invalid and orders nothing. A room of another version
+/// (`"gridcraft/10_x"`) gets the untyped copy, which takes it, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs REVIEW_VALKEY_URL"]
+async fn e2e_a_gridcraft_build_gets_the_typed_copy() {
+    assert!(sheets_round(Some("gridcraft/1_abc")).await, "gridcraft/1_abc took a string in sheets");
+    assert!(sheets_round(Some("gridcraft/1")).await, "gridcraft/1 took a string in sheets");
+    assert!(!sheets_round(Some("gridcraft/10_x")).await, "gridcraft/10_x was typed as gridcraft/1");
+}
+
+/// Join a fresh room as `schema` and send a string straight in `sheets`; whether the relay
+/// refused it as invalid (and ordered nothing), or ordered it.
+async fn sheets_round(schema: Option<&str>) -> bool {
+    use base64::Engine as _;
+    let Some(h) = start().await else { return false };
+    let room = unique_room("grid-build");
+    let mut alice = connect(&h.url, &room, "alice", schema).await;
+    let seen = answer(&mut alice).await;
+    let doc = seen.iter().find_map(|m| matches!(m, ServerMsg::Joined { .. }).then(|| m.doc().to_owned())).expect("joined");
+    let string_in_sheets = [1, 1, 50, 0, 0x04, 1, 6, b's', b'h', b'e', b'e', b't', b's', 2, 0xc3, 0xa9, 0];
+    assert!(craft_collab::update_is_sound(&string_in_sheets), "the gate alone takes it");
+    let before = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+    alice.send(text_op(&doc, 1, &base64::engine::general_purpose::STANDARD.encode(string_in_sheets))).unwrap();
+    let heard = listen(&mut alice, 1500).await;
+    let after = h.relay.rooms.lock().await.get(&room).map_or(0, crate::room::Room::seq);
+    let refused = heard.iter().any(|m| matches!(m, ServerMsg::Error { local: Some(1), code: Some(c), .. } if c == "invalid"));
+    if refused {
+        assert_eq!(after, before, "a refused op burned a sequence number: {heard:?}");
+    } else {
+        assert_eq!(after, before + 1, "neither refused nor ordered: {heard:?}");
+    }
+    refused
+}
+
 /// The copy holds only what the room records, and judges the document scope whatever other
 /// scopes a peer invents. An editor's op that the room refuses after the copy (here: past the
 /// room's size limit, which only the room reads, with the padding outside the ops) once stayed

@@ -58,12 +58,26 @@ pub struct Mark {
 
 /// The roots a replica schema types, as (name, is a map). A root the schema does not name stays
 /// untyped in the copy, and the `fits` check then lets anything under it through.
+///
+/// Matched on the schema's family and version: the whole string, or the part before its first
+/// `_`. So `"gridcraft/1"` and `"gridcraft/1_<build>"` (GridCraft ruling R1; DeckCraft names
+/// `"deckcraft/1_<build>"` the same way) type the same roots, and the relay still pins a room to
+/// the full string, so it never mixes builds. Never a bare prefix: `"gridcraft/10"` and
+/// `"gridcraft/10_x"` are version 10, not 1. The rule is the same for every family; an unknown
+/// family or version stays untyped, as before.
 fn roots(schema: Option<&str>) -> &'static [(&'static str, bool)] {
-    match schema {
+    match schema.map(family) {
         Some("wordcraft/1") => &[("body", false), ("blocks", true)],
         Some("gridcraft/1") => &[("meta", true), ("sheets", false), ("sheet", true), ("styles", true), ("ops", false)],
         _ => &[],
     }
+}
+
+/// A replica schema's family and version: the name up to its first `_`, or all of it. `"gridcraft/1"`
+/// for `"gridcraft/1_abc"` and for `"gridcraft/1"` itself; `"gridcraft/10"` for
+/// `"gridcraft/10_x"`.
+fn family(schema: &str) -> &str {
+    schema.split_once('_').map_or(schema, |(family, _)| family)
 }
 
 fn fresh(schema: Option<&str>) -> YReplica {
@@ -451,6 +465,54 @@ mod tests {
         assert!(!shadow.is_waiting(), "the checkpoint waits");
         let back = LiveDoc::from_state(&shadow.state()).unwrap();
         assert_eq!(back.block(71).unwrap().text, "x".repeat(30));
+    }
+
+    /// C14: the roots are typed by the schema's family and version (before the first `_`), so
+    /// every build of GridCraft 1 gets the typed copy; another version or an unknown family
+    /// stays untyped; WordCraft and DeckCraft are typed as before.
+    #[test]
+    fn the_roots_follow_the_schema_family_and_version() {
+        let grid = roots(Some("gridcraft/1"));
+        assert!(!grid.is_empty());
+        assert_eq!(roots(Some("gridcraft/1_abc")), grid, "a GridCraft build string");
+        assert_eq!(roots(Some("gridcraft/1_")), grid);
+        for untyped in [
+            Some("gridcraft/2_x"),
+            Some("gridcraft/2"),
+            Some("gridcraft/10"),
+            Some("gridcraft/10_x"),
+            Some("gridcraft/1x"),
+            Some("gridcraft/1.1"),
+            Some("unknown/1"),
+            Some("unknown/1_x"),
+            Some("gridcraft"),
+            Some(""),
+            None,
+        ] {
+            assert!(roots(untyped).is_empty(), "{untyped:?} took a typed copy");
+        }
+        let word = roots(Some("wordcraft/1"));
+        assert_eq!(word, &[("body", false), ("blocks", true)]);
+        assert_eq!(roots(Some("wordcraft/1_abc")), word, "the same rule for WordCraft");
+        assert!(roots(Some("wordcraft/10")).is_empty() && roots(Some("wordcraft/10_x")).is_empty());
+        for deck in ["deckcraft/1", "deckcraft/1_0.1.0", "deckcraft/10_x"] {
+            assert!(roots(Some(deck)).is_empty(), "DeckCraft names no typed roots, as before: {deck}");
+        }
+    }
+
+    /// C14: a GridCraft build's copy judges by the schema. A string straight in the `sheets`
+    /// array (which yrs cannot read back) is refused under `"gridcraft/1_abc"` as under
+    /// `"gridcraft/1"`, and taken by an untyped copy (`"gridcraft/2_x"`, `"unknown/1"`).
+    #[test]
+    fn a_gridcraft_build_gets_the_typed_copy() {
+        let string_in_sheets = [1, 1, 50, 0, 0x04, 1, 6, b's', b'h', b'e', b'e', b't', b's', 2, 0xc3, 0xa9, 0];
+        assert!(crate::update_is_sound(&string_in_sheets), "the gate alone takes it");
+        for typed in ["gridcraft/1", "gridcraft/1_abc"] {
+            assert_eq!(Shadow::new(Some(typed)).admit(&string_in_sheets), Err(ShadowRefusal::Invalid), "{typed}");
+        }
+        for untyped in ["gridcraft/2_x", "gridcraft/10", "gridcraft/10_x", "unknown/1"] {
+            assert!(Shadow::new(Some(untyped)).admit(&string_in_sheets).is_ok(), "{untyped}");
+        }
     }
 
     #[test]
