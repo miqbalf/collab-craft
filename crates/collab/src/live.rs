@@ -1430,7 +1430,7 @@ impl<H: Hub, R: Replica> Live<H, R> {
         }
     }
 
-    /// Merge `updates` in order into as few updates as surely fit the relay's caps: the text cap
+    /// Merge `updates` in order into updates that surely fit the relay's caps: the text cap
     /// and the op block cap ([`MAX_OP_BLOCKS`](crate::MAX_OP_BLOCKS), counted as
     /// [`update_blocks`](crate::update_blocks) counts it), past which the relay refuses an op for
     /// good. Bytes alone do not bound the blocks: at the default text cap (just under 16 MiB) a
@@ -1440,7 +1440,10 @@ impl<H: Hub, R: Replica> Live<H, R> {
     ///
     /// Merging only joins the updates' own items: no clock is minted, so an update the room
     /// already holds merges and lands as a no-op. Each group is merged once, so a reconnect
-    /// bundle of thousands of small edits costs about its own size, not a pass per edit.
+    /// bundle of thousands of small edits costs about its own size, not a pass per edit. The
+    /// grouping is greedy and judged on the parts' summed size and blocks, not on the merged
+    /// update, so it is not the fewest chunks possible: near the caps a chunk can be smaller
+    /// than it needs to be, never larger.
     fn chunked(&self, updates: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
         // The params a submit of `bytes` of update would serialize to, about: base64, the
         // quotes, and the scope around it. Merged updates are no larger than the parts summed,
