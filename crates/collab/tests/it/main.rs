@@ -270,6 +270,61 @@ fn undo_covers_structure_too() {
     assert_eq!(a.block(2), Some(sample()[1].clone()));
 }
 
+/// Undo never takes away another replica's text: an undo that would remove a block someone
+/// else has typed in says so before anything changes ([`LiveDoc::undo_takes_others_text`]), so
+/// the app can refuse it. Typing elsewhere, or in a block the undo keeps, does not count.
+#[test]
+fn an_undo_that_would_remove_anothers_typing_is_found_first() {
+    let new = (1 << 32) | 7;
+    // A inserts a block, B types in it: undoing the insert would take B's typing away.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    assert!(!a.undo_takes_others_text(1), "nobody else typed yet");
+    b.apply(&up).unwrap();
+    let up = b.insert_text(new, 2, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(a.undo_takes_others_text(1), "B typed in the block the undo would remove");
+    assert!(!b.undo_takes_others_text(1), "B's own undo takes only B's typing");
+    assert_eq!(a.order(), b.order(), "asking changes nothing");
+    assert_eq!(a.block(new), b.block(new));
+    // B typing in a block the undo keeps does not count.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(1, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.undo_takes_others_text(1));
+    // A split (Enter): B types in the new tail; undoing the split would take it away.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.split(4, 4, new).unwrap();
+    b.apply(&up).unwrap();
+    assert_eq!(b.block(new).unwrap().text, " paragraph");
+    let up = b.insert_text(new, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(a.undo_takes_others_text(1));
+    // B typing in the head of the split does not count: the undo keeps that block.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.split(4, 4, new).unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(4, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.undo_takes_others_text(1));
+    // Only the steps asked about count: an older step's block is not looked at.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(new, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    a.insert_text(1, 0, "A", &Map::new()).unwrap();
+    assert!(!a.undo_takes_others_text(1), "the newest step is A's own typing");
+    assert!(a.undo_takes_others_text(2), "the step before it inserted the block B typed in");
+}
+
 /// One peer undoes inserting a block while another undoes removing it: the second undo puts the
 /// id back in the body, the first takes the block itself away. An id whose block is gone is not
 /// in the order on any replica, and its removal is reported, so every app drops it alike.

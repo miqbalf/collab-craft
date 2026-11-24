@@ -78,6 +78,12 @@ pub trait Replica: Sized + Send {
     fn needs_resync(&self) -> bool {
         false
     }
+    /// Whether undoing the newest `steps` local edits would take away text another replica
+    /// wrote, so the app refuses that undo. Asking changes nothing. A schema that cannot tell
+    /// says `false`.
+    fn undo_takes_others_text(&self, _steps: usize) -> bool {
+        false
+    }
 }
 
 /// The part of a replica every yrs schema shares: the document, its undo history, its client
@@ -471,6 +477,13 @@ impl YReplica {
         let update = self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
         crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
         Some(update)
+    }
+
+    /// What the newest `steps` undo steps inserted, newest first: what undoing them would
+    /// take away, for a schema to check before it undoes.
+    #[must_use]
+    pub fn undo_insertions(&self, steps: usize) -> Vec<&yrs::IdSet> {
+        self.undo.undo_stack().iter().rev().take(steps).map(|item| item.insertions()).collect()
     }
 
     /// Redo the last undone local edit and return the update to send. `None` on a damaged
