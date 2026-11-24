@@ -835,14 +835,27 @@ fn account(gates: &Gates, gate: &mut Gate, shadow: &Shadow) {
 
 /// Take an op back out of the room's copy when it is not ordered after all (the bus could not
 /// number it, or the room refused it). A rebuild, but not the sender's doing, so not counted
-/// against it.
-fn unadmit(gates: &Gates, gate: &mut Gate, mark: Option<Mark>) {
+/// against it. Run off the async runtime, as the admit is (C9S2 review A-2): while Valkey is
+/// down every refused submit pays one, and a rebuild of a large document takes tens of
+/// milliseconds or more.
+async fn unadmit(gates: &Gates, gate: &mut Gate, mark: Option<Mark>) {
     if let (Some(mark), Some(mut shadow)) = (mark, gate.shadow.take()) {
-        let empty_before = shadow.empty_rebuilds();
-        shadow.rollback(mark);
-        warn_empty_rebuild("(rollback)", &shadow, empty_before);
-        account(gates, gate, &shadow);
-        gate.shadow = Some(shadow);
+        let rolled = tokio::task::spawn_blocking(move || {
+            let empty_before = shadow.empty_rebuilds();
+            shadow.rollback(mark);
+            warn_empty_rebuild("(rollback)", &shadow, empty_before);
+            shadow
+        })
+        .await;
+        match rolled {
+            Ok(shadow) => {
+                account(gates, gate, &shadow);
+                gate.shadow = Some(shadow);
+            }
+            // The rebuild is under `catch_unwind` inside, so this is a cancelled task: the copy
+            // is gone, and the room's next op starts a fresh one.
+            Err(e) => lose_copy(gates, gate, &e.to_string()),
+        }
     }
 }
 
@@ -1889,7 +1902,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         match bus.next_seq(&claims.rm, floor).await {
             Ok(s) => s,
             Err(e) => {
-                unadmit(&relay.gates, &mut ordered, mark);
+                unadmit(&relay.gates, &mut ordered, mark).await;
                 drop(ordered);
                 tracing::error!(error = %e, room = %claims.rm, "could not assign a sequence");
                 let _ = socket
@@ -1915,7 +1928,7 @@ async fn on_submit(socket: SocketRef, Data(msg): Data<SubmitMsg>, State(relay): 
         )
     };
     if outcome.is_err() {
-        unadmit(&relay.gates, &mut ordered, mark);
+        unadmit(&relay.gates, &mut ordered, mark).await;
     }
     drop(ordered);
 

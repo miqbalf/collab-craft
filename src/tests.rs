@@ -2064,7 +2064,7 @@ mod relay_proto {
         let mut gate = crate::Gate::default();
         for _ in 0..2 * MAX_STRIKES {
             let mark = crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await.expect("lands");
-            crate::unadmit(&gates, &mut gate, mark);
+            crate::unadmit(&gates, &mut gate, mark).await;
         }
         assert!(gates.strikes().is_empty(), "a relay rollback struck");
         let now = std::time::Instant::now();
@@ -2133,6 +2133,26 @@ mod relay_proto {
         crate::lose_copy(&gates, &mut gate, "test");
         assert_eq!((gates.shadow_bytes.load(Relaxed), gates.over_floor.load(Relaxed)), (0, 0));
         assert!(crate::SHADOW_LOST.load(Relaxed) >= 1, "a lost copy is counted");
+    }
+
+    /// C9S2 review A-2: a rollback (the bus could not number the op) rebuilds the copy off the
+    /// async runtime. On a single-threaded runtime, a task spawned before the rollback gets to
+    /// run while the rebuild is under way; a rebuild inline on the runtime would hold it off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rollback_rebuilds_the_copy_off_the_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let gates = crate::Gates::default();
+        let mut gate = crate::Gate::default();
+        assert!(crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![text_state(1024 * 1024)], false).await.is_ok());
+        let mark = crate::admit_on_shadow(&gates, &mut gate, ("r", "alice"), None, vec![ARRAY.to_vec()], false).await.expect("lands");
+        assert!(mark.is_some(), "the op was not judged");
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let ticker = tokio::spawn(async move { flag.store(true, SeqCst) });
+        crate::unadmit(&gates, &mut gate, mark).await;
+        assert!(ran.load(SeqCst), "the rollback held the runtime for its whole rebuild");
+        assert!(gate.shadow.is_some() && gate.bytes > 0, "the copy was lost in the rollback");
+        ticker.await.unwrap();
     }
 
     /// No room of ordinary size waits because of other rooms. With a thousand small rooms and
