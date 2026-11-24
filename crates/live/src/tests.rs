@@ -90,9 +90,9 @@ fn seed() -> Vec<SeedBlock> {
 }
 
 /// One window: its engine and its live session.
-struct Window {
+struct Window<H: Hub = MemHub> {
     engine: Engine,
-    le: LiveEditing<MemHub, Lines>,
+    le: LiveEditing<H, Lines>,
 }
 
 impl Window {
@@ -102,7 +102,9 @@ impl Window {
         let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() };
         Window { engine, le }
     }
+}
 
+impl<H: Hub> Window<H> {
     fn pump(&mut self) -> Vec<crate::Peer<(u64, usize)>> {
         self.le.pump(&mut self.engine)
     }
@@ -122,7 +124,7 @@ impl Window {
     }
 }
 
-fn settle(windows: &mut [&mut Window]) {
+fn settle<H: Hub>(windows: &mut [&mut Window<H>]) {
     for _ in 0..4 {
         for w in windows.iter_mut() {
             w.pump();
@@ -299,4 +301,104 @@ fn a_late_catch_up_is_told_then_given_up() {
     *now.lock().unwrap() += 10_000.0;
     late.pump(&mut engine);
     assert!(matches!(late.status(), LiveStatus::Broken(_)), "{:?}", late.status());
+}
+
+/// LP2: what is typed while the link is down, and while it rejoins, stays in the window and
+/// reaches the room after the rejoin, in order, and the two windows converge.
+#[test]
+fn typing_while_the_link_is_down_or_rejoining_is_kept_and_shared() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    settle(&mut [&mut a, &mut b]);
+    a.set(1, "E2x8");
+    settle(&mut [&mut a, &mut b]);
+    assert_eq!(b.line(1), "E2x8");
+
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    assert!(a.le.editable(), "a window that was live takes typing while it reconnects");
+    let mut typed = String::from("E2x8");
+    for c in "2046".chars() {
+        typed.push(c);
+        a.set(1, &typed);
+        a.pump();
+        assert_eq!(a.line(1), typed, "each keystroke stays in the window");
+    }
+    assert!(a.le.take_notices().iter().all(|n| !n.contains("paused")), "no keystroke was refused");
+    assert!(!a.le.edits_saved(), "the queued edits are not held by any save");
+
+    // The socket is back but the relay has not answered the join yet (a real relay answers
+    // after its bus calls): typing still lands.
+    relay.restore_link(a.le.hub());
+    typed.push('0');
+    a.set(1, &typed);
+    assert_eq!(a.line(1), typed);
+    settle(&mut [&mut a, &mut b]);
+    assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "{:?}", a.le.status());
+    assert_eq!(a.line(1), "E2x820460");
+    assert_eq!(b.line(1), "E2x820460", "every keystroke reached the other window");
+    assert_eq!((a.line(1), a.line(2)), (b.line(1), b.line(2)));
+}
+
+/// LP2: a window that never was live still refuses typing while it connects (its first
+/// catch-up may replace the replica), and a refused or broken link takes none.
+#[test]
+fn typing_is_still_refused_before_the_first_join() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Connecting);
+    assert!(!a.le.editable());
+    a.set(1, "early");
+    assert_eq!(a.line(1), "one");
+}
+
+/// LP2 goal 2: a renewed ticket opens a second link and the window switches to it once it
+/// has joined. The window never leaves Live, what is typed before, during and after the
+/// switch reaches the other window, and the old connection leaves the room.
+#[test]
+fn a_renewed_ticket_switches_links_without_a_drop() {
+    use craft_collab::Handover;
+    let relay = MemRelay::new();
+    let opener = relay.clone();
+    let first = relay.connect("alice", "Alice", true);
+    let hub = Handover::new(first.clone(), move |_ticket: &str| Ok(opener.connect("alice", "Alice", true)));
+    let le = LiveEditing::start(hub, ROOM, seed().as_slice(), Access::Edit).unwrap();
+    let mut a = Window { engine: Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect() }, le };
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    let step = |a: &mut Window<Handover<MemHub>>, b: &mut Window| {
+        a.pump();
+        b.pump();
+        assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "never reconnecting: {:?}", a.le.status());
+    };
+    for _ in 0..4 {
+        a.pump();
+        b.pump();
+    }
+    a.set(1, "G1");
+    step(&mut a, &mut b);
+
+    a.le.hub_mut().set_token("renewed".into());
+    assert_eq!(relay.tokens(&first), ["renewed"], "the old link reconnects with it if it drops first");
+    assert!(a.le.hub().switching());
+    a.set(1, "G15");
+    let mut typed = String::from("G15");
+    for c in "80933.".chars() {
+        step(&mut a, &mut b);
+        typed.push(c);
+        a.set(1, &typed);
+    }
+    for _ in 0..4 {
+        step(&mut a, &mut b);
+    }
+    assert_eq!(a.le.hub().switches(), 1);
+    assert!(!first.connected(), "the old link was closed");
+    assert_eq!(a.line(1), "G1580933.");
+    assert_eq!(b.line(1), "G1580933.", "nothing typed around the switch was lost");
+    let peers = b.pump();
+    assert_eq!(peers.len(), 1, "one Alice in the room after the switch: {peers:?}");
+    assert!(a.le.take_notices().iter().all(|n| !n.contains("econnect")), "the user saw no reconnect");
 }

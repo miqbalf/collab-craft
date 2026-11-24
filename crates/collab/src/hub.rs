@@ -42,6 +42,10 @@ pub trait Hub {
     fn set_token(&mut self, token: String) {
         let _ = token;
     }
+
+    /// Close the link for good: no reconnect, nothing sent or received after it. A hub that
+    /// closes on drop (the web hub) need not do more. No-op by default.
+    fn close(&mut self) {}
 }
 
 /// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back

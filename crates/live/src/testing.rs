@@ -154,6 +154,11 @@ impl Hub for MemHub {
             c.tokens.push(token);
         }
     }
+
+    /// The connection leaves for good, as a closed socket: the room is told.
+    fn close(&mut self) {
+        self.relay.drop_link(self);
+    }
 }
 
 impl Relay {

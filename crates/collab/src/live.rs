@@ -479,6 +479,19 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.space.is_some() && self.doc.as_ref().is_some_and(|d| !d.damaged()) && !self.broken && !self.awaiting_snapshot
     }
 
+    /// Whether a rejoin keeps this replica as it is: it has joined, settled on the room's
+    /// history, waits for no snapshot and takes edits. Only the first join's catch-up can
+    /// replace a replica (with the room's checkpoint), so an edit made while such a replica's
+    /// link is down or rejoining is safe to take: [`edit`](Live::edit) applies it here, the hub
+    /// drops the submit while the link is down, and the rejoin sends every unconfirmed edit
+    /// again, merged and in order.
+    ///
+    /// False before the first catch-up has settled, which an op of any kind does (this
+    /// replica's own confirmed edit included).
+    pub fn keeps_replica_on_rejoin(&self) -> bool {
+        self.joined_once && self.settled && self.ready_to_type()
+    }
+
     /// Whether this replica waits for the room's checkpoint snapshot before it may edit.
     ///
     /// Set when it joined a room that lost its history ([`Work::HistoryLost`]) holding nothing

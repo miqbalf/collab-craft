@@ -35,12 +35,14 @@
 //!   last `text_ops` piece of a fallback) and the replica is ready. No edits: the catch-up may
 //!   still replace the replica with the room's checkpoint. A catch-up still arriving after 10 s
 //!   is told to the user once; after 20 s it ends in [`LiveStatus::Broken`] (reopen).
-//! - [`LiveStatus::Live`] while connected, joined and ready: the only state that takes edits.
+//! - [`LiveStatus::Live`] while connected, joined and ready.
 //!   `saved_at` is the ETag of the newest file the document service saved (the `saved`
 //!   marker from the service uid [`SERVICE_UID`], `{seq, etag}`, `seq` never going back). It
 //!   is kept across reconnects and peers leaving.
 //! - [`LiveStatus::Reconnecting`] when the link drops after it had been live, until the hub's
-//!   rejoin is answered and its catch-up has arrived. No edits.
+//!   rejoin is answered and its catch-up has arrived. Edits are still taken: they wait in the
+//!   replica and go out, in order, after the rejoin (a rejoin never replaces a settled
+//!   replica).
 //! - [`LiveStatus::ReadOnly`] for a read-only ticket, from the start and for good (it follows
 //!   the other editors and shows its caret, and never sends an edit).
 //! - [`LiveStatus::Refused`] when the relay grants no client space, so nothing can be shared.
@@ -605,9 +607,23 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         self.live.applied()
     }
 
-    /// Whether the host may take edits now: live, connected, with an edit ticket.
+    /// Whether the host may take edits now: with an edit ticket, live and connected, or
+    /// reconnecting after it had been live.
+    ///
+    /// While a link that was live is down or rejoining, an edit is applied to the replica and
+    /// waits there; the rejoin sends it with every other unconfirmed edit, in order
+    /// (`Live::keeps_replica_on_rejoin`). Refusing it instead loses what the user typed in the
+    /// gap, which a ticket expiry opens every few minutes. Before the first catch-up, and once
+    /// the link is refused or broken, nothing is taken.
     pub fn editable(&self) -> bool {
-        matches!(self.status, LiveStatus::Live { .. }) && self.access == Access::Edit && self.live.connected() && self.live.ready_to_type()
+        if self.access != Access::Edit || self.broken.is_some() || self.refused.is_some() {
+            return false;
+        }
+        match self.status {
+            LiveStatus::Live { .. } if self.live.connected() => self.live.ready_to_type(),
+            LiveStatus::Live { .. } | LiveStatus::Reconnecting => self.been_live && self.live.keeps_replica_on_rejoin(),
+            _ => false,
+        }
     }
 
     /// Why no edit is taken now, for the user: connecting, reconnecting, read-only, or the

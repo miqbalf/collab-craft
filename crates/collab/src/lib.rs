@@ -41,6 +41,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod error;
+mod handover;
 mod hub;
 mod live;
 pub mod proto;
@@ -67,6 +68,7 @@ pub mod web;
 mod tests;
 
 pub use error::{Error, Result};
+pub use handover::{Handover, Opener};
 pub use hub::{EVENTS, Endpoint, Hub, SLOW_LINK_BYTES_PER_SEC, decode, emit, encode, receive, transfer_time};
 pub use live::{CHECKPOINT_TIMEOUT, DOC_SCOPE, Live, TextPayload, Work, refusal_is_permanent, update_from_wire, update_to_wire};
 pub use proto::{
