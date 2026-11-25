@@ -173,6 +173,9 @@ const AFTER_UNDO: &str = "An edit made right after Undo was not kept. Please mak
 /// An Undo refused because it would remove what another editor typed
 /// ([`craft_collab::LiveDoc::undo_takes_others_text`]). The undo step stays.
 pub const UNDO_TAKES_OTHERS: &str = "Someone else has typed in what this Undo would remove, so it wasn't undone.";
+/// A Redo refused because it would remove what another editor typed
+/// ([`craft_collab::LiveDoc::redo_takes_others_text`]). The redo step stays.
+pub const REDO_TAKES_OTHERS: &str = "Someone else has typed in what this Redo would remove, so it wasn't redone.";
 /// The service closed the room: nothing saves edits made in it any more.
 const CLOSED: &str = "The live session ended. Reopen the file to keep editing.";
 
@@ -1177,6 +1180,12 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         if !redo && self.live.undo_takes_others_text(steps) {
             lock(&self.shared).undo.push(steps);
             self.notices.push(UNDO_TAKES_OTHERS.to_owned());
+            return;
+        }
+        // Nor does Redo: the redo step stays, nothing changes.
+        if redo && self.live.redo_takes_others_text(steps) {
+            lock(&self.shared).redo.push(steps);
+            self.notices.push(REDO_TAKES_OTHERS.to_owned());
             return;
         }
         let mut done = 0;

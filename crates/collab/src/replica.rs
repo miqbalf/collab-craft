@@ -84,6 +84,10 @@ pub trait Replica: Sized + Send {
     fn undo_takes_others_text(&self, _steps: usize) -> bool {
         false
     }
+    /// The same for redoing the newest `steps` undone edits.
+    fn redo_takes_others_text(&self, _steps: usize) -> bool {
+        false
+    }
 }
 
 /// The part of a replica every yrs schema shares: the document, its undo history, its client
@@ -114,6 +118,9 @@ pub struct YReplica {
     waiting: Vec<(Vec<u8>, (u64, u32))>,
     /// Parents of recently checked items, for the next check (see the `fits` module).
     seen: crate::fits::Seen,
+    /// The document just after each undo whose step is still on the redo stack, oldest first,
+    /// so a redo can tell what others wrote since ([`YReplica::redo_steps`]).
+    undone_at: Vec<yrs::Snapshot>,
 }
 
 impl YReplica {
@@ -150,6 +157,7 @@ impl YReplica {
             held_bytes: 0,
             waiting: Vec::new(),
             seen: crate::fits::Seen::default(),
+            undone_at: Vec::new(),
         }
     }
 
@@ -474,7 +482,10 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
+        // A new local edit empties the redo stack: forget the undos it held.
+        self.undone_at.truncate(self.undo.redo_stack().len());
         let update = self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        self.undone_at.push(self.doc.transact().snapshot());
         crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
         Some(update)
     }
@@ -486,6 +497,16 @@ impl YReplica {
         self.undo.undo_stack().iter().rev().take(steps).map(|item| item.insertions()).collect()
     }
 
+    /// What the newest `steps` redo steps would take away, newest first: what the undos they
+    /// come from inserted (a block put back, words put back), each with the document just after
+    /// that undo (`None` when it is not known), so a schema can tell what was written since.
+    #[must_use]
+    pub fn redo_steps(&self, steps: usize) -> Vec<(&yrs::IdSet, Option<&yrs::Snapshot>)> {
+        let stack = self.undo.redo_stack();
+        let known = self.undone_at.len() == stack.len();
+        stack.iter().enumerate().rev().take(steps).map(|(i, item)| (item.insertions(), self.undone_at.get(i).filter(|_| known))).collect()
+    }
+
     /// Redo the last undone local edit and return the update to send. `None` on a damaged
     /// replica too.
     pub fn redo(&mut self) -> Option<Vec<u8>> {
@@ -493,7 +514,9 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
+        self.undone_at.truncate(self.undo.redo_stack().len());
         let update = self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))?;
+        self.undone_at.pop();
         crate::fits::learn(&self.doc.transact(), &update, &before, &mut self.seen);
         Some(update)
     }
