@@ -202,6 +202,11 @@ impl MemRelay {
         self.0.borrow().granted.get(&hub.at).copied()
     }
 
+    /// The id space `hub`'s connection names on every rejoin ([`Hub::set_space`]).
+    pub fn named_space(&self, hub: &MemHub) -> u32 {
+        self.0.borrow().conns.get(hub.at).map_or(0, |c| c.space)
+    }
+
     /// The relay's sequence: the last op it ordered.
     pub fn seq(&self) -> u64 {
         self.0.borrow().seq
@@ -283,6 +288,11 @@ impl Hub for MemHub {
         if let Some(c) = self.relay.0.borrow_mut().conns.get_mut(self.at) {
             c.space = space;
         }
+    }
+
+    /// The connection leaves for good, as a closed socket: the room is told.
+    fn close(&mut self) {
+        self.relay.drop_link(self);
     }
 }
 

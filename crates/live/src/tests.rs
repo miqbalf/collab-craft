@@ -110,9 +110,9 @@ fn seed() -> Vec<SeedBlock> {
 }
 
 /// One window: its engine and its live session.
-struct Window {
+struct Window<H: Hub = MemHub> {
     engine: Engine,
-    le: LiveEditing<MemHub, Lines>,
+    le: LiveEditing<H, Lines>,
 }
 
 impl Window {
@@ -122,7 +122,9 @@ impl Window {
         let engine = Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), ..Engine::default() };
         Window { engine, le }
     }
+}
 
+impl<H: Hub> Window<H> {
     fn pump(&mut self) -> Vec<crate::Peer<(u64, usize)>> {
         self.le.pump(&mut self.engine)
     }
@@ -142,7 +144,7 @@ impl Window {
     }
 }
 
-fn settle(windows: &mut [&mut Window]) {
+fn settle<H: Hub>(windows: &mut [&mut Window<H>]) {
     for _ in 0..4 {
         for w in windows.iter_mut() {
             w.pump();
@@ -1877,4 +1879,155 @@ fn a_view_only_member_is_seen_as_view_by_its_peers() {
     let seen_by_viewer = viewer.pump();
     let alice = seen_by_viewer.iter().find(|p| p.id.starts_with("alice~")).expect("alice is on bob's roster");
     assert_eq!(alice.access, Access::Edit, "{seen_by_viewer:?}");
+}
+
+/// A link whose relay answers late: its inbox is held for `wait` polls, as a real relay's join
+/// answer comes after its bus calls.
+#[derive(Clone)]
+struct Late {
+    hub: MemHub,
+    wait: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Hub for Late {
+    fn send(&mut self, msg: craft_collab::ClientMsg) -> craft_collab::Result<()> {
+        self.hub.send(msg)
+    }
+    fn poll(&mut self) -> Vec<ServerMsg> {
+        match self.wait.get() {
+            0 => self.hub.poll(),
+            n => {
+                self.wait.set(n - 1);
+                Vec::new()
+            }
+        }
+    }
+    fn connected(&self) -> bool {
+        self.hub.connected()
+    }
+    fn set_token(&mut self, token: String) {
+        self.hub.set_token(token);
+    }
+    fn set_space(&mut self, space: u32) {
+        self.hub.set_space(space);
+    }
+    fn close(&mut self) {
+        self.hub.close();
+    }
+}
+
+/// LP2 fix 1 (I1, I4): a renewed ticket switches links through `Handover` while the person
+/// types. The window never leaves Live, nothing typed before, during or after the switch is
+/// lost, the new link names the kept id space and the replica keeps it, and Undo still takes
+/// back the last typing. Then the new link drops and comes back while the person types on.
+#[test]
+fn a_switch_keeps_typing_the_space_and_undo() {
+    use craft_collab::{Handover, Reopen};
+    let relay = MemRelay::new();
+    let opener = relay.clone();
+    let late = |hub: MemHub, wait: u32| Late { hub, wait: std::rc::Rc::new(std::cell::Cell::new(wait)) };
+    let first = late(relay.connect("alice", "Alice", true), 0);
+    let opened: std::rc::Rc<std::cell::RefCell<Vec<MemHub>>> = std::rc::Rc::default();
+    let made = std::rc::Rc::clone(&opened);
+    let hub = Handover::new(first.clone(), move |r: &Reopen<'_>| {
+        assert_eq!(r.ticket, "renewed");
+        let h = opener.connect("alice", "Alice", true);
+        made.borrow_mut().push(h.clone());
+        Ok(late(h, 3))
+    });
+    let le = LiveEditing::start(hub, ROOM, seed().as_slice(), Access::Edit).unwrap();
+    let mut a = Window { engine: Engine { doc: seed().into_iter().map(|b| (b.id, b.text)).collect(), ..Engine::default() }, le };
+    let mut b = Window::join(&relay, "bob", Access::Edit);
+    for _ in 0..4 {
+        a.pump();
+        b.pump();
+    }
+    let step = |a: &mut Window<Handover<Late>>, b: &mut Window| {
+        a.pump();
+        b.pump();
+        assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "never reconnecting: {:?}", a.le.status());
+    };
+    a.set(1, "G1");
+    step(&mut a, &mut b);
+    let kept = a.le.live().space().expect("granted");
+    assert_eq!(relay.named_space(&first.hub), kept);
+
+    a.le.hub_mut().set_token("renewed".into());
+    assert_eq!(relay.tokens(&first.hub), ["renewed"], "the old link reconnects with it if it drops first");
+    assert!(a.le.hub().switching());
+    let second = opened.borrow()[0].clone();
+    assert_eq!(relay.named_space(&second), kept, "the new link names the kept space");
+    let mut typed = String::from("G1");
+    for c in "5809".chars() {
+        typed.push(c);
+        a.set(1, &typed);
+        step(&mut a, &mut b);
+    }
+    assert_eq!(a.le.hub().switches(), 1, "the switch happened while typing");
+    assert!(!first.connected(), "the old link was closed");
+    for c in "33.".chars() {
+        typed.push(c);
+        a.set(1, &typed);
+        step(&mut a, &mut b);
+    }
+    for _ in 0..4 {
+        step(&mut a, &mut b);
+    }
+    assert_eq!(a.line(1), "G1580933.");
+    assert_eq!(b.line(1), "G1580933.", "nothing typed around the switch was lost");
+    assert_eq!(a.le.live().space(), Some(kept), "the replica keeps its space");
+    let peers = b.pump();
+    assert_eq!(peers.len(), 1, "one Alice in the room after the switch: {peers:?}");
+    assert!(a.le.take_notices().is_empty(), "the person was told nothing");
+
+    // A second renewal with nothing typed after it: Undo must still reach the typing before it.
+    a.le.hub_mut().set_token("renewed".into());
+    for _ in 0..6 {
+        step(&mut a, &mut b);
+    }
+    assert_eq!(a.le.hub().switches(), 2);
+    let mut undo = a.le.queue().history_hook();
+    assert!(undo(false), "the switch lost the undo history");
+    for _ in 0..4 {
+        step(&mut a, &mut b);
+    }
+    let undone = a.line(1).to_owned();
+    assert!(undone.len() < typed.len() && typed.starts_with(&undone), "Undo did not take the last typing back: {undone:?}");
+    assert_eq!(b.line(1), undone, "the undo reached the other window");
+
+    // The link in use drops; the person types on; it comes back.
+    let current = opened.borrow().last().unwrap().clone();
+    relay.drop_link(&current);
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    let mut typed = undone;
+    for c in " ok".chars() {
+        typed.push(c);
+        a.set(1, &typed);
+        a.pump();
+    }
+    relay.restore_link(&current);
+    settle(&mut [&mut a]);
+    settle(&mut [&mut b]);
+    settle(&mut [&mut a]);
+    settle(&mut [&mut b]);
+    assert_eq!(a.line(1), typed);
+    assert_eq!(b.line(1), typed, "what was typed while the new link was down reached the room");
+    assert_eq!(a.le.live().space(), Some(kept));
+}
+
+/// LP2 fix 1, M3: while a window that was live reconnects, edits are taken, and the line for
+/// that state says they are kept instead of "editing is paused".
+#[test]
+fn the_reconnecting_line_says_edits_are_kept() {
+    let relay = MemRelay::new();
+    let mut a = Window::join(&relay, "alice", Access::Edit);
+    settle(&mut [&mut a]);
+    relay.drop_link(a.le.hub());
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    assert!(a.le.editable());
+    let line = a.le.not_editable();
+    assert_eq!(line, crate::RECONNECTING);
+    assert!(!line.contains("paused") && line.contains("kept"), "{line}");
 }

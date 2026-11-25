@@ -44,6 +44,7 @@ mod error;
 mod fits;
 #[cfg(test)]
 mod fuzz;
+mod handover;
 mod hub;
 mod live;
 pub mod proto;
@@ -72,6 +73,7 @@ pub mod web;
 mod tests;
 
 pub use error::{Error, Result};
+pub use handover::{Handover, Opener, Reopen};
 pub use hub::{EVENTS, Endpoint, Hub, SLOW_LINK_BYTES_PER_SEC, decode, emit, encode, receive, transfer_time};
 pub use live::{
     CHECKPOINT_TIMEOUT, DOC_SCOPE, Live, LockEvent, MAX_UNCONFIRMED_BYTES, MAX_UNCONFIRMED_EDITS, OFFLINE_MAX_BYTES, PAST_BOUND, TextPayload, Work,

@@ -58,6 +58,10 @@ pub trait Hub {
     /// newcomer joins before the holder of a lost space rejoins. That case depends on how
     /// Valkey persists and is not fixed in M1.
     fn set_space(&mut self, space: u32);
+
+    /// Close the link for good: no reconnect, nothing sent or received after it. A hub that
+    /// closes on drop (the web and native hubs) need not do more. No-op by default.
+    fn close(&mut self) {}
 }
 
 /// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back

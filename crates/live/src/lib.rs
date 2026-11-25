@@ -134,7 +134,12 @@ const READ_ONLY_BROKEN: &str = "You can only read this file. Reopen it to keep f
 const NO_SPACE: &str = "The live editing server cannot share edits right now. Reopen the file later.";
 /// No edit is taken until the link is live.
 pub const CONNECTING: &str = "Still connecting to the other editors. You can edit in a moment.";
-const RECONNECTING: &str = "Reconnecting to the other editors. Editing is paused until then.";
+/// The link of a window that was live is down or rejoining: edits are taken, kept and sent once
+/// it is back.
+pub const RECONNECTING: &str = "Reconnecting to the other editors. Your changes are kept and sent once the connection is back.";
+/// A rejoin whose catch-up is not in yet (before the first one, or the replica is not ready to
+/// type): no edit is taken for that moment.
+pub const REJOINING: &str = "Reconnecting to the other editors. You can edit again in a moment.";
 /// An ordered (structure-locked) change was refused because the link is down: it needs the lock,
 /// which only the connected room can grant. Nothing changed.
 pub const ORDERED_OFFLINE: &str = "This change needs the connection to the other editors. Try again once you are reconnected.";
@@ -776,7 +781,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             LiveStatus::Live { .. } | LiveStatus::Reconnecting if self.access == Access::Edit => {
                 let online = matches!(self.status, LiveStatus::Live { .. }) && self.live.connected();
                 if !self.live.ready_to_type() || !self.been_live {
-                    RECONNECTING
+                    REJOINING
                 } else if !online && self.live.open_fence().is_some() {
                     // Under the lock every edit is part of the ordered run, which needs the link.
                     ORDERED_OFFLINE
