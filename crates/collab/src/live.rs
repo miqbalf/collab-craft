@@ -601,6 +601,13 @@ impl<H: Hub, R: Replica> Live<H, R> {
         self.doc.as_ref().is_some_and(|d| d.undo_takes_others_text(steps))
     }
 
+    /// Whether redoing the newest `steps` undone edits would take away another replica's text
+    /// ([`Replica::redo_takes_others_text`]). `false` before the replica is seeded.
+    #[must_use]
+    pub fn redo_takes_others_text(&self, steps: usize) -> bool {
+        self.doc.as_ref().is_some_and(|d| d.redo_takes_others_text(steps))
+    }
+
     /// Redo the last undone local edit and send it. `false` when there is nothing to redo.
     pub fn redo(&mut self) -> Result<bool> {
         match self.sound_doc()?.redo() {

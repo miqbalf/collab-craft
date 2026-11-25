@@ -66,6 +66,10 @@ pub trait Replica: Sized + Send {
     fn undo_takes_others_text(&self, _steps: usize) -> bool {
         false
     }
+    /// The same for redoing the newest `steps` undone edits.
+    fn redo_takes_others_text(&self, _steps: usize) -> bool {
+        false
+    }
 }
 
 /// The part of a replica every yrs schema shares: the document, its undo history, its client
@@ -80,6 +84,9 @@ pub struct YReplica {
     damaged: bool,
     /// Local edits are made outside the undo history ([`YReplica::untracked`]).
     untracked: bool,
+    /// The document just after each undo whose step is still on the redo stack, oldest first,
+    /// so a redo can tell what others wrote since ([`YReplica::redo_steps`]).
+    undone_at: Vec<yrs::Snapshot>,
 }
 
 impl YReplica {
@@ -105,7 +112,7 @@ impl YReplica {
         let mut undo = UndoManager::with_options(options);
         scope(&doc, &mut undo);
         undo.include_origin(Origin::from(LOCAL));
-        YReplica { undo, doc, client, damaged: false, untracked: false }
+        YReplica { undo, doc, client, damaged: false, untracked: false, undone_at: Vec::new() }
     }
 
     /// A new document with client id `space` holding this replica's whole state, for the
@@ -168,7 +175,13 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.undo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        // A new local edit empties the redo stack: forget the undos it held.
+        self.undone_at.truncate(self.undo.redo_stack().len());
+        let undone = self.undo.undo_blocking();
+        if undone {
+            self.undone_at.push(self.doc.transact().snapshot());
+        }
+        undone.then(|| self.doc.transact().encode_diff_v1(&before))
     }
 
     /// What the newest `steps` undo steps inserted, newest first: what undoing them would
@@ -178,6 +191,16 @@ impl YReplica {
         self.undo.undo_stack().iter().rev().take(steps).map(|item| item.insertions()).collect()
     }
 
+    /// What the newest `steps` redo steps would take away, newest first: what the undos they
+    /// come from inserted (a block put back, words put back), each with the document just after
+    /// that undo (`None` when it is not known), so a schema can tell what was written since.
+    #[must_use]
+    pub fn redo_steps(&self, steps: usize) -> Vec<(&yrs::IdSet, Option<&yrs::Snapshot>)> {
+        let stack = self.undo.redo_stack();
+        let known = self.undone_at.len() == stack.len();
+        stack.iter().enumerate().rev().take(steps).map(|(i, item)| (item.insertions(), self.undone_at.get(i).filter(|_| known))).collect()
+    }
+
     /// Redo the last undone local edit and return the update to send. `None` on a damaged
     /// replica too.
     pub fn redo(&mut self) -> Option<Vec<u8>> {
@@ -185,7 +208,12 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undo.redo_blocking().then(|| self.doc.transact().encode_diff_v1(&before))
+        self.undone_at.truncate(self.undo.redo_stack().len());
+        let redone = self.undo.redo_blocking();
+        if redone {
+            self.undone_at.pop();
+        }
+        redone.then(|| self.doc.transact().encode_diff_v1(&before))
     }
 
     /// Whether local edits are being kept out of the undo history now.

@@ -39,16 +39,18 @@
 //! Undoing an edit that inserted a block (a paste's new paragraph, the tail of an Enter) takes
 //! the whole block away, with any text another replica has typed in it since.
 //! [`LiveDoc::undo_takes_others_text`] finds that before the undo runs, so the app can refuse it.
+//! A redo that would take a block an undo put back, after someone else typed in it, is found the
+//! same way ([`LiveDoc::redo_takes_others_text`]).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
-use yrs::types::text::YChange;
+use yrs::types::text::{ChangeKind, YChange};
 use yrs::types::{Attrs, Event, PathSegment};
 use yrs::{
-    Any, Array, ArrayRef, BranchID, DeepObservable, Doc, GetString, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Snapshot, Text, TextPrelim,
-    TextRef, Transact, TransactionMut,
+    Any, Array, ArrayRef, Assoc, BranchID, DeepObservable, Doc, GetString, IndexedSequence, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn,
+    Snapshot, Text, TextPrelim, TextRef, Transact, TransactionMut,
 };
 
 use crate::replica::{REMOTE, Replica, YReplica, byte_at, byte_span, integrate, put_sorted, to_any, to_json};
@@ -416,37 +418,64 @@ impl LiveDoc {
     /// undo takes back only this replica's own characters there. Asking changes nothing.
     #[must_use]
     pub fn undo_takes_others_text(&self, steps: usize) -> bool {
+        let made: Vec<_> = self.y.undo_insertions(steps).into_iter().map(|set| (set, None)).collect();
+        self.takes_others_text(&made)
+    }
+
+    /// Whether redoing the newest `steps` undone edits would take away another replica's text:
+    /// the undo put a block back (undoing a removal or a merge) and another replica has typed
+    /// in it since that undo. The redo takes that block out of the order again, so the app
+    /// refuses it. Text that was there before the undo does not count: the edit being redone
+    /// took it away the first time. Asking changes nothing.
+    #[must_use]
+    pub fn redo_takes_others_text(&self, steps: usize) -> bool {
+        self.takes_others_text(&self.y.redo_steps(steps))
+    }
+
+    /// Whether taking back what `made` holds (the insertions of the history steps about to be
+    /// undone or redone) removes a block from the order that holds another replica's text. A
+    /// block goes when its own entry or its place in the body is one of those insertions. With a
+    /// snapshot, only text written after it counts; without one, all of it.
+    fn takes_others_text(&self, made: &[(&yrs::IdSet, Option<&Snapshot>)]) -> bool {
         let Some(me) = self.y.client().map(|space| yrs::block::ClientID::new(u64::from(space))) else {
             return false;
         };
-        let made = self.y.undo_insertions(steps);
         if made.is_empty() {
             return false;
         }
+        let step_of = |id: &yrs::ID| made.iter().find(|(set, _)| set.contains(id)).map(|(_, since)| *since);
         // Not a local edit: no origin, so the undo manager does not track it, and it changes
         // nothing (the diff below only splits items at the snapshots).
         let mut txn = self.y.doc().transact_mut();
-        let texts: Vec<TextRef> = order_of(&txn, &self.body, &self.blocks)
+        let mut seen = BTreeSet::new();
+        let texts: Vec<(TextRef, Option<&Snapshot>)> = raw_ids(&txn, &self.body, &self.blocks)
             .into_iter()
-            .filter_map(|id| match self.blocks.get(&txn, &key(id)) {
-                Some(Out::YMap(block)) => match AsRef::<yrs::branch::Branch>::as_ref(&block).id() {
-                    // The block's own entry was one of the edits' insertions.
-                    BranchID::Nested(entry) if made.iter().any(|set| set.contains(&entry)) => text_of(&txn, &block),
-                    _ => None,
-                },
-                _ => None,
+            .enumerate()
+            .filter_map(|(at, id)| {
+                // The order keeps each id at its first place in the body only.
+                let id = id.filter(|id| seen.insert(*id))?;
+                let Some(Out::YMap(block)) = self.blocks.get(&txn, &key(id)) else { return None };
+                let entry = match AsRef::<yrs::branch::Branch>::as_ref(&block).id() {
+                    BranchID::Nested(entry) => step_of(&entry),
+                    BranchID::Root(_) => None,
+                };
+                let place = || {
+                    let at = u32::try_from(at).ok()?;
+                    let place = self.body.sticky_index(&txn, at, Assoc::After)?;
+                    step_of(place.id()?)
+                };
+                let since = entry.or_else(place)?;
+                Some((text_of(&txn, &block)?, since))
             })
             .collect();
-        // Every visible character, tagged with the item (and so the client) that wrote it.
+        // Every visible character written since (by anyone), tagged with its writer.
         let now = txn.snapshot();
         let never = Snapshot::default();
-        texts.iter().any(|t| t.diff_range(&mut txn, Some(&now), Some(&never), |c| c.id.client).iter().any(|d| d.ychange.is_some_and(|c| c != me)))
-    }
-
-    /// Stub (red).
-    #[must_use]
-    pub fn redo_takes_others_text(&self, _steps: usize) -> bool {
-        false
+        texts.iter().any(|(t, since)| {
+            t.diff_range(&mut txn, Some(&now), Some(since.unwrap_or(&never)), |c| (c.kind == ChangeKind::Added).then_some(c.id.client))
+                .iter()
+                .any(|d| d.ychange.flatten().is_some_and(|c| c != me))
+        })
     }
 
     /// The whole document as one update (v1), for a checkpoint or a peer starting from nothing.
@@ -530,6 +559,9 @@ impl Replica for LiveDoc {
     }
     fn undo_takes_others_text(&self, steps: usize) -> bool {
         LiveDoc::undo_takes_others_text(self, steps)
+    }
+    fn redo_takes_others_text(&self, steps: usize) -> bool {
+        LiveDoc::redo_takes_others_text(self, steps)
     }
 }
 
