@@ -84,9 +84,11 @@ pub struct YReplica {
     damaged: bool,
     /// Local edits are made outside the undo history ([`YReplica::untracked`]).
     untracked: bool,
-    /// The document just after each undo whose step is still on the redo stack, oldest first,
-    /// so a redo can tell what others wrote since ([`YReplica::redo_steps`]).
-    undone_at: Vec<yrs::Snapshot>,
+    /// The document's state vector just after each undo whose step is still on the redo stack,
+    /// oldest first, so a redo can tell what others wrote since ([`YReplica::redo_steps`]).
+    /// Kept as long as the redo stack: trimmed to its length after every undo, redo and
+    /// tracked local edit.
+    undone_at: Vec<StateVector>,
 }
 
 impl YReplica {
@@ -179,7 +181,7 @@ impl YReplica {
         self.undone_at.truncate(self.undo.redo_stack().len());
         let undone = self.undo.undo_blocking();
         if undone {
-            self.undone_at.push(self.doc.transact().snapshot());
+            self.undone_at.push(self.doc.transact().state_vector());
         }
         undone.then(|| self.doc.transact().encode_diff_v1(&before))
     }
@@ -192,10 +194,10 @@ impl YReplica {
     }
 
     /// What the newest `steps` redo steps would take away, newest first: what the undos they
-    /// come from inserted (a block put back, words put back), each with the document just after
-    /// that undo (`None` when it is not known), so a schema can tell what was written since.
+    /// come from inserted (a block put back, words put back), each with the state vector just
+    /// after that undo (`None` when it is not known), so a schema can tell what was written since.
     #[must_use]
-    pub fn redo_steps(&self, steps: usize) -> Vec<(&yrs::IdSet, Option<&yrs::Snapshot>)> {
+    pub fn redo_steps(&self, steps: usize) -> Vec<(&yrs::IdSet, Option<&StateVector>)> {
         let stack = self.undo.redo_stack();
         let known = self.undone_at.len() == stack.len();
         stack.iter().enumerate().rev().take(steps).map(|(i, item)| (item.insertions(), self.undone_at.get(i).filter(|_| known))).collect()
@@ -208,11 +210,10 @@ impl YReplica {
             return None;
         }
         let before = self.doc.transact().state_vector();
-        self.undone_at.truncate(self.undo.redo_stack().len());
         let redone = self.undo.redo_blocking();
-        if redone {
-            self.undone_at.pop();
-        }
+        // yrs drops redo steps that would change nothing before the one it redoes, all from the
+        // top of the stack (the newest undos): keep the states of the steps still there.
+        self.undone_at.truncate(self.undo.redo_stack().len());
         redone.then(|| self.doc.transact().encode_diff_v1(&before))
     }
 
@@ -243,9 +244,13 @@ impl YReplica {
         if self.client.is_none() {
             return Err(LiveError::NoClient);
         }
-        let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
-        edit(&mut txn)?;
-        Ok(txn.encode_update_v1())
+        let update = {
+            let mut txn = self.doc.transact_mut_with(if self.untracked { UNTRACKED } else { LOCAL });
+            edit(&mut txn).map(|()| txn.encode_update_v1())
+        };
+        // A tracked edit empties the redo stack: drop the undo states it held.
+        self.undone_at.truncate(self.undo.redo_stack().len());
+        update
     }
 }
 

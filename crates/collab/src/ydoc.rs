@@ -435,8 +435,8 @@ impl LiveDoc {
     /// Whether taking back what `made` holds (the insertions of the history steps about to be
     /// undone or redone) removes a block from the order that holds another replica's text. A
     /// block goes when its own entry or its place in the body is one of those insertions. With a
-    /// snapshot, only text written after it counts; without one, all of it.
-    fn takes_others_text(&self, made: &[(&yrs::IdSet, Option<&Snapshot>)]) -> bool {
+    /// state vector, only text written after it counts; without one, all of it.
+    fn takes_others_text(&self, made: &[(&yrs::IdSet, Option<&yrs::StateVector>)]) -> bool {
         let Some(me) = self.y.client().map(|space| yrs::block::ClientID::new(u64::from(space))) else {
             return false;
         };
@@ -448,7 +448,7 @@ impl LiveDoc {
         // nothing (the diff below only splits items at the snapshots).
         let mut txn = self.y.doc().transact_mut();
         let mut seen = BTreeSet::new();
-        let texts: Vec<(TextRef, Option<&Snapshot>)> = raw_ids(&txn, &self.body, &self.blocks)
+        let texts: Vec<(TextRef, Option<&yrs::StateVector>)> = raw_ids(&txn, &self.body, &self.blocks)
             .into_iter()
             .enumerate()
             .filter_map(|(at, id)| {
@@ -470,9 +470,11 @@ impl LiveDoc {
             .collect();
         // Every visible character written since (by anyone), tagged with its writer.
         let now = txn.snapshot();
-        let never = Snapshot::default();
         texts.iter().any(|(t, since)| {
-            t.diff_range(&mut txn, Some(&now), Some(since.unwrap_or(&never)), |c| (c.kind == ChangeKind::Added).then_some(c.id.client))
+            // The document then, as far as what was written goes (deletions don't matter here:
+            // only characters added since count).
+            let then = since.map_or_else(Snapshot::default, |sv| Snapshot::new(sv.clone(), yrs::IdSet::default()));
+            t.diff_range(&mut txn, Some(&now), Some(&then), |c| (c.kind == ChangeKind::Added).then_some(c.id.client))
                 .iter()
                 .any(|d| d.ychange.flatten().is_some_and(|c| c != me))
         })
