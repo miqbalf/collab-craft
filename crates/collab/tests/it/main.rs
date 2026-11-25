@@ -325,6 +325,68 @@ fn an_undo_that_would_remove_anothers_typing_is_found_first() {
     assert!(a.undo_takes_others_text(2), "the step before it inserted the block B typed in");
 }
 
+/// Redo never takes away another replica's text either. Undoing a removal (or a merge) puts the
+/// block back; when someone else types in it and the remover then redoes, the redo would take
+/// the block, and that typing, out again. [`LiveDoc::redo_takes_others_text`] says so first.
+#[test]
+fn a_redo_that_would_remove_anothers_typing_is_found_first() {
+    // A removes block 2, undoes that, B types in it: redoing the removal would take it away.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.remove_block(2).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1), "nobody else typed yet");
+    let up = b.insert_text(2, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(a.redo_takes_others_text(1), "B typed in the block the redo would remove");
+    assert!(!a.undo_takes_others_text(1), "nothing left to undo");
+    assert_eq!(a.order(), b.order(), "asking changes nothing");
+    // A merge: the redo takes the second block out of the order again.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.merge(1, 2).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    assert_eq!(b.order(), sample().iter().map(|x| x.id).collect::<Vec<_>>());
+    let up = b.insert_text(2, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(a.redo_takes_others_text(1));
+    // B typing in a block the redo keeps does not count.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.remove_block(2).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(1, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1));
+    // Redoing a deletion of A's own words next to B's typing takes only A's words.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.delete_text(1, 0, 2).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(1, 5, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1));
+    // Redoing an insert never removes anything.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let new = (1 << 32) | 7;
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    let up = b.insert_text(1, 0, "BOB", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1));
+}
+
 /// One peer undoes inserting a block while another undoes removing it: the second undo puts the
 /// id back in the body, the first takes the block itself away. An id whose block is gone is not
 /// in the order on any replica, and its removal is reported, so every app drops it alike.

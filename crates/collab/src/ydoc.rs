@@ -443,6 +443,12 @@ impl LiveDoc {
         texts.iter().any(|t| t.diff_range(&mut txn, Some(&now), Some(&never), |c| c.id.client).iter().any(|d| d.ychange.is_some_and(|c| c != me)))
     }
 
+    /// Stub (red).
+    #[must_use]
+    pub fn redo_takes_others_text(&self, _steps: usize) -> bool {
+        false
+    }
+
     /// The whole document as one update (v1), for a checkpoint or a peer starting from nothing.
     #[must_use]
     pub fn state(&self) -> Vec<u8> {
