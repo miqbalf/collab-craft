@@ -387,6 +387,78 @@ fn a_redo_that_would_remove_anothers_typing_is_found_first() {
     assert!(!a.redo_takes_others_text(1));
 }
 
+/// yrs drops a redo step that would change nothing (B already deleted what it would delete) and
+/// redoes the next one in the same call. The check must stay in step with the redo stack after
+/// that: a later redo that takes away only A's own removal (of a seeded paragraph nobody typed
+/// in since) is still allowed (review round 3, M4).
+#[test]
+fn a_redo_after_a_skipped_step_is_still_checked_against_its_own_undo() {
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    // Oldest first: delete "T", delete "i", remove block 2. Undo all three.
+    for up in [a.delete_text(1, 0, 1).unwrap(), a.delete_text(1, 0, 1).unwrap(), a.remove_block(2).unwrap()] {
+        b.apply(&up).unwrap();
+    }
+    for _ in 0..3 {
+        let up = a.undo().unwrap();
+        b.apply(&up).unwrap();
+    }
+    assert_eq!(a.block(1).unwrap().text, "Title");
+    // B deletes the "T" the oldest undo put back: redoing that step would change nothing.
+    let up = b.delete_text(1, 0, 1).unwrap();
+    a.apply(&up).unwrap();
+    // One Redo: yrs drops the empty step and redoes deleting "i".
+    let up = a.redo().unwrap();
+    b.apply(&up).unwrap();
+    assert_eq!(a.block(1).unwrap().text, "tle");
+    // The next Redo removes block 2 again, which only A's own edit took out before.
+    assert!(!a.redo_takes_others_text(1), "nobody typed in block 2 since its undo");
+    a.redo().unwrap();
+    assert!(!a.order().contains(&2));
+}
+
+/// The check reads the text against the document as it was after the undo. Text deleted since
+/// (by another replica, so yrs may have collected it) must not make the check panic, and
+/// deleting is not typing: it does not count (review round 3, GC).
+#[test]
+fn a_redo_check_after_collected_deletions_does_not_panic() {
+    // B deletes seeded text from the block A's undo put back.
+    let mut a = replica(&sample(), 1);
+    let mut b = replica(&sample(), 2);
+    let up = a.remove_block(2).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    let up = b.delete_text(2, 0, 3).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1), "a deletion is not typing");
+    assert!(!a.undo_takes_others_text(1));
+    // B types, then deletes part of what B typed, then deletes the rest of the seeded text.
+    let up = b.insert_text(2, 0, "BOBBY", &Map::new()).unwrap();
+    a.apply(&up).unwrap();
+    let up = b.delete_text(2, 1, 2).unwrap();
+    a.apply(&up).unwrap();
+    let len = b.block(2).unwrap().text.chars().count();
+    let up = b.delete_text(2, 3, len - 3).unwrap();
+    a.apply(&up).unwrap();
+    assert_eq!(a.block(2).unwrap().text, "BBY");
+    assert!(a.redo_takes_others_text(1), "what B typed and kept counts");
+    // B deletes the rest of the text too: nothing of B's is left to take away.
+    let up = b.delete_text(2, 0, 3).unwrap();
+    a.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1));
+    // A block whose entry was taken away and collected (an undone insert) is not looked at.
+    let new = (1 << 32) | 7;
+    let up = a.insert_block(1, &plain(new, "fresh")).unwrap();
+    b.apply(&up).unwrap();
+    let up = a.undo().unwrap();
+    b.apply(&up).unwrap();
+    assert!(!a.redo_takes_others_text(1));
+    assert!(!a.undo_takes_others_text(1));
+    a.redo().unwrap();
+    assert_eq!(a.block(new).unwrap().text, "fresh");
+}
+
 /// One peer undoes inserting a block while another undoes removing it: the second undo puts the
 /// id back in the body, the first takes the block itself away. An id whose block is gone is not
 /// in the order on any replica, and its removal is reported, so every app drops it alike.
