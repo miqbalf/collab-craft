@@ -52,6 +52,7 @@ pub mod replica;
 mod session;
 pub mod shadow;
 mod token;
+mod wake;
 mod walk;
 mod ydoc;
 
@@ -86,6 +87,7 @@ pub use proto::{
 pub use replica::{MAX_OP_BLOCKS, MAX_STATE_BLOCKS, Replica, YReplica, update_blocks, update_exceeds_blocks, update_is_sound};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
+pub use wake::Wake;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};
 /// The CRDT under every replica, for an app that writes its own schema on [`YReplica`].
 pub use yrs;

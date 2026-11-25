@@ -13,6 +13,10 @@
 //! because [`Hub`] is polled rather than called back. There is no channel and no lock: a browser
 //! runs this on one thread, and a queue behind a [`RefCell`] is the honest description of that.
 //!
+//! An app that draws frames only when asked (egui) would still see a message only on its next
+//! poll. [`WebHub::set_wake`] gives the handlers a callback that runs after each message is
+//! queued, and after the link connects or drops, so the app polls at once ([`crate::Wake`]).
+//!
 //! The protocol itself is not repeated here. [`emit`] and [`receive`] are the same functions the
 //! native hub calls, so a browser peer and a desktop peer cannot drift apart over an event name.
 
@@ -39,6 +43,7 @@ struct Link {
     dropped: bool,
 }
 use crate::proto::{ClientMsg, ServerMsg};
+use crate::wake::Wake;
 
 /// A connection to the relay from a browser.
 pub struct WebHub {
@@ -47,6 +52,8 @@ pub struct WebHub {
     auth: Object,
     link: Rc<RefCell<Link>>,
     inbox: Rc<RefCell<VecDeque<ServerMsg>>>,
+    /// What the handlers call once something arrived ([`WebHub::set_wake`]).
+    wake: Wake,
     /// The handlers, kept alive while the socket can still call them. Dropping a [`Closure`]
     /// invalidates the function JavaScript is holding, and the next event would then tear the
     /// page down rather than deliver a message.
@@ -112,9 +119,11 @@ impl WebHub {
         // "error" is in the set because the relay reports its own refusals that way, and an app
         // has to show them rather than have them swallowed into a log.
         let link = Rc::new(RefCell::new(Link::default()));
+        let wake = Wake::default();
         for event in EVENTS {
             let queue = Rc::clone(&inbox);
             let state = Rc::clone(&link);
+            let woken = wake.clone();
             let handler = Closure::<dyn FnMut(JsValue)>::new(move |payload: JsValue| {
                 if let Some(msg) = read(event, &payload) {
                     if matches!(msg, ServerMsg::Joined { .. }) {
@@ -123,6 +132,7 @@ impl WebHub {
                         state.borrow_mut().refused = true;
                     }
                     queue.borrow_mut().push_back(msg);
+                    woken.fire();
                 }
             });
             on.call2(&socket, &JsValue::from_str(event), handler.as_ref()).map_err(js)?;
@@ -134,8 +144,11 @@ impl WebHub {
         // sends the same `auth` object on every attempt, so it is cleared once the first
         // connection is up.
         let first = auth.clone();
+        let woken = wake.clone();
         let cleared = Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
             let _ = Reflect::set(&first, &JsValue::from_str("applied"), &JsValue::NULL);
+            // Connected: the app's status line changes.
+            woken.fire();
         });
         on.call2(&socket, &JsValue::from_str("connect"), cleared.as_ref()).map_err(js)?;
         handlers.push(cleared);
@@ -145,7 +158,10 @@ impl WebHub {
         // itself: the same ticket would be refused again.
         let reopen = socket.clone();
         let state = Rc::clone(&link);
+        let woken = wake.clone();
         let reopened = Closure::<dyn FnMut(JsValue)>::new(move |reason: JsValue| {
+            // Dropped: the app's status line changes.
+            woken.fire();
             if reason.as_string().as_deref() != Some("io server disconnect") {
                 return;
             }
@@ -168,7 +184,15 @@ impl WebHub {
         on.call2(&socket, &JsValue::from_str("disconnect"), reopened.as_ref()).map_err(js)?;
         handlers.push(reopened);
 
-        Ok(WebHub { socket, auth, link, inbox, _handlers: handlers })
+        Ok(WebHub { socket, auth, link, inbox, wake, _handlers: handlers })
+    }
+
+    /// Call `wake` whenever a message from the relay is queued for [`Hub::poll`], and when the
+    /// link connects or drops, in place of any earlier callback. An egui app passes
+    /// `move || ctx.request_repaint()`, so a remote edit is drawn on the next frame rather than
+    /// when the app next happens to poll.
+    pub fn set_wake(&self, wake: impl Fn() + 'static) {
+        self.wake.set(wake);
     }
 }
 
@@ -226,6 +250,7 @@ impl Hub for WebHub {
 impl Drop for WebHub {
     /// Close the socket rather than leaving it open for the life of the page.
     fn drop(&mut self) {
+        self.wake.clear();
         let timer = {
             let mut link = self.link.borrow_mut();
             link.dropped = true;
