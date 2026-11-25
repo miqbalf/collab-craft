@@ -49,8 +49,8 @@ use serde_json::{Map, Value};
 use yrs::types::text::{ChangeKind, YChange};
 use yrs::types::{Attrs, Event, PathSegment};
 use yrs::{
-    Any, Array, ArrayRef, Assoc, BranchID, DeepObservable, Doc, GetString, IndexedSequence, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn,
-    Snapshot, Text, TextPrelim, TextRef, Transact, TransactionMut,
+    Any, Array, ArrayRef, Assoc, BranchID, DeepObservable, Doc, IndexedSequence, Map as _, MapPrelim, MapRef, Number, Out, ReadTxn, Snapshot, Text,
+    TextPrelim, TextRef, Transact, TransactionMut,
 };
 
 use crate::replica::{REMOTE, Replica, YReplica, byte_span, integrate, put_sorted, to_any, to_json};
