@@ -47,6 +47,7 @@ pub mod proto;
 pub mod replica;
 mod session;
 mod token;
+mod wake;
 mod ydoc;
 
 /// A [`Hub`] over `rust_socketio`, for native apps.
@@ -76,6 +77,7 @@ pub use proto::{
 pub use replica::{Replica, YReplica};
 pub use session::{Effect, Session};
 pub use token::doc_from_token;
+pub use wake::Wake;
 pub use ydoc::{Attributes, BlockChange, LiveDoc, LiveError, SeedBlock};
 /// The CRDT under every replica, for an app that writes its own schema on [`YReplica`].
 pub use yrs;
