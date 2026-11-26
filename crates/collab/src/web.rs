@@ -183,6 +183,11 @@ impl WebHub {
         });
         on.call2(&socket, &JsValue::from_str("disconnect"), reopened.as_ref()).map_err(js)?;
         handlers.push(reopened);
+        // A failed connect or reconnect attempt changes what the app's status line says.
+        let woken = wake.clone();
+        let failed = Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| woken.fire());
+        on.call2(&socket, &JsValue::from_str("connect_error"), failed.as_ref()).map_err(js)?;
+        handlers.push(failed);
 
         Ok(WebHub { socket, auth, link, inbox, wake, _handlers: handlers })
     }
