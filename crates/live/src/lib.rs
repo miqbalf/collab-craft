@@ -462,6 +462,9 @@ impl<H: Hub> Hub for Tap<H> {
     fn set_space(&mut self, space: u32) {
         self.hub.set_space(space);
     }
+    fn set_wake(&mut self, wake: &craft_collab::Wake) {
+        self.hub.set_wake(wake);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {

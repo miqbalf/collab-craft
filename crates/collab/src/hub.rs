@@ -62,6 +62,14 @@ pub trait Hub {
     /// Close the link for good: no reconnect, nothing sent or received after it. A hub that
     /// closes on drop (the web and native hubs) need not do more. No-op by default.
     fn close(&mut self) {}
+
+    /// Fire `wake` whenever something arrives for [`Hub::poll`], and when the link connects or
+    /// drops, so an app that draws frames only when asked polls at once ([`crate::Wake`]). A hub
+    /// that is only polled on the app's own schedule ignores it (the default); a hub that wraps
+    /// another (boxes, taps or hands over links) must forward it.
+    fn set_wake(&mut self, wake: &crate::Wake) {
+        let _ = wake;
+    }
 }
 
 /// How long a hub waits before its next reconnect attempt: 250 ms, doubling to 5 s, and back

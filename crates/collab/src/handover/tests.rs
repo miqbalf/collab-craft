@@ -17,6 +17,8 @@ struct Link {
     tickets: Vec<String>,
     /// Every space it was told to name, oldest first.
     spaces: Vec<u32>,
+    /// What it fires when something arrives (`Hub::set_wake`).
+    wake: Option<crate::Wake>,
 }
 
 #[derive(Clone)]
@@ -43,11 +45,19 @@ impl Hub for Fake {
     fn close(&mut self) {
         self.0.borrow_mut().closed = true;
     }
+    fn set_wake(&mut self, wake: &crate::Wake) {
+        self.0.borrow_mut().wake = Some(wake.clone());
+    }
 }
 
 impl Fake {
+    /// Queue `msgs` and, like the web hub's handlers, fire the wake it was given.
     fn deliver(&self, msgs: impl IntoIterator<Item = ServerMsg>) {
         self.0.borrow_mut().inbox.extend(msgs);
+        let wake = self.0.borrow().wake.clone();
+        if let Some(wake) = wake {
+            wake.fire();
+        }
     }
 }
 
@@ -278,4 +288,32 @@ fn the_new_link_resumes_where_the_current_one_stands() {
     h.poll();
     h.set_token("t5".into());
     assert_eq!(opened.borrow()[4].0.borrow().applied, None);
+}
+
+/// LI2 (PERF2 on the combined line): the app is woken by the link in use, by a link opened with
+/// a renewed ticket (before and after it joined), and by the link after a switch.
+#[test]
+fn the_wake_reaches_every_link() {
+    let (first, mut h, opened) = joined_hub();
+    let fired = Rc::new(std::cell::Cell::new(0));
+    let count = Rc::clone(&fired);
+    let wake = crate::Wake::default();
+    wake.set(move || count.set(count.get() + 1));
+    h.set_wake(&wake);
+    first.deliver([op(1)]);
+    assert_eq!(fired.get(), 1, "the link in use wakes the app");
+    h.set_token("t2".into());
+    let second = opened.borrow()[0].clone();
+    second.deliver([presence()]);
+    assert_eq!(fired.get(), 2, "the link being opened wakes the app before it joined");
+    second.deliver([joined("p2")]);
+    assert_eq!(fired.get(), 3, "and with its join, so the switch is not left to a timer");
+    h.poll();
+    assert_eq!(h.switches(), 1);
+    second.deliver([op(2)]);
+    assert_eq!(fired.get(), 4, "the new link in use wakes the app");
+    h.set_token("t3".into());
+    let third = opened.borrow()[1].clone();
+    third.deliver([presence()]);
+    assert_eq!(fired.get(), 5, "a link opened after the wake was set gets it too");
 }

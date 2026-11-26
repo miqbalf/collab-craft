@@ -116,6 +116,8 @@ pub struct Handover<H: Hub> {
     switches: u64,
     /// The id space the replica keeps, named by every link from now on.
     space: Option<u32>,
+    /// What every link fires when something arrives ([`Hub::set_wake`]), passed on to each.
+    wake: Option<crate::Wake>,
     at: Position,
 }
 
@@ -123,7 +125,7 @@ impl<H: Hub> Handover<H> {
     /// `active` is the connected hub; `open` connects another to the same relay and room (the
     /// same call that made `active`, with the [`Reopen`] values).
     pub fn new(active: H, open: impl FnMut(&Reopen<'_>) -> Result<H> + 'static) -> Handover<H> {
-        Handover { active, next: None, open: Box::new(open), switches: 0, space: None, at: Position::default() }
+        Handover { active, next: None, open: Box::new(open), switches: 0, space: None, wake: None, at: Position::default() }
     }
 
     /// Whether a link opened with a renewed ticket has not joined yet.
@@ -224,6 +226,9 @@ impl<H: Hub> Hub for Handover<H> {
                 if let Some(space) = self.space {
                     hub.set_space(space);
                 }
+                if let Some(wake) = &self.wake {
+                    hub.set_wake(wake);
+                }
                 self.next = Some(Next { hub, joined: None, held: Vec::new() });
             }
             Err(e) => log::warn!("collab: a link with the renewed ticket could not be opened: {e}"),
@@ -243,6 +248,16 @@ impl<H: Hub> Hub for Handover<H> {
     fn close(&mut self) {
         self.abandon();
         self.active.close();
+    }
+
+    /// Every link wakes the app from now on: the one in use, the one being opened (its join
+    /// is what lets the switch happen), and each one opened later.
+    fn set_wake(&mut self, wake: &crate::Wake) {
+        self.wake = Some(wake.clone());
+        self.active.set_wake(wake);
+        if let Some(next) = self.next.as_mut() {
+            next.hub.set_wake(wake);
+        }
     }
 }
 

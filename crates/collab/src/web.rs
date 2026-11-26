@@ -225,6 +225,11 @@ impl Hub for WebHub {
         self.inbox.borrow_mut().drain(..).collect()
     }
 
+    fn set_wake(&mut self, wake: &Wake) {
+        let wake = wake.clone();
+        self.wake.set(move || wake.fire());
+    }
+
     fn connected(&self) -> bool {
         // Read off the socket each time rather than tracked here. Socket.IO reconnects on its
         // own, and a flag of ours would have to be told about every one of those.
