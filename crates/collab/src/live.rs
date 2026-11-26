@@ -552,7 +552,12 @@ pub struct Live<H, R: Replica = LiveDoc> {
     /// Who else is in the document: the relay's peer id (a badge's colour is derived from it),
     /// the display name, and what the member may do ([`PeerAccess`](crate::PeerAccess)).
     pub roster: Vec<crate::Presence>,
+    /// Whether the hub was connected at the last pump. Starts false: a hub may still be
+    /// connecting when the app first pumps.
     was_connected: bool,
+    /// Whether the hub has ever been connected. Before that, nothing about the connection is
+    /// told: the first connect is not a drop and a reconnect.
+    been_connected: bool,
 }
 
 impl<H: Hub> Live<H> {
@@ -605,7 +610,8 @@ impl<H: Hub, R: Replica> Live<H, R> {
             told_damaged: false,
             notices: Vec::new(),
             roster: Vec::new(),
-            was_connected: true,
+            was_connected: false,
+            been_connected: false,
         }
     }
 
@@ -1045,14 +1051,15 @@ impl<H: Hub, R: Replica> Live<H, R> {
     /// first, then this.
     pub fn pump(&mut self) -> Vec<Work<R::Change>> {
         let now = self.hub.connected();
-        if now != self.was_connected {
+        if now != self.was_connected && self.been_connected {
             self.notices.push(if now {
                 "reconnected to the other editors".to_owned()
             } else {
                 "not connected to the other editors; your edits are waiting".to_owned()
             });
-            self.was_connected = now;
         }
+        self.was_connected = now;
+        self.been_connected |= now;
 
         let mut work = Vec::new();
         for msg in self.hub.poll() {
@@ -2507,6 +2514,32 @@ mod tests {
         assert!(edits >= 1);
         let copy = LiveDoc::from_state(&state).unwrap();
         assert!(copy.block(1).unwrap().text.contains("mine"), "the copy lacks the unmerged edit");
+    }
+
+    /// LI2: a hub that is still connecting when the app first pumps (the web hub: its socket
+    /// opens after `connect` returns) says nothing about the connection on the first connect.
+    /// A real drop and the rejoin after it are still told.
+    #[test]
+    fn the_first_connect_is_not_told_as_a_drop_and_a_reconnect() {
+        const DOWN: &str = "not connected to the other editors; your edits are waiting";
+        const BACK: &str = "reconnected to the other editors";
+        let hub = Flaky::default();
+        let mut live = Live::new(hub.clone(), "d");
+        live.seed(&[block()]).unwrap();
+        live.pump();
+        live.pump();
+        hub.up(true);
+        hub.deliver(joined(1));
+        live.pump();
+        live.pump();
+        assert!(live.notices.is_empty(), "the first connect was told: {:?}", live.notices);
+        hub.up(false);
+        live.pump();
+        assert_eq!(live.notices, [DOWN], "a real drop is told");
+        hub.up(true);
+        hub.deliver(joined(1));
+        live.pump();
+        assert_eq!(live.notices, [DOWN, BACK], "and the rejoin after it");
     }
 
     /// C9: edits made while the link is down go out on the rejoin as one merged submit, and a
