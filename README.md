@@ -13,6 +13,16 @@ desktop binary carrying a cloud password leaks one the moment somebody copies
 the file. A plugin per provider reimplements authentication, file authorisation
 and token minting every time.
 
+## Fork notes
+
+This fork adds, on top of upstream CollabCraft:
+
+- A live worker that loads and saves each room's document through a self-hosted file server, with save timeouts, conflict copies and checkpoints.
+- Relay hardening: reconnecting the message bus after it restarts, sequence floors on rejoin, caps on held and ordered edits, and room eviction under memory pressure.
+- Undo and Redo that never remove another editor's text, roster members marked as editors or viewers, ticket renewal, and a browser hub that wakes the app when messages arrive.
+
+The server app that hosts the Craft apps is not part of this repository.
+
 ## What it needs
 
 | Dependency | Why | Notes |
