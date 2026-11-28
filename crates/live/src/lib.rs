@@ -1344,7 +1344,7 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
     /// own link never counts: the roster lists the others, and the service is the saver itself.
     fn watch_saver(&mut self) {
         let service = &self.service_uid;
-        let is_service = self.live.me.as_deref().is_some_and(|me| uid_of(me) == service);
+        let is_service = lock(&self.seen).me.as_deref().is_some_and(|me| uid_of(me) == service);
         if is_service || self.live.roster.iter().any(|p| uid_of(&p.peer) == service) {
             self.saver_wait = None;
             self.saver_missing = false;
