@@ -1340,10 +1340,12 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
         self.watch_saver();
     }
 
-    /// Count how long the link has been live with no document service in the room.
+    /// Count how long the link has been live with no document service in the room. The service's
+    /// own link never counts: the roster lists the others, and the service is the saver itself.
     fn watch_saver(&mut self) {
         let service = &self.service_uid;
-        if self.live.roster.iter().any(|p| uid_of(&p.peer) == service) {
+        let is_service = self.live.me.as_deref().is_some_and(|me| uid_of(me) == service);
+        if is_service || self.live.roster.iter().any(|p| uid_of(&p.peer) == service) {
             self.saver_wait = None;
             self.saver_missing = false;
             return;
@@ -1361,7 +1363,10 @@ impl<H: Hub, K: LiveKind> LiveEditing<H, K> {
             _ => wait.frames >= SAVER_WAIT_FRAMES,
         };
         if over && !self.saver_missing {
-            log::warn!("live: no document service in the room; this window's edits are not being saved");
+            log::warn!(
+                "live: the document service has not been in the room for {} s since this link went live; nothing saves this window's edits to the server until it joins",
+                SAVER_WAIT_MS / 1000.0
+            );
             self.saver_missing = true;
         }
     }

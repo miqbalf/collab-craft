@@ -260,6 +260,26 @@ fn the_service_tells_and_ends() {
     assert!(!a.le.editable());
 }
 
+/// An editor alone in the room past the wait finds the service missing; the service, alone in
+/// the room, is itself the service and never does.
+#[test]
+fn the_service_never_finds_itself_missing() {
+    // Two relays, so each is alone in its room.
+    let (relay_s, relay_b) = (MemRelay::new(), MemRelay::new());
+    let mut s = Window::join(&relay_s, SERVICE_UID, Access::Edit);
+    let mut lone = Window::join(&relay_b, "bob", Access::Edit);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    for w in [&mut s, &mut lone] {
+        let read = now.clone();
+        w.le.set_clock(Box::new(move || *read.lock().unwrap()));
+    }
+    settle(&mut [&mut s, &mut lone]);
+    *now.lock().unwrap() += 16_000.0;
+    settle(&mut [&mut s, &mut lone]);
+    assert!(lone.le.saver_missing(), "an editor alone in the room did not miss the service");
+    assert!(!s.le.saver_missing(), "the service took itself for missing");
+}
+
 /// Carets go out at most five a second on the host's clock, and the newest one wins.
 #[test]
 fn carets_are_held_to_five_a_second() {
